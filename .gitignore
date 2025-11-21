@@ -39,8 +39,9 @@ Makefile
 *.cmake
 !CMakeLists.txt
 
-# Dependencies (linked externally)
-third_party/
+# Dependencies (linked externally) - exclude large/external deps, include heimdall source
+third_party/*
+!third_party/heimdall/
 
 # Claude
 .claude/

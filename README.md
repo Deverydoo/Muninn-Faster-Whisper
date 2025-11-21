@@ -130,8 +130,8 @@ Memory usage: **~40% lower** than Python implementation
 - CMake 3.20+
 - CUDA Toolkit 11.8+ (for GPU acceleration)
 - CTranslate2 (included or provide your own build)
+- Heimdall 2.0+ (required, for audio extraction - included in `third_party/heimdall/`)
 - ONNX Runtime (optional, for Silero VAD)
-- Heimdall (optional, for audio extraction)
 
 ### Build from Source
 
@@ -378,9 +378,20 @@ auto result = transcriber.transcribe("video.mp4", options,
 | Dependency | Required | Purpose |
 |------------|----------|---------|
 | CTranslate2 | Yes | Whisper inference engine |
+| Heimdall 2.0 | Yes | Audio/video file loading (380x real-time extraction) |
 | CUDA | Recommended | GPU acceleration |
 | ONNX Runtime | Optional | Silero VAD support |
-| Heimdall | Optional | Audio/video file loading |
+
+### Heimdall Audio Engine
+
+Muninn uses **Heimdall 2.0** for audio extraction. Heimdall's v2 API provides:
+
+- **16kHz mono float32 output** - Optimized for CTranslate2/Whisper requirements
+- **Multi-track support** - Extract each audio track separately (no mixing)
+- **380x real-time** performance (4-min video extracted in 0.6s)
+- **Static linking** - Standalone DLL with no external dependencies
+
+Heimdall is included in `third_party/heimdall/`. See [Heimdall README](third_party/heimdall/README.md) for build instructions.
 
 ## Project Status
 
