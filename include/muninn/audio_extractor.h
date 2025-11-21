@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace muninn {
 
@@ -20,7 +21,38 @@ public:
     ~AudioExtractor();
 
     /**
-     * @brief Extract audio from video/audio file
+     * @brief Open a file for multi-track extraction
+     * @param file_path Path to audio/video file
+     * @return True if successful
+     */
+    bool open(const std::string& file_path);
+
+    /**
+     * @brief Close the currently open file
+     */
+    void close();
+
+    /**
+     * @brief Get number of audio tracks in file
+     * @return Number of audio tracks (0 if no file open)
+     */
+    int get_track_count() const;
+
+    /**
+     * @brief Get duration in seconds
+     */
+    float get_duration() const;
+
+    /**
+     * @brief Extract audio from a specific track
+     * @param track_index Track index (0-based)
+     * @param samples Output buffer for float32 samples
+     * @return True if successful
+     */
+    bool extract_track(int track_index, std::vector<float>& samples);
+
+    /**
+     * @brief Extract audio from video/audio file (convenience method - uses track 0)
      *
      * Automatically handles:
      * - Multi-format support (MP3, WAV, M4A, MP4, MOV, etc.)

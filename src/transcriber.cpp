@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <regex>
+#include <map>
 
 namespace muninn {
 
@@ -70,10 +71,12 @@ std::string Transcriber::Impl::extract_text(const std::vector<std::string>& toke
         }
 
         // Replace GPT-2 BPE space marker (Ġ = U+0120) with actual space
+        // UTF-8 encoding of U+0120 is: 0xC4 0xA0 (2 bytes)
         std::string processed = token;
+        const std::string gpt2_space = "\xC4\xA0";  // Ġ in UTF-8
         size_t pos = 0;
-        while ((pos = processed.find('\u0120', pos)) != std::string::npos) {
-            processed.replace(pos, 3, " ");  // UTF-8 encoding of U+0120 is 3 bytes
+        while ((pos = processed.find(gpt2_space, pos)) != std::string::npos) {
+            processed.replace(pos, 2, " ");
             pos += 1;
         }
 
@@ -123,7 +126,7 @@ bool Transcriber::Impl::is_hallucination(
     }
 
     if (words.size() >= 3) {
-        // Check if same word repeated multiple times
+        // Check if same word repeated multiple times consecutively
         int max_repeat_count = 1;
         for (size_t i = 0; i < words.size(); i++) {
             int repeat_count = 1;
@@ -139,6 +142,29 @@ bool Transcriber::Impl::is_hallucination(
                       << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
                       << "' (repeat: " << max_repeat_count << "/" << words.size() << " words)\n";
             return true;
+        }
+
+        // Check for phrase repetition (e.g., "I'm going to be like" repeated)
+        // Look for repeating n-grams where n = 3-6 words
+        for (int ngram_size = 3; ngram_size <= 6 && ngram_size <= static_cast<int>(words.size()) / 2; ngram_size++) {
+            std::map<std::string, int> ngram_counts;
+            for (size_t i = 0; i + ngram_size <= words.size(); i++) {
+                std::string ngram;
+                for (int j = 0; j < ngram_size; j++) {
+                    if (j > 0) ngram += " ";
+                    ngram += words[i + j];
+                }
+                ngram_counts[ngram]++;
+            }
+
+            // If any n-gram appears 3+ times, it's a hallucination
+            for (const auto& [ngram, count] : ngram_counts) {
+                if (count >= 3) {
+                    std::cerr << "[Muninn] Skipping phrase-repetition hallucination: '"
+                              << ngram << "' repeated " << count << " times\n";
+                    return true;
+                }
+            }
         }
     }
 
@@ -385,6 +411,9 @@ TranscribeResult Transcriber::transcribe(
 
         result.duration = audio_samples.size() / 16000.0f;
 
+        // Track repeated segments across chunks to detect hallucinations like "Thank you" repeated
+        std::map<std::string, int> segment_text_counts;
+
         // Whisper CTranslate2 has a maximum input length of 3000 frames (30 seconds)
         constexpr int MAX_FRAMES = 3000;
 
@@ -418,8 +447,23 @@ TranscribeResult Transcriber::transcribe(
                 // Transcribe this chunk
                 auto chunk_segments = pimpl_->transcribe_chunk(chunk_features, chunk_start_time, options);
 
-                // Add to overall segments
-                result.segments.insert(result.segments.end(), chunk_segments.begin(), chunk_segments.end());
+                // Filter repeated segments across chunks (hallucination detection)
+                for (auto& seg : chunk_segments) {
+                    // Normalize text for comparison (lowercase, trim)
+                    std::string normalized = seg.text;
+                    std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
+
+                    segment_text_counts[normalized]++;
+
+                    // If same text appears 3+ times across chunks, it's a hallucination
+                    if (segment_text_counts[normalized] >= 3) {
+                        std::cerr << "[Muninn] Skipping cross-chunk hallucination (appears "
+                                  << segment_text_counts[normalized] << " times): '" << seg.text << "'\n";
+                        continue;  // Skip this segment
+                    }
+
+                    result.segments.push_back(seg);
+                }
             }
 
             std::cout << "[Muninn] Completed chunked transcription: " << result.segments.size() << " total segments\n";
@@ -446,21 +490,68 @@ TranscribeResult Transcriber::transcribe(
     const std::string& audio_path,
     const TranscribeOptions& options
 ) {
-    // Load audio file using AudioExtractor
+    TranscribeResult combined_result;
+
+    // Open audio file to get track count
     AudioExtractor extractor;
-    std::vector<float> samples;
-    float duration = 0.0f;
 
     std::cout << "[Muninn] Loading audio from: " << audio_path << "\n";
 
-    if (!extractor.extract_audio(audio_path, samples, duration)) {
-        throw std::runtime_error("Failed to load audio file: " + extractor.get_last_error());
+    if (!extractor.open(audio_path)) {
+        throw std::runtime_error("Failed to open audio file: " + extractor.get_last_error());
     }
 
-    std::cout << "[Muninn] Audio loaded: " << samples.size() << " samples (" << duration << "s)\n";
+    int track_count = extractor.get_track_count();
+    float duration = extractor.get_duration();
 
-    // Transcribe the loaded samples
-    return transcribe(samples, 16000, options);
+    std::cout << "[Muninn] Found " << track_count << " audio track(s), duration: " << duration << "s\n";
+
+    combined_result.duration = duration;
+    combined_result.language = options.language;
+    combined_result.language_probability = 1.0f;
+
+    // Process each track
+    for (int track = 0; track < track_count; ++track) {
+        std::cout << "\n═══════════════════════════════════════════════════════════\n";
+        std::cout << "[Muninn] Processing Track " << track << "/" << track_count << "\n";
+        std::cout << "═══════════════════════════════════════════════════════════\n";
+
+        std::vector<float> samples;
+        if (!extractor.extract_track(track, samples)) {
+            std::cerr << "[Muninn] WARNING: Failed to extract track " << track << ": "
+                      << extractor.get_last_error() << "\n";
+            continue;
+        }
+
+        std::cout << "[Muninn] Track " << track << ": " << samples.size() << " samples\n";
+
+        // Transcribe this track
+        try {
+            auto track_result = transcribe(samples, 16000, options);
+
+            // Add track label prefix to each segment
+            for (auto& segment : track_result.segments) {
+                segment.text = "[Track " + std::to_string(track) + "] " + segment.text;
+            }
+
+            // Merge into combined result
+            combined_result.segments.insert(combined_result.segments.end(),
+                track_result.segments.begin(), track_result.segments.end());
+
+            std::cout << "[Muninn] Track " << track << ": " << track_result.segments.size() << " segment(s)\n";
+
+        } catch (const std::exception& e) {
+            std::cerr << "[Muninn] WARNING: Track " << track << " transcription failed: " << e.what() << "\n";
+        }
+    }
+
+    extractor.close();
+
+    std::cout << "\n═══════════════════════════════════════════════════════════\n";
+    std::cout << "[Muninn] All tracks complete. Total segments: " << combined_result.segments.size() << "\n";
+    std::cout << "═══════════════════════════════════════════════════════════\n";
+
+    return combined_result;
 }
 
 Transcriber::ModelInfo Transcriber::get_model_info() const {

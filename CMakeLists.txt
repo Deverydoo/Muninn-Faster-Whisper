@@ -55,37 +55,42 @@ set(HEIMDALL_DIR "${CMAKE_SOURCE_DIR}/third_party/heimdall")
 # Find FFmpeg libraries
 find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h
     HINTS
+        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/include"
+        "${HEIMDALL_DIR}/ffmpeg/include"
         "C:/ffmpeg/include"
         "C:/Program Files/ffmpeg/include"
-        "${HEIMDALL_DIR}/ffmpeg/include"
 )
 
 find_library(AVFORMAT_LIB avformat
     HINTS
+        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
         "C:/ffmpeg/lib"
         "C:/Program Files/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
 )
 
 find_library(AVCODEC_LIB avcodec
     HINTS
+        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
         "C:/ffmpeg/lib"
         "C:/Program Files/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
 )
 
 find_library(AVUTIL_LIB avutil
     HINTS
+        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
         "C:/ffmpeg/lib"
         "C:/Program Files/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
 )
 
 find_library(SWRESAMPLE_LIB swresample
     HINTS
+        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
         "C:/ffmpeg/lib"
         "C:/Program Files/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
 )
 
 if(NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIB)

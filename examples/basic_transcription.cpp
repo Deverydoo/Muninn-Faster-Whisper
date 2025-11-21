@@ -3,6 +3,10 @@
 #include <vector>
 #include <cmath>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 // Generate a simple sine wave for testing (1 second @ 16kHz)
 std::vector<float> generate_test_audio(float frequency = 440.0f, float duration = 1.0f) {
     const int sample_rate = 16000;
@@ -11,7 +15,7 @@ std::vector<float> generate_test_audio(float frequency = 440.0f, float duration 
 
     for (int i = 0; i < num_samples; i++) {
         float t = static_cast<float>(i) / sample_rate;
-        samples[i] = 0.5f * std::sin(2.0f * M_PI * frequency * t);
+        samples[i] = 0.5f * std::sin(2.0f * static_cast<float>(M_PI) * frequency * t);
     }
 
     return samples;

@@ -51,35 +51,89 @@ int main(int argc, char* argv[]) {
     std::cout << "Muninn Faster-Whisper Test Application\n";
     std::cout << "Version: 0.5.0-alpha\n";
     std::cout << "═══════════════════════════════════════════════════════════\n\n";
+    std::cout.flush();
 
-    if (argc < 3) {
-        print_usage(argv[0]);
-        return 1;
-    }
+    // Hardcoded test paths (relative to executable location)
+    std::string model_path = "faster-whisper-large-v3-turbo";
+    std::string audio_path = "test.mp4";
 
-    std::string model_path = argv[1];
-    std::string audio_path = argv[2];
+    std::cout << "[Test] Model: " << model_path << "\n";
+    std::cout << "[Test] Audio: " << audio_path << "\n\n";
+    std::cout.flush();
+
+    std::cout << "[DEBUG] Step 1: Entering try block\n";
+    std::cout.flush();
 
     try {
         // Initialize transcriber
-        std::cout << "[Muninn] Loading model from: " << model_path << "\n";
+        std::cout << "[DEBUG] Step 2: About to construct Transcriber...\n";
+        std::cout.flush();
+
+        std::cout << "[Muninn] Loading model...\n";
+        std::cout.flush();
+
         muninn::Transcriber transcriber(model_path, "cuda", "float16");
 
+        std::cout << "[DEBUG] Step 3: Transcriber constructed successfully\n";
+        std::cout.flush();
+
         // Get model info
+        std::cout << "[DEBUG] Step 4: Getting model info...\n";
+        std::cout.flush();
+
         auto model_info = transcriber.get_model_info();
         std::cout << "\n[Muninn] Model Information:\n";
         std::cout << "  Multilingual: " << (model_info.is_multilingual ? "Yes" : "No") << "\n";
         std::cout << "  Languages: " << model_info.num_languages << "\n";
         std::cout << "  Mel bins: " << model_info.n_mels << "\n\n";
+        std::cout.flush();
 
-        // TODO: Load audio file via Heimdall
-        std::cerr << "[Muninn] ERROR: Audio file loading not yet implemented!\n";
-        std::cerr << "[Muninn] Next step: Integrate Heimdall audio decoder DLL\n";
-        std::cerr << "[Muninn] For now, pass audio samples programmatically:\n\n";
-        std::cerr << "  std::vector<float> samples = load_audio(\"" << audio_path << "\");\n";
-        std::cerr << "  auto result = transcriber.transcribe(samples, 16000);\n\n";
+        // Transcribe audio file
+        std::cout << "[DEBUG] Step 5: Setting up transcription options...\n";
+        std::cout.flush();
 
-        return 1;
+        std::cout << "[Muninn] Starting transcription...\n\n";
+        std::cout.flush();
+
+        muninn::TranscribeOptions options;
+        options.language = "en";
+        options.beam_size = 5;
+        options.temperature = 0.0f;
+
+        std::cout << "[DEBUG] Step 6: About to call transcribe()...\n";
+        std::cout.flush();
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto result = transcriber.transcribe(audio_path, options);
+        auto end_time = std::chrono::high_resolution_clock::now();
+
+        std::cout << "[DEBUG] Step 7: Transcription completed\n";
+        std::cout.flush();
+
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+        std::cout << "\n[Muninn] Transcription complete!\n";
+        std::cout << "[Muninn] Audio duration: " << result.duration << "s\n";
+        std::cout << "[Muninn] Segments: " << result.segments.size() << "\n";
+        std::cout << "[Muninn] Processing time: " << (duration_ms.count() / 1000.0) << "s\n";
+        if (result.duration > 0) {
+            std::cout << "[Muninn] Real-time factor: " << (duration_ms.count() / 1000.0 / result.duration) << "x\n";
+        }
+
+        // Print transcript
+        std::cout << "\n═══════════════════════════════════════════════════════════\n";
+        std::cout << "TRANSCRIPT\n";
+        std::cout << "═══════════════════════════════════════════════════════════\n";
+        for (const auto& segment : result.segments) {
+            std::cout << segment.text << "\n";
+        }
+        std::cout << "═══════════════════════════════════════════════════════════\n";
+
+        // Save to file
+        std::string output_path = audio_path + ".transcript.txt";
+        save_transcript(output_path, result);
+
+        return 0;
 
         // Example of how to use once audio loading is implemented:
         /*

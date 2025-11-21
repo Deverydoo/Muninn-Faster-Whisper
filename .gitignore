@@ -38,19 +38,28 @@ Makefile
 !CMakeLists.txt
 
 # Dependencies (linked externally)
-third_party/CTranslate2/
-third_party/heimdall/
-third_party/ffmpeg/
+third_party/
+
+# Claude
+.claude/
 
 # Models (large files)
 models/
 *.bin
 *.gguf
 
-# Test files
-test_*.mp3
-test_*.wav
-test_*.mp4
+# Test/media files
+*.mp3
+*.wav
+*.mp4
+*.m4a
+*.flac
+*.ogg
+*.webm
+*.mkv
+*.avi
+*.mov
+*.aac
 
 # Python
 __pycache__/
