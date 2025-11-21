@@ -1,0 +1,87 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Compiled files
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Dependencies (linked externally)
+third_party/CTranslate2/
+third_party/heimdall/
+third_party/ffmpeg/
+
+# Models (large files)
+models/
+*.bin
+*.gguf
+
+# Test files
+test_*.mp3
+test_*.wav
+test_*.mp4
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Documentation build
+docs/_build/
+docs/_generated/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
