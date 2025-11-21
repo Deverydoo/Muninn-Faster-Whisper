@@ -1,12 +1,20 @@
 cmake_minimum_required(VERSION 3.20)
+
+# vcpkg toolchain (must be before project) - Same as Heimdall
+set(CMAKE_TOOLCHAIN_FILE "C:/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
+set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "Vcpkg target triplet")
+
 project(MuninnFasterWhisper VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Static CRT linkage (same as Heimdall)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Options
 option(WITH_CUDA "Build with CUDA support" ON)
-option(WITH_SILERO_VAD "Build with Silero VAD (requires ONNX Runtime)" ON)
+option(WITH_SILERO_VAD "Build with Silero VAD (requires ONNX Runtime)" OFF)
 option(BUILD_SHARED_LIBS "Build as shared library (DLL)" ON)
 option(BUILD_TESTS "Build test applications" ON)
 option(BUILD_EXAMPLES "Build example applications" OFF)
@@ -71,27 +79,18 @@ if(WITH_CUDA)
 endif()
 
 # =======================
-# Heimdall Audio Decoder
+# FFmpeg for Internal Audio Decoder (via vcpkg - same as Heimdall)
 # =======================
-set(HEIMDALL_DIR "${CMAKE_SOURCE_DIR}/lib")
-
-find_library(HEIMDALL_LIB heimdall
-    HINTS "${HEIMDALL_DIR}"
-    NO_DEFAULT_PATH
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat
+    libavcodec
+    libavutil
+    libswresample
 )
-
-find_file(HEIMDALL_DLL
-    NAMES heimdall.dll
-    PATHS "${HEIMDALL_DIR}"
-    NO_DEFAULT_PATH
-)
-
-if(HEIMDALL_LIB)
-    message(STATUS "Found Heimdall: ${HEIMDALL_LIB}")
-    set(WITH_HEIMDALL ON)
-else()
-    message(FATAL_ERROR "Heimdall not found in ${HEIMDALL_DIR}. Heimdall is required for audio extraction.")
-endif()
+message(STATUS "Found FFmpeg via vcpkg")
+message(STATUS "FFmpeg include: ${FFMPEG_INCLUDE_DIRS}")
+message(STATUS "FFmpeg libs: ${FFMPEG_LIBRARIES}")
 
 # =======================
 # ONNX Runtime for Silero VAD
@@ -147,6 +146,7 @@ set(MUNINN_SOURCES
     src/mel_spectrogram.cpp
     src/transcriber.cpp
     src/audio_extractor.cpp
+    src/audio/audio_decoder.cpp
     src/vad.cpp
     src/silero_vad.cpp
 )
@@ -168,11 +168,6 @@ set_target_properties(muninn PROPERTIES
     SOVERSION 0
 )
 
-# Compile definitions
-if(WITH_HEIMDALL)
-    target_compile_definitions(muninn PRIVATE WITH_HEIMDALL)
-endif()
-
 # Include directories
 target_include_directories(muninn
     PUBLIC
@@ -180,11 +175,8 @@ target_include_directories(muninn
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CTRANSLATE2_INCLUDE_DIR}
+        ${FFMPEG_INCLUDE_DIRS}
 )
-
-if(WITH_HEIMDALL)
-    target_include_directories(muninn PRIVATE ${HEIMDALL_DIR}/include)
-endif()
 
 if(SILERO_VAD_ENABLED)
     target_include_directories(muninn PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
@@ -194,34 +186,27 @@ endif()
 target_link_libraries(muninn
     PRIVATE
         ${CTRANSLATE2_LIB}
+        PkgConfig::FFMPEG
 )
 
 if(SILERO_VAD_ENABLED)
     target_link_libraries(muninn PRIVATE ${ONNXRUNTIME_LIB})
 endif()
 
-if(WITH_HEIMDALL)
-    target_link_libraries(muninn PRIVATE ${HEIMDALL_LIB})
-endif()
-
 if(WITH_CUDA)
     target_link_libraries(muninn PRIVATE CUDA::cudart)
+endif()
+
+# MSVC Optimizations (same as Heimdall)
+if(MSVC)
+    target_compile_options(muninn PRIVATE /O2 /arch:AVX2 /fp:fast /GL)
+    target_link_options(muninn PRIVATE /LTCG)
 endif()
 
 # =======================
 # Copy Dependencies to Output
 # =======================
 if(BUILD_SHARED_LIBS)
-    # Copy Heimdall DLL
-    if(HEIMDALL_DLL)
-        add_custom_command(TARGET muninn POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${HEIMDALL_DLL}"
-                "$<TARGET_FILE_DIR:muninn>"
-            COMMENT "Copying heimdall.dll"
-        )
-    endif()
-
     # Copy CTranslate2 DLL
     if(CTRANSLATE2_DLL)
         add_custom_command(TARGET muninn POST_BUILD
@@ -250,9 +235,16 @@ if(BUILD_TESTS)
     add_executable(muninn_test_app tests/muninn_test_app.cpp)
     target_link_libraries(muninn_test_app PRIVATE muninn)
 
-    # Ensure test app can find DLLs
+    # Audio extraction test (tests internal audio decoder)
+    add_executable(test_audio_extraction tests/test_audio_extraction.cpp)
+    target_link_libraries(test_audio_extraction PRIVATE muninn)
+
+    # Ensure test apps can find DLLs
     if(BUILD_SHARED_LIBS)
         set_target_properties(muninn_test_app PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+        )
+        set_target_properties(test_audio_extraction PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
         )
     endif()
@@ -293,15 +285,13 @@ message(STATUS "Version:          ${PROJECT_VERSION}")
 message(STATUS "C++ Standard:     C++${CMAKE_CXX_STANDARD}")
 message(STATUS "Build Type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "Library Type:     ${BUILD_SHARED_LIBS}")
+message(STATUS "Toolchain:        vcpkg (x64-windows-static)")
 message(STATUS "CUDA Support:     ${WITH_CUDA}")
-message(STATUS "Heimdall:         ${WITH_HEIMDALL}")
+message(STATUS "Audio Decoder:    Internal (FFmpeg via vcpkg)")
 message(STATUS "Silero VAD:       ${SILERO_VAD_ENABLED}")
 message(STATUS "CTranslate2:      ${CTRANSLATE2_LIB}")
 if(CTRANSLATE2_DLL)
     message(STATUS "CTranslate2 DLL:  ${CTRANSLATE2_DLL}")
-endif()
-if(HEIMDALL_DLL)
-    message(STATUS "Heimdall DLL:     ${HEIMDALL_DLL}")
 endif()
 if(ONNXRUNTIME_DLL)
     message(STATUS "ONNX Runtime DLL: ${ONNXRUNTIME_DLL}")

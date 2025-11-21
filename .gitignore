@@ -98,3 +98,6 @@ docs/_generated/
 *.tmp
 *.bak
 *.orig
+
+# Repository map (auto-generated)
+REPOMAP.md

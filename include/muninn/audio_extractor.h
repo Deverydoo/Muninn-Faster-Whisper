@@ -1,5 +1,6 @@
 #pragma once
 
+#include "muninn/export.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -7,15 +8,16 @@
 namespace muninn {
 
 /**
- * @brief AudioExtractor - Wrapper around Heimdall's AudioDecoder
+ * @brief AudioExtractor - Internal Audio Extraction
  *
  * Extracts audio from video files and prepares it for Whisper transcription.
+ * Uses internal audio decoder (no external dependencies).
  * Configured for Whisper requirements:
  * - 16kHz sample rate
  * - Mono channel
  * - Float32 samples normalized to [-1, 1]
  */
-class AudioExtractor {
+class MUNINN_API AudioExtractor {
 public:
     AudioExtractor();
     ~AudioExtractor();

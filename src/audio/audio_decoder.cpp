@@ -9,7 +9,8 @@ extern "C" {
     #include <libavutil/opt.h>
 }
 
-namespace heimdall {
+namespace muninn {
+namespace audio {
 
 // Helper function to get current timestamp in HH:MM:SS.mmm format
 static std::string get_timestamp() {
@@ -33,7 +34,7 @@ AudioDecoder::AudioDecoder()
     , packet_(nullptr)
     , frame_(nullptr)
     , is_open_(false)
-    , target_sample_rate_(48000)
+    , target_sample_rate_(16000)
 {
     packet_ = av_packet_alloc();
     frame_ = av_frame_alloc();
@@ -50,18 +51,18 @@ bool AudioDecoder::open(const std::string& filename, int target_sample_rate) {
 
     target_sample_rate_ = target_sample_rate;
     std::ostringstream oss;
-    oss << "[Heimdall] Opening with target sample rate: " << target_sample_rate_ << " Hz";
+    oss << "[Muninn Audio] Opening with target sample rate: " << target_sample_rate_ << " Hz";
     TS_PRINT(oss.str());
 
     // Open file
     if (avformat_open_input(&format_ctx_, filename.c_str(), nullptr, nullptr) < 0) {
-        std::cerr << "[Heimdall] Cannot open file: " << filename << std::endl;
+        std::cerr << "[Muninn Audio] Cannot open file: " << filename << std::endl;
         return false;
     }
 
     // Get stream info
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
-        std::cerr << "[Heimdall] Cannot find stream info" << std::endl;
+        std::cerr << "[Muninn Audio] Cannot find stream info" << std::endl;
         avformat_close_input(&format_ctx_);
         return false;
     }
@@ -71,7 +72,7 @@ bool AudioDecoder::open(const std::string& filename, int target_sample_rate) {
         if (format_ctx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (init_stream(i)) {
                 oss.str("");  // Clear stream for reuse
-                oss << "[Heimdall] Found audio stream " << audio_streams_.size() - 1
+                oss << "[Muninn Audio] Found audio stream " << audio_streams_.size() - 1
                     << " (index " << i << "): "
                     << get_sample_rate(audio_streams_.size() - 1) << "Hz, "
                     << get_channels(audio_streams_.size() - 1) << " channels";
@@ -81,14 +82,14 @@ bool AudioDecoder::open(const std::string& filename, int target_sample_rate) {
     }
 
     if (audio_streams_.empty()) {
-        TS_PRINT("[Heimdall] No audio streams found");
+        TS_PRINT("[Muninn Audio] No audio streams found");
         avformat_close_input(&format_ctx_);
         return false;
     }
 
     is_open_ = true;
     oss.str("");  // Clear stream for reuse
-    oss << "[Heimdall] Guardian ready - watching over " << audio_streams_.size() << " audio streams";
+    oss << "[Muninn Audio] Ready - watching over " << audio_streams_.size() << " audio streams";
     TS_PRINT(oss.str());
     return true;
 }
@@ -99,20 +100,20 @@ bool AudioDecoder::init_stream(int stream_index) {
     // Find decoder
     const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!codec) {
-        std::cerr << "[Heimdall] Codec not found for stream " << stream_index << std::endl;
+        std::cerr << "[Muninn Audio] Codec not found for stream " << stream_index << std::endl;
         return false;
     }
 
     // Allocate codec context
     AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
     if (!codec_ctx) {
-        std::cerr << "[Heimdall] Cannot allocate codec context" << std::endl;
+        std::cerr << "[Muninn Audio] Cannot allocate codec context" << std::endl;
         return false;
     }
 
     // Copy codec parameters
     if (avcodec_parameters_to_context(codec_ctx, stream->codecpar) < 0) {
-        std::cerr << "[Heimdall] Cannot copy codec parameters" << std::endl;
+        std::cerr << "[Muninn Audio] Cannot copy codec parameters" << std::endl;
         avcodec_free_context(&codec_ctx);
         return false;
     }
@@ -125,7 +126,7 @@ bool AudioDecoder::init_stream(int stream_index) {
 
     // Open codec with threading options
     if (avcodec_open2(codec_ctx, codec, &codec_opts) < 0) {
-        std::cerr << "[Heimdall] Cannot open codec" << std::endl;
+        std::cerr << "[Muninn Audio] Cannot open codec" << std::endl;
         av_dict_free(&codec_opts);
         avcodec_free_context(&codec_ctx);
         return false;
@@ -135,12 +136,12 @@ bool AudioDecoder::init_stream(int stream_index) {
     // Create resampler to convert to float samples
     SwrContext* swr_ctx = swr_alloc();
     if (!swr_ctx) {
-        std::cerr << "[Heimdall] Cannot allocate resampler" << std::endl;
+        std::cerr << "[Muninn Audio] Cannot allocate resampler" << std::endl;
         avcodec_free_context(&codec_ctx);
         return false;
     }
 
-    // Set resampler options (convert to mono float for waveform)
+    // Set resampler options (convert to mono float for transcription)
     // CRITICAL: Use target_sample_rate_ for output to enable downsampling optimization
     AVChannelLayout mono_layout = AV_CHANNEL_LAYOUT_MONO;
     av_opt_set_chlayout(swr_ctx, "in_chlayout", &codec_ctx->ch_layout, 0);
@@ -151,7 +152,7 @@ bool AudioDecoder::init_stream(int stream_index) {
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
     if (swr_init(swr_ctx) < 0) {
-        std::cerr << "[Heimdall] Cannot initialize resampler" << std::endl;
+        std::cerr << "[Muninn Audio] Cannot initialize resampler" << std::endl;
         swr_free(&swr_ctx);
         avcodec_free_context(&codec_ctx);
         return false;
@@ -280,7 +281,7 @@ int AudioDecoder::extract_streams(
     bool full_quality = (packet_skip == 1);
 
     std::ostringstream oss;
-    oss << "[Heimdall] Extracting " << indices_to_use.size() << " streams at "
+    oss << "[Muninn Audio] Extracting " << indices_to_use.size() << " streams at "
         << target_sample_rate_ << "Hz (quality=" << quality << ", skip=" << packet_skip << ")";
     TS_PRINT(oss.str());
 
@@ -296,7 +297,7 @@ int AudioDecoder::extract_streams(
     }
 
     if (file_index_to_logical.empty()) {
-        TS_PRINT("[Heimdall] ERROR: No valid streams to extract");
+        TS_PRINT("[Muninn Audio] ERROR: No valid streams to extract");
         return 0;
     }
 
@@ -384,7 +385,7 @@ int AudioDecoder::extract_streams(
     }
 
     oss.str("");
-    oss << "[Heimdall] Extraction complete: " << packets_read << " packets processed";
+    oss << "[Muninn Audio] Extraction complete: " << packets_read << " packets processed";
     TS_PRINT(oss.str());
 
     int successful_streams = 0;
@@ -392,7 +393,7 @@ int AudioDecoder::extract_streams(
         if (!pair.second.empty()) {
             successful_streams++;
             oss.str("");
-            oss << "[Heimdall] Stream " << pair.first << ": " << pair.second.size()
+            oss << "[Muninn Audio] Stream " << pair.first << ": " << pair.second.size()
                 << " samples (" << std::fixed << std::setprecision(2)
                 << (pair.second.size() / static_cast<double>(target_sample_rate_)) << "s)";
             TS_PRINT(oss.str());
@@ -428,4 +429,5 @@ void AudioDecoder::close() {
     is_open_ = false;
 }
 
-} // namespace heimdall
+} // namespace audio
+} // namespace muninn

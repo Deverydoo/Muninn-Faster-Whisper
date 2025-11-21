@@ -1,12 +1,27 @@
 # Muninn Faster-Whisper
 
-**High-performance Pure C++ Whisper transcription library - Production-ready alternative to Python faster-whisper**
+**Self-contained Pure C++ Whisper Transcription Suite - Production-ready alternative to Python faster-whisper**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
 [![CTranslate2](https://img.shields.io/badge/CTranslate2-Optimized-green.svg)](https://github.com/OpenNMT/CTranslate2)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-Powered-orange.svg)](https://ffmpeg.org/)
 
 > **Muninn** - In Norse mythology, Muninn ("memory" or "mind") is one of Odin's ravens that flies across the world gathering information.
+
+**A complete, self-contained C++ Whisper transcription library with built-in audio extraction, VAD, and comprehensive hallucination filtering.**
+
+## What Makes Muninn Special?
+
+Unlike other C++ Whisper implementations, Muninn is **truly self-contained**:
+
+✅ **No external audio tools** - Built-in FFmpeg-powered decoder
+✅ **No Python dependencies** - Pure C++17 implementation
+✅ **Minimal setup** - Just vcpkg + CTranslate2
+✅ **Default VAD works out-of-box** - Energy VAD requires no extra dependencies
+✅ **Production-ready** - Comprehensive hallucination filtering & multi-track support
+
+**Build once, deploy anywhere** - Just copy `muninn.dll` + `ctranslate2.dll` + model files.
 
 ## Why Muninn?
 
@@ -21,6 +36,12 @@ Muninn delivers all of this while maintaining **feature parity with Python faste
 
 ## Features
 
+### Self-Contained Architecture
+- **Built-in Audio Extraction** - Internal FFmpeg-powered decoder (no external DLLs)
+- **Zero Python Dependencies** - Pure C++ implementation
+- **Single Library Integration** - One DLL/SO + CTranslate2
+- **Minimal External Dependencies** - Only vcpkg for FFmpeg (MSVC) or system FFmpeg
+
 ### Core Transcription
 - **Automatic Language Detection** - Detects 99+ languages automatically
 - **Multi-track Audio Support** - Process video files with multiple audio tracks separately
@@ -29,8 +50,8 @@ Muninn delivers all of this while maintaining **feature parity with Python faste
 - **Temperature Fallback** - Automatic retry with higher temperatures on difficult segments
 
 ### Voice Activity Detection (VAD)
-- **Silero VAD** - Neural network-based speech detection (most accurate)
-- **Energy VAD** - Fast energy-based fallback (no dependencies)
+- **Energy VAD** - Fast energy-based detection (**default**, no dependencies)
+- **Silero VAD** - Neural network-based speech detection (optional, requires ONNX Runtime)
 - **Automatic Silence Skipping** - Skip non-speech regions for faster processing
 - **VAD-aware Timestamp Remapping** - Accurate timestamps on original timeline
 
@@ -71,11 +92,13 @@ int main() {
     // Configure transcription
     TranscribeOptions options;
     options.language = "auto";           // Auto-detect language
-    options.vad_filter = true;           // Enable VAD
-    options.vad_type = VADType::Silero;  // Use neural VAD
-    options.silero_model_path = "models/silero_vad.onnx";
+    options.vad_filter = true;           // Enable VAD (uses Energy VAD by default)
     options.beam_size = 5;
     options.word_timestamps = false;     // Set true for word-level timing
+
+    // Optional: Enable Silero VAD for better accuracy
+    // options.vad_type = VADType::Silero;
+    // options.silero_model_path = "models/silero_vad.onnx";
 
     // Transcribe audio/video file
     auto result = transcriber.transcribe("video.mp4", options);
@@ -126,30 +149,101 @@ Memory usage: **~40% lower** than Python implementation
 ## Installation
 
 ### Requirements
+
+**Minimum:**
 - C++17 compiler (MSVC 2022, GCC 9+, Clang 10+)
 - CMake 3.20+
-- CUDA Toolkit 11.8+ (for GPU acceleration)
-- CTranslate2 (included or provide your own build)
-- Heimdall 2.0+ (required, for audio extraction - included in `third_party/heimdall/`)
-- ONNX Runtime (optional, for Silero VAD)
+- vcpkg (Windows/MSVC) or system FFmpeg (Linux/Mac)
+- CTranslate2 (build guide included - see [third_party/CTranslate2/BUILD_MSVC.md](third_party/CTranslate2/BUILD_MSVC.md))
 
-### Build from Source
+**Optional:**
+- CUDA Toolkit 11.8+ (for GPU acceleration)
+- ONNX Runtime (for Silero VAD - optional, Energy VAD is default)
+
+### Build from Source (Windows with MSVC)
+
+**Step 1: Install vcpkg and FFmpeg**
+```bash
+# Install vcpkg (if not already installed)
+git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+
+# Install FFmpeg
+C:\vcpkg\vcpkg install ffmpeg:x64-windows-static
+```
+
+**Step 2: Build CTranslate2** (see [BUILD_MSVC.md](third_party/CTranslate2/BUILD_MSVC.md))
+```bash
+cd third_party/CTranslate2
+mkdir build && cd build
+
+# Quick build (minimal dependencies)
+cmake -G "Visual Studio 17 2022" -A x64 ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" ^
+  -DBUILD_SHARED_LIBS=ON ^
+  -DWITH_MKL=OFF ^
+  -DWITH_RUY=ON ^
+  -DWITH_CUDA=OFF ^
+  -DBUILD_CLI=OFF ^
+  ..
+
+cmake --build . --config Release -j
+
+# Copy DLL to lib folder
+copy build\Release\ctranslate2.dll ..\..\lib\
+```
+
+**Step 3: Build Muninn**
+```bash
+# From repository root
+mkdir build && cd build
+
+# Configure (Energy VAD only, no ONNX dependency)
+cmake -G "Visual Studio 17 2022" -A x64 ^
+  -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ^
+  -DVCPKG_TARGET_TRIPLET="x64-windows-static" ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DWITH_CUDA=ON ^
+  -DWITH_SILERO_VAD=OFF ^
+  ..
+
+# Build
+cmake --build . --config Release -j
+
+# Output: build/Release/muninn.dll + ctranslate2.dll
+```
+
+**Optional: Enable Silero VAD**
+```bash
+# Add to cmake command:
+-DWITH_SILERO_VAD=ON
+# Requires ONNX Runtime in third_party/onnx/
+```
+
+### Build from Source (Linux/Mac)
 
 ```bash
 git clone --recursive https://github.com/nordiq-ai/muninn-faster-whisper.git
 cd muninn-faster-whisper
 
-# Configure with all features
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-      -DWITH_CUDA=ON \
-      -DWITH_SILERO_VAD=ON \
-      -DWITH_HEIMDALL=ON
+# Install FFmpeg (system)
+sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswresample-dev  # Ubuntu/Debian
+# OR
+brew install ffmpeg  # macOS
 
-# Build
-cmake --build build --config Release -j
+# Build CTranslate2 (see third_party/CTranslate2/README.md)
+cd third_party/CTranslate2 && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON
+make -j
+cd ../../..
+
+# Build Muninn
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON
+cmake --build build -j
 
 # Install
-cmake --install build --prefix /usr/local
+sudo cmake --install build --prefix /usr/local
 ```
 
 ### CMake Integration
@@ -375,23 +469,24 @@ auto result = transcriber.transcribe("video.mp4", options,
 
 ## Dependencies
 
-| Dependency | Required | Purpose |
-|------------|----------|---------|
-| CTranslate2 | Yes | Whisper inference engine |
-| Heimdall 2.0 | Yes | Audio/video file loading (380x real-time extraction) |
-| CUDA | Recommended | GPU acceleration |
-| ONNX Runtime | Optional | Silero VAD support |
+| Dependency | Required | Purpose | Source |
+|------------|----------|---------|--------|
+| **CTranslate2** | Yes | Whisper inference engine | Build from `third_party/CTranslate2/` |
+| **FFmpeg** | Yes | Internal audio extraction | vcpkg (Windows) or system (Linux/Mac) |
+| **CUDA** | Recommended | GPU acceleration | NVIDIA CUDA Toolkit |
+| **ONNX Runtime** | Optional | Silero VAD (Energy VAD is default) | Download or build |
 
-### Heimdall Audio Engine
+### Internal Audio Decoder
 
-Muninn uses **Heimdall 2.0** for audio extraction. Heimdall's v2 API provides:
+Muninn includes a **built-in FFmpeg-powered audio decoder** for self-contained operation:
 
-- **16kHz mono float32 output** - Optimized for CTranslate2/Whisper requirements
+- **16kHz mono float32 output** - Optimized for Whisper requirements
 - **Multi-track support** - Extract each audio track separately (no mixing)
-- **380x real-time** performance (4-min video extracted in 0.6s)
-- **Static linking** - Standalone DLL with no external dependencies
+- **Multi-format support** - MP3, WAV, M4A, FLAC, MP4, MOV, MKV, etc.
+- **Multi-threaded decoding** - Fast extraction using all CPU cores
+- **Single-pass multi-stream** - Extract multiple tracks in one pass
 
-Heimdall is included in `third_party/heimdall/`. See [Heimdall README](third_party/heimdall/README.md) for build instructions.
+**No external audio extraction DLLs required** - everything is statically linked into muninn.dll.
 
 ## Project Status
 

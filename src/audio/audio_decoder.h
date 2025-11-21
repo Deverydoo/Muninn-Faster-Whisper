@@ -12,13 +12,15 @@ extern "C" {
     #include <libswresample/swresample.h>
 }
 
-namespace heimdall {
+namespace muninn {
+namespace audio {
 
 /**
- * AudioDecoder - Heimdall's Acute Hearing
+ * AudioDecoder - Audio Extraction for Muninn
  *
- * Extracts audio from video files with the precision of Heimdall's legendary senses.
+ * Extracts audio from video files for transcription.
  * Can detect and decode multiple audio streams simultaneously.
+ * Optimized for Whisper transcription (16kHz mono float32).
  */
 class AudioDecoder {
 public:
@@ -29,10 +31,10 @@ public:
      * Open audio file and prepare for decoding
      *
      * @param filename Path to audio/video file
-     * @param target_sample_rate Target sample rate for resampling (default: 48000)
+     * @param target_sample_rate Target sample rate for resampling (default: 16000 for Whisper)
      * @return True if successful
      */
-    bool open(const std::string& filename, int target_sample_rate = 48000);
+    bool open(const std::string& filename, int target_sample_rate = 16000);
 
     /**
      * Get number of audio streams in file
@@ -67,10 +69,9 @@ public:
     /**
      * Extract audio streams (UNIFIED CORE METHOD)
      *
-     * Single-pass extraction for all use cases:
+     * Single-pass extraction for transcription:
      * - Transcription: quality=100 (full decode)
-     * - Fast waveforms: quality=10 (10% packets)
-     * - Detailed waveforms: quality=100 at higher sample rates
+     * - Fast preview: quality=10 (10% packets)
      *
      * Each track is kept separate (no mixing/merging).
      *
@@ -114,4 +115,5 @@ private:
     bool init_stream(int stream_index);
 };
 
-} // namespace heimdall
+} // namespace audio
+} // namespace muninn

@@ -1,4 +1,0 @@
-Microsoft Windows [Version 10.0.26200.7019]
-(c) Microsoft Corporation. All rights reserved.
-
-D:\machine_learning\Loki-Studio\cpp_heimdall>
