@@ -1,5 +1,6 @@
 #pragma once
 
+#include "export.h"
 #include "types.h"
 #include <memory>
 #include <string>
@@ -11,7 +12,7 @@ namespace muninn {
 /**
  * @brief Audio file information (from Heimdall)
  */
-struct AudioInfo {
+struct MUNINN_API AudioInfo {
     float duration;              // Duration in seconds
     int sample_rate;             // Native sample rate
     int num_tracks;              // Number of audio tracks/streams
@@ -50,7 +51,7 @@ using ProgressCallback = std::function<bool(int track_index, int total_tracks, f
  *   }
  * @endcode
  */
-class Transcriber {
+class MUNINN_API Transcriber {
 public:
     /**
      * @brief Initialize Whisper transcriber with ModelOptions

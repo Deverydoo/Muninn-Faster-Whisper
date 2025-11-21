@@ -82,9 +82,9 @@ int main(int argc, char* argv[]) {
     std::cout << "═══════════════════════════════════════════════════════════\n\n";
     std::cout.flush();
 
-    // Hardcoded test paths (relative to executable location)
-    std::string model_path = "models/faster-whisper-large-v3-turbo";
-    std::string audio_path = "test.mp4";
+    // Parse command-line arguments or use defaults
+    std::string model_path = (argc > 1) ? argv[1] : "models/faster-whisper-large-v3-turbo";
+    std::string audio_path = (argc > 2) ? argv[2] : "test.mp4";
 
     std::cout << "[Test] Model: " << model_path << "\n";
     std::cout << "[Test] Audio: " << audio_path << "\n\n";
@@ -130,7 +130,9 @@ int main(int argc, char* argv[]) {
         options.temperature = 0.0f;
         options.vad_filter = true;  // Enable VAD filtering
         options.vad_type = muninn::VADType::Silero;
-        options.silero_model_path = "models/silero_vad.onnx";
+        // Silero VAD model - try in same directory as whisper model first
+        std::string silero_path = model_path + "/../silero_vad.onnx";
+        options.silero_model_path = silero_path;
         options.word_timestamps = false;  // Word-level timestamps (off by default)
 
         std::cout << "[DEBUG] Step 6: About to call transcribe()...\n";
