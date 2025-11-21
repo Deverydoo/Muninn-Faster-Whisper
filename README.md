@@ -136,7 +136,7 @@ Memory usage: **~40% lower** than Python implementation
 ### Build from Source
 
 ```bash
-git clone https://github.com/nordiq-ai/muninn-faster-whisper.git
+git clone --recursive https://github.com/nordiq-ai/muninn-faster-whisper.git
 cd muninn-faster-whisper
 
 # Configure with all features

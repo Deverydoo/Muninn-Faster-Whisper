@@ -39,9 +39,10 @@ Makefile
 *.cmake
 !CMakeLists.txt
 
-# Dependencies (linked externally) - exclude large/external deps, include heimdall source
+# Dependencies (linked externally) - exclude large/external deps, include heimdall source and CTranslate2 submodule
 third_party/*
 !third_party/heimdall/
+!third_party/CTranslate2/
 
 # Claude
 .claude/
