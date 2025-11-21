@@ -47,12 +47,76 @@ if(WITH_CUDA)
 endif()
 
 # =======================
+# Heimdall Audio Decoder
+# =======================
+
+set(HEIMDALL_DIR "${CMAKE_SOURCE_DIR}/third_party/heimdall")
+
+# Find FFmpeg libraries
+find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h
+    HINTS
+        "C:/ffmpeg/include"
+        "C:/Program Files/ffmpeg/include"
+        "${HEIMDALL_DIR}/ffmpeg/include"
+)
+
+find_library(AVFORMAT_LIB avformat
+    HINTS
+        "C:/ffmpeg/lib"
+        "C:/Program Files/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
+)
+
+find_library(AVCODEC_LIB avcodec
+    HINTS
+        "C:/ffmpeg/lib"
+        "C:/Program Files/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
+)
+
+find_library(AVUTIL_LIB avutil
+    HINTS
+        "C:/ffmpeg/lib"
+        "C:/Program Files/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
+)
+
+find_library(SWRESAMPLE_LIB swresample
+    HINTS
+        "C:/ffmpeg/lib"
+        "C:/Program Files/ffmpeg/lib"
+        "${HEIMDALL_DIR}/ffmpeg/lib"
+)
+
+if(NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIB)
+    message(WARNING "FFmpeg not found. Audio file loading will not be available.")
+    message(WARNING "You can still use transcribe(samples, sample_rate) API.")
+    set(WITH_FFMPEG OFF)
+else()
+    message(STATUS "FFmpeg found: ${FFMPEG_INCLUDE_DIR}")
+    set(WITH_FFMPEG ON)
+endif()
+
+# =======================
 # Muninn Library
 # =======================
 
-add_library(muninn_faster_whisper STATIC
+set(MUNINN_SOURCES
     src/mel_spectrogram.cpp
     src/transcriber.cpp
+    src/audio_extractor.cpp
+)
+
+# Add Heimdall source if FFmpeg is available
+if(WITH_FFMPEG)
+    list(APPEND MUNINN_SOURCES
+        ${HEIMDALL_DIR}/src/audio_decoder.cpp
+    )
+    add_compile_definitions(WITH_FFMPEG)
+endif()
+
+add_library(muninn_faster_whisper STATIC
+    ${MUNINN_SOURCES}
 )
 
 target_include_directories(muninn_faster_whisper
@@ -62,10 +126,28 @@ target_include_directories(muninn_faster_whisper
         ${CTRANSLATE2_INCLUDE_DIR}
 )
 
+if(WITH_FFMPEG)
+    target_include_directories(muninn_faster_whisper
+        PRIVATE
+            ${FFMPEG_INCLUDE_DIR}
+            ${HEIMDALL_DIR}/src
+    )
+endif()
+
 target_link_libraries(muninn_faster_whisper
     PUBLIC
         ${CTRANSLATE2_LIB}
 )
+
+if(WITH_FFMPEG)
+    target_link_libraries(muninn_faster_whisper
+        PUBLIC
+            ${AVFORMAT_LIB}
+            ${AVCODEC_LIB}
+            ${AVUTIL_LIB}
+            ${SWRESAMPLE_LIB}
+    )
+endif()
 
 if(WITH_CUDA)
     target_link_libraries(muninn_faster_whisper

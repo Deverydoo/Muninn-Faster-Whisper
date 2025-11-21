@@ -1,5 +1,6 @@
 #include "muninn/transcriber.h"
 #include "muninn/mel_spectrogram.h"
+#include "muninn/audio_extractor.h"
 #include <ctranslate2/models/whisper.h>
 #include <ctranslate2/utils.h>
 #include <algorithm>
@@ -445,8 +446,21 @@ TranscribeResult Transcriber::transcribe(
     const std::string& audio_path,
     const TranscribeOptions& options
 ) {
-    // TODO: Implement audio file loading via Heimdall
-    throw std::runtime_error("File-based transcription not yet implemented. Use transcribe(samples, sample_rate) instead.");
+    // Load audio file using AudioExtractor
+    AudioExtractor extractor;
+    std::vector<float> samples;
+    float duration = 0.0f;
+
+    std::cout << "[Muninn] Loading audio from: " << audio_path << "\n";
+
+    if (!extractor.extract_audio(audio_path, samples, duration)) {
+        throw std::runtime_error("Failed to load audio file: " + extractor.get_last_error());
+    }
+
+    std::cout << "[Muninn] Audio loaded: " << samples.size() << " samples (" << duration << "s)\n";
+
+    // Transcribe the loaded samples
+    return transcribe(samples, 16000, options);
 }
 
 Transcriber::ModelInfo Transcriber::get_model_info() const {

@@ -33,22 +33,18 @@ if exist CTranslate2 (
 )
 
 echo.
-echo [2/3] Copying Heimdall audio decoder...
-if not exist heimdall mkdir heimdall
-if not exist heimdall\include mkdir heimdall\include
-
-copy /Y "D:\machine_learning\Loki-Studio\cpp_heimdall_waveform_engine\build\Release\heimdall.dll" heimdall\ >nul
-copy /Y "D:\machine_learning\Loki-Studio\cpp_heimdall_waveform_engine\build\Release\heimdall.lib" heimdall\ >nul
-copy /Y "D:\machine_learning\Loki-Studio\cpp_heimdall_waveform_engine\src\audio_decoder.h" heimdall\include\ >nul
-copy /Y "D:\machine_learning\Loki-Studio\cpp_heimdall_waveform_engine\src\heimdall.h" heimdall\include\ >nul
-
-if errorlevel 1 (
-    echo     ERROR: Failed to copy Heimdall files
-    echo     Make sure Heimdall is built: cpp_heimdall_waveform_engine\build\Release\heimdall.dll
-    pause
-    exit /b 1
+echo [2/3] Creating Heimdall audio decoder symlink...
+if exist heimdall (
+    echo     Heimdall already exists, skipping
+) else (
+    mklink /D heimdall "D:\machine_learning\Loki-Studio\cpp_heimdall_waveform_engine"
+    if errorlevel 1 (
+        echo     ERROR: Failed to create Heimdall symlink
+        pause
+        exit /b 1
+    )
+    echo     ✓ Heimdall symlink created
 )
-echo     ✓ Heimdall DLL and headers copied
 
 echo.
 echo [3/3] Verifying setup...
@@ -57,8 +53,8 @@ if not exist CTranslate2\include (
     pause
     exit /b 1
 )
-if not exist heimdall\heimdall.dll (
-    echo     ERROR: Heimdall DLL not found
+if not exist heimdall\src\audio_decoder.h (
+    echo     ERROR: Heimdall source files not found
     pause
     exit /b 1
 )
