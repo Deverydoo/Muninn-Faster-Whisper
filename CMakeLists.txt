@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Options
 option(WITH_CUDA "Build with CUDA support" ON)
+option(WITH_SILERO_VAD "Build with Silero VAD (requires ONNX Runtime)" OFF)
 option(BUILD_TESTS "Build test applications" ON)
 option(BUILD_EXAMPLES "Build example applications" ON)
 
@@ -76,11 +77,60 @@ set(MUNINN_SOURCES
     src/mel_spectrogram.cpp
     src/transcriber.cpp
     src/audio_extractor.cpp
+    src/vad.cpp
+    src/silero_vad.cpp
 )
 
 # Enable Heimdall if available
 if(WITH_HEIMDALL)
     add_compile_definitions(WITH_HEIMDALL)
+endif()
+
+# =======================
+# ONNX Runtime for Silero VAD (optional)
+# =======================
+
+if(WITH_SILERO_VAD)
+    set(ONNXRUNTIME_DIR "${CMAKE_SOURCE_DIR}/third_party/onnx/onnxruntime-win-x64-gpu-1.23.2" CACHE PATH "Path to ONNX Runtime")
+
+    # Support multiple layouts:
+    # 1. GitHub C API release: lib/onnxruntime.lib, include/
+    # 2. NuGet package: runtimes/win-x64/native/*.lib, build/native/include/
+    find_library(ONNXRUNTIME_LIB
+        NAMES onnxruntime
+        PATHS
+            "${ONNXRUNTIME_DIR}/lib"
+            "${ONNXRUNTIME_DIR}/runtimes/win-x64/native"
+            "${ONNXRUNTIME_DIR}/build/Release"
+        NO_DEFAULT_PATH
+    )
+
+    # Find include directory
+    if(EXISTS "${ONNXRUNTIME_DIR}/include/onnxruntime_cxx_api.h")
+        set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_DIR}/include")
+    elseif(EXISTS "${ONNXRUNTIME_DIR}/build/native/include/onnxruntime_cxx_api.h")
+        set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_DIR}/build/native/include")
+    else()
+        set(ONNXRUNTIME_INCLUDE_DIR "")
+    endif()
+
+    if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+        message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_LIB}")
+        message(STATUS "ONNX Runtime includes: ${ONNXRUNTIME_INCLUDE_DIR}")
+        add_compile_definitions(MUNINN_USE_SILERO_VAD)
+        set(SILERO_VAD_ENABLED ON)
+    elseif(ONNXRUNTIME_LIB)
+        message(WARNING "ONNX Runtime library found but headers missing.")
+        message(WARNING "Headers expected at: ${ONNXRUNTIME_DIR}/include/ or ${ONNXRUNTIME_DIR}/build/native/include/")
+        message(WARNING "Download C API release from: https://github.com/microsoft/onnxruntime/releases")
+        set(SILERO_VAD_ENABLED OFF)
+    else()
+        message(WARNING "ONNX Runtime not found. Silero VAD will be disabled.")
+        message(WARNING "Download from: https://github.com/microsoft/onnxruntime/releases")
+        set(SILERO_VAD_ENABLED OFF)
+    endif()
+else()
+    set(SILERO_VAD_ENABLED OFF)
 endif()
 
 add_library(muninn_faster_whisper STATIC
@@ -101,10 +151,24 @@ if(WITH_HEIMDALL)
     )
 endif()
 
+if(SILERO_VAD_ENABLED)
+    target_include_directories(muninn_faster_whisper
+        PRIVATE
+            ${ONNXRUNTIME_INCLUDE_DIR}
+    )
+endif()
+
 target_link_libraries(muninn_faster_whisper
     PUBLIC
         ${CTRANSLATE2_LIB}
 )
+
+if(SILERO_VAD_ENABLED)
+    target_link_libraries(muninn_faster_whisper
+        PUBLIC
+            ${ONNXRUNTIME_LIB}
+    )
+endif()
 
 if(WITH_HEIMDALL)
     target_link_libraries(muninn_faster_whisper
@@ -176,6 +240,7 @@ message(STATUS "C++ Standard:     C++${CMAKE_CXX_STANDARD}")
 message(STATUS "Build Type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA Support:     ${WITH_CUDA}")
 message(STATUS "Heimdall:         ${WITH_HEIMDALL}")
+message(STATUS "Silero VAD:       ${SILERO_VAD_ENABLED}")
 message(STATUS "CTranslate2:      ${CTRANSLATE2_LIB}")
 message(STATUS "Build Tests:      ${BUILD_TESTS}")
 message(STATUS "Build Examples:   ${BUILD_EXAMPLES}")

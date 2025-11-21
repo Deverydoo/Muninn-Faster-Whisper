@@ -2,8 +2,39 @@
 
 #include <string>
 #include <vector>
+#include <set>
 
 namespace muninn {
+
+/**
+ * @brief VAD algorithm type (user-selectable in GUI)
+ */
+enum class VADType {
+    None,           // No VAD - process all audio
+    Energy,         // Energy-based VAD (fast, no dependencies, ~1ms/chunk)
+    Silero,         // Silero VAD ONNX (most accurate, ~2MB model, ~0.5ms/chunk)
+    WebRTC          // WebRTC/Google VAD (good accuracy, small footprint) - future
+};
+
+/**
+ * @brief Compute precision type
+ */
+enum class ComputeType {
+    Float32,        // Full precision (most accurate, slowest)
+    Float16,        // Half precision (fast on GPU)
+    Int8,           // 8-bit quantized (fastest, good quality)
+    Int8Float16,    // Mixed precision
+    Auto            // Auto-detect best for device
+};
+
+/**
+ * @brief Device type for inference
+ */
+enum class DeviceType {
+    Auto,           // Auto-detect (prefer CUDA if available)
+    CUDA,           // NVIDIA GPU
+    CPU             // CPU only
+};
 
 /**
  * @brief Word-level timestamp information
@@ -20,6 +51,7 @@ struct Word {
  */
 struct Segment {
     int id;                         // Segment index
+    int track_id;                   // Audio track index (for multi-track files)
     float start;                    // Start time in seconds
     float end;                      // End time in seconds
     std::string text;               // Transcribed text
@@ -31,7 +63,7 @@ struct Segment {
     float compression_ratio;        // Text compression ratio
     float no_speech_prob;           // Probability of no speech
 
-    Segment() : id(0), start(0.0f), end(0.0f),
+    Segment() : id(0), track_id(0), start(0.0f), end(0.0f),
                 temperature(0.0f), avg_logprob(0.0f),
                 compression_ratio(0.0f), no_speech_prob(0.0f) {}
 };
@@ -56,38 +88,120 @@ struct TranscribeResult {
 
 /**
  * @brief Transcription configuration options
+ *
+ * All options configurable from the Qt GUI settings panel
  */
 struct TranscribeOptions {
-    // Language and task
+    // ═══════════════════════════════════════════════════════════
+    // Language and Task
+    // ═══════════════════════════════════════════════════════════
     std::string language = "auto";         // "en", "es", "auto", etc.
     std::string task = "transcribe";       // "transcribe" or "translate"
 
-    // Decoding parameters
-    int beam_size = 5;                     // Beam search width
+    // ═══════════════════════════════════════════════════════════
+    // Decoding Parameters
+    // ═══════════════════════════════════════════════════════════
+    int beam_size = 5;                     // Beam search width (1-10)
     float temperature = 0.0f;              // Sampling temperature (0 = greedy)
+    std::vector<float> temperature_fallback = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};  // Temperature fallback sequence
     float patience = 1.0f;                 // Beam search patience
     float length_penalty = 1.0f;           // Length penalty factor
     float repetition_penalty = 1.0f;       // Repetition penalty
     int no_repeat_ngram_size = 0;          // Prevent n-gram repetitions
 
-    // Voice Activity Detection
-    bool vad_filter = true;                // Enable VAD
-    float vad_threshold = 0.5f;            // VAD energy threshold
-    int vad_min_speech_duration_ms = 250;  // Minimum speech duration
-    int vad_max_speech_duration_s = 30;    // Maximum speech duration
-    int vad_min_silence_duration_ms = 2000; // Minimum silence for split
+    // ═══════════════════════════════════════════════════════════
+    // Voice Activity Detection (VAD)
+    // ═══════════════════════════════════════════════════════════
+    VADType vad_type = VADType::Energy;    // VAD algorithm to use
+    bool vad_filter = true;                // Enable VAD (shortcut for vad_type != None)
+    float vad_threshold = 0.02f;           // VAD energy threshold (Energy) or speech prob (Silero)
+    int vad_min_speech_duration_ms = 250;  // Minimum speech duration to keep
+    int vad_max_speech_duration_s = 30;    // Maximum speech duration before split
+    int vad_min_silence_duration_ms = 500; // Minimum silence for split (Energy: 500ms, Silero: 100ms)
+    int vad_speech_pad_ms = 100;           // Padding around speech segments
 
-    // Hallucination filtering
+    // Silero VAD specific
+    std::string silero_model_path;         // Path to silero_vad.onnx (required for VADType::Silero)
+
+    // ═══════════════════════════════════════════════════════════
+    // Hallucination Filtering
+    // ═══════════════════════════════════════════════════════════
     float compression_ratio_threshold = 2.4f;  // Max compression ratio
     float log_prob_threshold = -1.0f;          // Min average log probability
-    float no_speech_threshold = 0.6f;          // Max no-speech probability
+    float no_speech_threshold = 0.4f;          // Max no-speech probability
+    float hallucination_silence_threshold = 0.0f;  // Skip segments in silent regions (0 = disabled)
 
+    // ═══════════════════════════════════════════════════════════
     // Timestamps
+    // ═══════════════════════════════════════════════════════════
     bool word_timestamps = false;          // Extract word-level timing
+    float clip_start = 0.0f;               // Start time for clip (0 = beginning)
+    float clip_end = -1.0f;                // End time for clip (-1 = full audio)
 
-    // Processing
-    int batch_size = 16;                   // Batch size for parallel processing
+    // ═══════════════════════════════════════════════════════════
+    // Token Suppression
+    // ═══════════════════════════════════════════════════════════
+    bool suppress_blank = true;            // Suppress blank outputs at segment start
+    std::vector<int> suppress_tokens = {-1};  // Token IDs to suppress (-1 = use model defaults)
+
+    // ═══════════════════════════════════════════════════════════
+    // Multi-Track Processing
+    // ═══════════════════════════════════════════════════════════
+    std::set<int> skip_tracks;             // Track indices to skip (empty = process all)
+    bool skip_silent_tracks = true;        // Auto-skip tracks with no audio signal
+
+    // ═══════════════════════════════════════════════════════════
+    // Performance Tuning
+    // ═══════════════════════════════════════════════════════════
+    int batch_size = 4;                    // Batch size for parallel GPU processing
     int max_length = 448;                  // Maximum tokens per segment
+
+    // ═══════════════════════════════════════════════════════════
+    // Prompt / Context
+    // ═══════════════════════════════════════════════════════════
+    std::string initial_prompt;            // Initial prompt to condition model
+    std::vector<std::string> hotwords;     // Words to boost recognition
+    bool condition_on_previous = true;     // Use previous text as context
+    float prompt_reset_on_temperature = 0.5f;  // Reset prompt context when T exceeds this
+};
+
+/**
+ * @brief Model initialization options
+ *
+ * Passed to Transcriber constructor
+ */
+struct ModelOptions {
+    std::string model_path;                // Path to CTranslate2 model directory
+
+    // Device configuration
+    DeviceType device = DeviceType::Auto;  // Inference device
+    ComputeType compute_type = ComputeType::Float16;  // Precision
+
+    // Threading (0 = auto-detect)
+    int intra_threads = 0;                 // Threads per operation (CPU)
+    int inter_threads = 1;                 // Parallel operations (workers)
+
+    // GPU options
+    int device_index = 0;                  // GPU index for multi-GPU systems
+
+    // Helper to convert enums to strings for CTranslate2
+    std::string device_string() const {
+        switch (device) {
+            case DeviceType::CUDA: return "cuda";
+            case DeviceType::CPU: return "cpu";
+            default: return "auto";
+        }
+    }
+
+    std::string compute_type_string() const {
+        switch (compute_type) {
+            case ComputeType::Float32: return "float32";
+            case ComputeType::Float16: return "float16";
+            case ComputeType::Int8: return "int8";
+            case ComputeType::Int8Float16: return "int8_float16";
+            default: return "default";
+        }
+    }
 };
 
 } // namespace muninn

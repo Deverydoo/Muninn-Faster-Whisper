@@ -1,6 +1,6 @@
 # Muninn Faster-Whisper
 
-**High-performance C++ Whisper transcription library - Production-ready alternative to Python faster-whisper**
+**High-performance Pure C++ Whisper transcription library - Production-ready alternative to Python faster-whisper**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
@@ -8,17 +8,53 @@
 
 > **Muninn** - In Norse mythology, Muninn ("memory" or "mind") is one of Odin's ravens that flies across the world gathering information.
 
-## What is Muninn?
+## Why Muninn?
 
-Muninn Faster-Whisper is a high-level C++ transcription API that brings Python faster-whisper's reliability and features to C++ applications. Built on an optimized CTranslate2 engine, it provides:
+**A pure C++ faster-whisper has been one of the most requested features in the transcription community.** Python's faster-whisper is excellent, but many applications need:
 
-- ✅ **Drop-in C++ alternative** to Python faster-whisper
-- ✅ **Production-ready** with comprehensive hallucination filtering
-- ✅ **Voice Activity Detection** (VAD) for automatic silence skipping
-- ✅ **Sliding window processing** for long audio files
-- ✅ **Zero Python dependencies** - Pure C++ implementation
-- ✅ **2-4x faster** than Python on same hardware
-- ✅ **Lower memory usage** (~40% less than Python)
+- Native C++ integration without Python dependencies
+- Lower latency for real-time applications
+- Smaller deployment footprint
+- Direct integration with C++ audio/video pipelines
+
+Muninn delivers all of this while maintaining **feature parity with Python faster-whisper**.
+
+## Features
+
+### Core Transcription
+- **Automatic Language Detection** - Detects 99+ languages automatically
+- **Multi-track Audio Support** - Process video files with multiple audio tracks separately
+- **Word-level Timestamps** - Precise timing for each word (optional)
+- **Beam Search Decoding** - High-quality output with configurable beam size
+- **Temperature Fallback** - Automatic retry with higher temperatures on difficult segments
+
+### Voice Activity Detection (VAD)
+- **Silero VAD** - Neural network-based speech detection (most accurate)
+- **Energy VAD** - Fast energy-based fallback (no dependencies)
+- **Automatic Silence Skipping** - Skip non-speech regions for faster processing
+- **VAD-aware Timestamp Remapping** - Accurate timestamps on original timeline
+
+### Quality & Hallucination Filtering
+- **Compression Ratio Checks** - Detect repetitive hallucinations
+- **Log Probability Thresholds** - Filter low-confidence outputs
+- **No-speech Probability Filtering** - Skip segments with no actual speech
+- **Repetition Detection** - Catch phrase/word repetition patterns
+- **Cross-chunk Hallucination Detection** - Detect repeated phrases across chunks
+- **Silence Region Filtering** - Filter segments that fall in silent regions
+
+### Performance
+- **CUDA GPU Acceleration** - Full NVIDIA GPU utilization
+- **Batched Inference** - Process multiple chunks in parallel on GPU
+- **Optimized CTranslate2** - Custom-built for maximum speed
+- **2-4x Faster than Python** - No interpreter overhead
+- **~40% Lower Memory** - Efficient C++ memory management
+
+### Advanced Options
+- **Clip Timestamps** - Process only specific time ranges
+- **Initial Prompt** - Condition model on domain-specific vocabulary
+- **Condition on Previous Text** - Better consistency across segments
+- **Token Suppression** - Control which tokens can be generated
+- **Skip Tracks** - Skip specific audio tracks in multi-track files
 
 ## Quick Start
 
@@ -27,82 +63,53 @@ Muninn Faster-Whisper is a high-level C++ transcription API that brings Python f
 
 using namespace muninn;
 
-// Initialize transcriber
-Transcriber transcriber("models/faster-whisper-large-v3-turbo",
-                        "cuda", "float16");
+int main() {
+    // Initialize transcriber with GPU
+    Transcriber transcriber("models/faster-whisper-large-v3-turbo",
+                            "cuda", "float16");
 
-// Configure transcription
-TranscribeOptions options;
-options.language = "en";
-options.vad_filter = true;
-options.beam_size = 5;
-options.temperature = 0.0f;
+    // Configure transcription
+    TranscribeOptions options;
+    options.language = "auto";           // Auto-detect language
+    options.vad_filter = true;           // Enable VAD
+    options.vad_type = VADType::Silero;  // Use neural VAD
+    options.silero_model_path = "models/silero_vad.onnx";
+    options.beam_size = 5;
+    options.word_timestamps = false;     // Set true for word-level timing
 
-// Transcribe audio
-auto result = transcriber.transcribe("audio.mp3", options);
+    // Transcribe audio/video file
+    auto result = transcriber.transcribe("video.mp4", options);
 
-// Access segments
-for (const auto& segment : result.segments) {
-    printf("[%.2f -> %.2f] %s\n",
-           segment.start, segment.end, segment.text.c_str());
+    // Print results
+    std::cout << "Language: " << result.language << std::endl;
+    std::cout << "Duration: " << result.duration << "s" << std::endl;
+
+    for (const auto& segment : result.segments) {
+        printf("[Track %d] [%.2f -> %.2f] %s\n",
+               segment.track_id, segment.start, segment.end,
+               segment.text.c_str());
+    }
+
+    return 0;
 }
 ```
 
-## Features
+## Feature Parity with faster-whisper
 
-### High-Level API
-- **One-line transcription** - Simple API matching Python faster-whisper
-- **Automatic prompting** - No manual token management
-- **Language detection** - Auto-detect or specify language
-- **Word timestamps** - Extract word-level timing (optional)
-
-### Quality & Reliability
-- **VAD filtering** - Skip silent segments automatically
-- **Hallucination detection** - Comprehensive quality filtering:
-  - Compression ratio checks
-  - Repetition detection
-  - No-speech probability filtering
-  - Log probability thresholds
-- **Sliding window processing** - Handle audio of any length
-
-### Performance
-- **Optimized CTranslate2** - Custom-built for maximum speed
-- **CUDA acceleration** - Full GPU utilization
-- **Batched inference** - Process multiple segments in parallel
-- **Lower overhead** - No Python interpreter or GIL
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Muninn::Transcriber                  │
-│                   (High-Level API)                      │
-└─────────────────┬───────────────────────────────────────┘
-                  │
-     ┌────────────┴────────────┐
-     │                         │
-┌────▼──────┐        ┌────────▼─────────┐
-│    VAD    │        │ AudioProcessor   │
-│ (Silence  │        │  (Sliding        │
-│  Filter)  │        │   Windows)       │
-└─────┬─────┘        └────────┬─────────┘
-      │                       │
-      └───────────┬───────────┘
-                  │
-     ┌────────────▼────────────────┐
-     │   MelSpectrogram Converter  │
-     └────────────┬────────────────┘
-                  │
-     ┌────────────▼────────────────┐
-     │  CTranslate2 Whisper Engine │
-     │    (Optimized Build)        │
-     └────────────┬────────────────┘
-                  │
-     ┌────────────▼────────────────┐
-     │   Hallucination Filter      │
-     │  (Quality Control)          │
-     └─────────────────────────────┘
-```
+| Feature | faster-whisper (Python) | Muninn (C++) |
+|---------|------------------------|--------------|
+| Silero VAD | ✅ | ✅ |
+| Beam Search | ✅ | ✅ |
+| Temperature Fallback | ✅ | ✅ |
+| Condition on Previous | ✅ | ✅ |
+| Language Detection | ✅ | ✅ |
+| Word Timestamps | ✅ | ✅ |
+| Hallucination Filtering | ✅ | ✅ |
+| Batched Processing | ✅ | ✅ |
+| Initial Prompt | ✅ | ✅ |
+| Clip Timestamps | ✅ | ✅ |
+| Multi-track Audio | ❌ | ✅ |
+| No Python Required | ❌ | ✅ |
 
 ## Performance Benchmarks
 
@@ -122,7 +129,9 @@ Memory usage: **~40% lower** than Python implementation
 - C++17 compiler (MSVC 2022, GCC 9+, Clang 10+)
 - CMake 3.20+
 - CUDA Toolkit 11.8+ (for GPU acceleration)
-- CTranslate2 (included as optimized build)
+- CTranslate2 (included or provide your own build)
+- ONNX Runtime (optional, for Silero VAD)
+- Heimdall (optional, for audio extraction)
 
 ### Build from Source
 
@@ -130,8 +139,11 @@ Memory usage: **~40% lower** than Python implementation
 git clone https://github.com/nordiq-ai/muninn-faster-whisper.git
 cd muninn-faster-whisper
 
-# Configure
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON
+# Configure with all features
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_CUDA=ON \
+      -DWITH_SILERO_VAD=ON \
+      -DWITH_HEIMDALL=ON
 
 # Build
 cmake --build build --config Release -j
@@ -154,22 +166,34 @@ target_link_libraries(your_app PRIVATE Muninn::faster-whisper)
 ```cpp
 class Transcriber {
 public:
-    // Constructor
+    // Constructor with ModelOptions (recommended)
+    explicit Transcriber(const ModelOptions& options);
+
+    // Constructor with strings (convenience)
     Transcriber(const std::string& model_path,
                 const std::string& device = "cuda",
                 const std::string& compute_type = "float16");
 
-    // Main transcription methods
+    // Transcribe from file (supports MP3, WAV, M4A, FLAC, MP4, MOV, etc.)
     TranscribeResult transcribe(
         const std::string& audio_path,
-        const TranscribeOptions& options = {}
+        const TranscribeOptions& options = {},
+        ProgressCallback progress_callback = nullptr
     );
 
+    // Transcribe from memory
     TranscribeResult transcribe(
         const std::vector<float>& audio_samples,
         int sample_rate = 16000,
-        const TranscribeOptions& options = {}
+        const TranscribeOptions& options = {},
+        int track_id = 0
     );
+
+    // Get audio file info without transcribing
+    static AudioInfo get_audio_info(const std::string& audio_path);
+
+    // Get model information
+    ModelInfo get_model_info() const;
 };
 ```
 
@@ -177,42 +201,81 @@ public:
 
 ```cpp
 struct TranscribeOptions {
-    // Language and task
-    std::string language = "auto";     // "en", "es", or "auto"
-    std::string task = "transcribe";   // "transcribe" or "translate"
+    // Language and Task
+    std::string language = "auto";         // "en", "es", "auto", etc.
+    std::string task = "transcribe";       // "transcribe" or "translate"
 
-    // Decoding parameters
-    int beam_size = 5;
-    float temperature = 0.0f;
-    float patience = 1.0f;
-    float repetition_penalty = 1.0f;
+    // Decoding Parameters
+    int beam_size = 5;                     // Beam search width (1-10)
+    float temperature = 0.0f;              // Sampling temperature (0 = greedy)
+    std::vector<float> temperature_fallback = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
+    float patience = 1.0f;                 // Beam search patience
+    float length_penalty = 1.0f;           // Length penalty factor
+    float repetition_penalty = 1.0f;       // Repetition penalty
+    int no_repeat_ngram_size = 0;          // Prevent n-gram repetitions
 
-    // Voice Activity Detection
-    bool vad_filter = true;
-    float vad_threshold = 0.5f;
-    int vad_min_speech_duration_ms = 250;
+    // Voice Activity Detection (VAD)
+    VADType vad_type = VADType::Energy;    // Energy, Silero, or None
+    bool vad_filter = true;                // Enable VAD filtering
+    float vad_threshold = 0.02f;           // VAD threshold
+    int vad_min_speech_duration_ms = 250;  // Minimum speech duration
+    int vad_max_speech_duration_s = 30;    // Maximum segment duration
+    int vad_min_silence_duration_ms = 500; // Minimum silence for split
+    int vad_speech_pad_ms = 100;           // Padding around speech
+    std::string silero_model_path;         // Path to silero_vad.onnx
 
-    // Hallucination filtering
+    // Hallucination Filtering
     float compression_ratio_threshold = 2.4f;
     float log_prob_threshold = -1.0f;
-    float no_speech_threshold = 0.6f;
+    float no_speech_threshold = 0.4f;
+    float hallucination_silence_threshold = 0.0f;  // 0 = disabled
 
     // Timestamps
-    bool word_timestamps = false;
+    bool word_timestamps = false;          // Extract word-level timing
+    float clip_start = 0.0f;               // Start time for clip
+    float clip_end = -1.0f;                // End time (-1 = full audio)
+
+    // Token Suppression
+    bool suppress_blank = true;
+    std::vector<int> suppress_tokens = {-1};
+
+    // Multi-Track Processing
+    std::set<int> skip_tracks;             // Track indices to skip
+    bool skip_silent_tracks = true;        // Auto-skip silent tracks
+
+    // Performance Tuning
+    int batch_size = 4;                    // Batch size for GPU
+    int max_length = 448;                  // Max tokens per segment
+
+    // Prompt / Context
+    std::string initial_prompt;            // Domain-specific vocabulary
+    std::vector<std::string> hotwords;     // Words to boost (planned)
+    bool condition_on_previous = true;     // Use previous text as context
+    float prompt_reset_on_temperature = 0.5f;  // Reset context threshold
 };
 ```
 
 ### TranscribeResult
 
 ```cpp
+struct Word {
+    float start;             // Start time in seconds
+    float end;               // End time in seconds
+    std::string word;        // The word text
+    float probability;       // Confidence score
+};
+
 struct Segment {
-    int id;
-    float start;
-    float end;
-    std::string text;
-    std::vector<Word> words;  // If word_timestamps=true
-    float avg_logprob;
-    float no_speech_prob;
+    int id;                  // Segment index
+    int track_id;            // Audio track index
+    float start;             // Start time in seconds
+    float end;               // End time in seconds
+    std::string text;        // Transcribed text
+    std::vector<Word> words; // Word timestamps (if enabled)
+    float temperature;       // Temperature used
+    float avg_logprob;       // Average log probability
+    float compression_ratio; // Text compression ratio
+    float no_speech_prob;    // No speech probability
 };
 
 struct TranscribeResult {
@@ -220,6 +283,10 @@ struct TranscribeResult {
     std::string language;
     float language_probability;
     float duration;
+
+    // Range-based for loop support
+    auto begin() { return segments.begin(); }
+    auto end() { return segments.end(); }
 };
 ```
 
@@ -234,66 +301,114 @@ int main() {
     muninn::Transcriber transcriber("models/whisper-large-v3-turbo");
     auto result = transcriber.transcribe("audio.mp3");
 
-    for (const auto& seg : result.segments) {
-        std::cout << seg.text << std::endl;
+    for (const auto& seg : result) {
+        std::cout << "[" << seg.start << "s] " << seg.text << std::endl;
     }
 }
 ```
 
-### Batch Processing
+### With Silero VAD
 
 ```cpp
-std::vector<std::string> audio_files = {
-    "file1.mp3", "file2.mp3", "file3.mp3"
-};
+muninn::TranscribeOptions options;
+options.vad_filter = true;
+options.vad_type = muninn::VADType::Silero;
+options.silero_model_path = "models/silero_vad.onnx";
 
-muninn::Transcriber transcriber("models/whisper-large-v3-turbo");
+auto result = transcriber.transcribe("audio.mp3", options);
+```
 
-for (const auto& file : audio_files) {
-    auto result = transcriber.transcribe(file);
-    // Process result...
+### Word-level Timestamps
+
+```cpp
+muninn::TranscribeOptions options;
+options.word_timestamps = true;
+
+auto result = transcriber.transcribe("audio.mp3", options);
+
+for (const auto& seg : result) {
+    for (const auto& word : seg.words) {
+        printf("[%.2fs] %s\n", word.start, word.word.c_str());
+    }
 }
 ```
 
-### Custom Configuration
+### Process Specific Time Range
 
 ```cpp
-muninn::TranscribeOptions opts;
-opts.language = "es";
-opts.beam_size = 10;
-opts.temperature = 0.2f;
-opts.vad_filter = true;
-opts.word_timestamps = true;
+muninn::TranscribeOptions options;
+options.clip_start = 60.0f;   // Start at 1 minute
+options.clip_end = 120.0f;    // End at 2 minutes
 
-auto result = transcriber.transcribe("audio.mp3", opts);
+auto result = transcriber.transcribe("long_video.mp4", options);
 ```
+
+### Multi-track Video
+
+```cpp
+// Get audio info first
+auto info = muninn::Transcriber::get_audio_info("video.mkv");
+std::cout << "Tracks: " << info.num_tracks << std::endl;
+
+// Transcribe all tracks
+muninn::TranscribeOptions options;
+// options.skip_tracks = {0};  // Skip track 0 if needed
+
+auto result = transcriber.transcribe("video.mkv", options);
+
+// Results are grouped by track_id
+for (const auto& seg : result) {
+    std::cout << "[Track " << seg.track_id << "] " << seg.text << std::endl;
+}
+```
+
+### Progress Callback (GUI Integration)
+
+```cpp
+auto result = transcriber.transcribe("video.mp4", options,
+    [](int track, int total_tracks, float progress, const std::string& msg) {
+        printf("\rTrack %d/%d: %.1f%% - %s",
+               track + 1, total_tracks, progress * 100, msg.c_str());
+        return true;  // Return false to cancel
+    });
+```
+
+## Dependencies
+
+| Dependency | Required | Purpose |
+|------------|----------|---------|
+| CTranslate2 | Yes | Whisper inference engine |
+| CUDA | Recommended | GPU acceleration |
+| ONNX Runtime | Optional | Silero VAD support |
+| Heimdall | Optional | Audio/video file loading |
 
 ## Project Status
 
 **Current Version**: 0.5.0-alpha
-**Status**: Active Development
 
-### Implemented ✅
+### Implemented
 - [x] CTranslate2 Whisper integration
-- [x] Mel-spectrogram conversion
-- [x] Audio extraction (FFmpeg)
-- [x] Basic hallucination filtering
-- [x] Segment generation
+- [x] Mel-spectrogram conversion (128-bin)
+- [x] Silero VAD (neural)
+- [x] Energy VAD (fallback)
+- [x] VAD timestamp remapping
+- [x] Temperature fallback strategy
+- [x] Condition on previous text
+- [x] Language auto-detection
+- [x] Hallucination filtering (comprehensive)
+- [x] Word-level timestamps
+- [x] Batched GPU inference
+- [x] Multi-track audio support
+- [x] Clip timestamps
+- [x] Initial prompt support
+- [x] Token suppression options
+- [x] Progress callbacks
 
-### In Progress 🚧
-- [ ] Voice Activity Detection (VAD)
-- [ ] Sliding window processing
-- [ ] Enhanced hallucination filters
-- [ ] High-level Transcriber API
-- [ ] Word-level timestamps
-
-### Planned 📋
-- [ ] Batched inference
+### Planned
+- [ ] Hotwords/prefix support (logit bias)
 - [ ] Streaming transcription
 - [ ] Python bindings
 - [ ] Pre-built binaries
-
-**Target**: v1.0.0 release in 2-3 weeks
 
 ## Contributing
 
@@ -306,15 +421,15 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - Built on [CTranslate2](https://github.com/OpenNMT/CTranslate2) by OpenNMT
-- Inspired by [faster-whisper](https://github.com/guillaumekln/faster-whisper)
+- Inspired by [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 - Based on [OpenAI Whisper](https://github.com/openai/whisper)
+- Silero VAD from [snakers4/silero-vad](https://github.com/snakers4/silero-vad)
 
 ## Support
 
 - **Issues**: [GitHub Issues](https://github.com/nordiq-ai/muninn-faster-whisper/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/nordiq-ai/muninn-faster-whisper/discussions)
-- **Documentation**: [docs/](docs/)
 
 ---
 
-**Made with ❤️ by NordIQ AI**
+**Made with care for the C++ community**

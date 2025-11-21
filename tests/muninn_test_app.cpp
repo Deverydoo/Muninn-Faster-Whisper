@@ -1,6 +1,7 @@
 #include "muninn/transcriber.h"
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <chrono>
 #include <iomanip>
 
@@ -12,6 +13,20 @@ void print_usage(const char* program_name) {
     std::cout << "\n";
     std::cout << "Note: Audio file loading not yet implemented.\n";
     std::cout << "      Currently requires passing audio samples programmatically.\n";
+}
+
+std::string format_timestamp(float seconds) {
+    int hours = static_cast<int>(seconds) / 3600;
+    int minutes = (static_cast<int>(seconds) % 3600) / 60;
+    int secs = static_cast<int>(seconds) % 60;
+    int ms = static_cast<int>((seconds - static_cast<int>(seconds)) * 1000);
+
+    std::ostringstream ss;
+    ss << std::setfill('0') << std::setw(2) << hours << ":"
+       << std::setw(2) << minutes << ":"
+       << std::setw(2) << secs << "."
+       << std::setw(3) << ms;
+    return ss.str();
 }
 
 void save_transcript(const std::string& output_path, const muninn::TranscribeResult& result) {
@@ -30,17 +45,31 @@ void save_transcript(const std::string& output_path, const muninn::TranscribeRes
     file << "Segments: " << result.segments.size() << "\n";
     file << "═══════════════════════════════════════════════════════════\n\n";
 
-    // Write segments with timestamps
+    // Group segments by track
+    int current_track = -1;
     for (const auto& segment : result.segments) {
-        // Format timestamp as [HH:MM:SS]
-        int hours = static_cast<int>(segment.start) / 3600;
-        int minutes = (static_cast<int>(segment.start) % 3600) / 60;
-        int seconds = static_cast<int>(segment.start) % 60;
+        // Print track header when track changes
+        if (segment.track_id != current_track) {
+            if (current_track != -1) {
+                file << "\n";  // Blank line between tracks
+            }
+            file << "[Track " << segment.track_id << "]\n";
+            current_track = segment.track_id;
+        }
 
-        file << "[" << std::setfill('0') << std::setw(2) << hours << ":"
-             << std::setw(2) << minutes << ":"
-             << std::setw(2) << seconds << "] "
-             << segment.text << "\n";
+        // Format: [HH:MM:SS.mmm] text
+        file << "[" << format_timestamp(segment.start) << "] " << segment.text << "\n";
+
+        // Show word timestamps if available
+        if (!segment.words.empty()) {
+            file << "    Words: ";
+            for (size_t i = 0; i < segment.words.size(); ++i) {
+                const auto& w = segment.words[i];
+                file << "[" << w.start << "s] " << w.word;
+                if (i < segment.words.size() - 1) file << " ";
+            }
+            file << "\n";
+        }
     }
 
     std::cout << "\n[Muninn] Transcript saved to: " << output_path << "\n";
@@ -54,7 +83,7 @@ int main(int argc, char* argv[]) {
     std::cout.flush();
 
     // Hardcoded test paths (relative to executable location)
-    std::string model_path = "faster-whisper-large-v3-turbo";
+    std::string model_path = "models/faster-whisper-large-v3-turbo";
     std::string audio_path = "test.mp4";
 
     std::cout << "[Test] Model: " << model_path << "\n";
@@ -96,9 +125,13 @@ int main(int argc, char* argv[]) {
         std::cout.flush();
 
         muninn::TranscribeOptions options;
-        options.language = "en";
+        options.language = "auto";  // Auto-detect language
         options.beam_size = 5;
         options.temperature = 0.0f;
+        options.vad_filter = true;  // Enable VAD filtering
+        options.vad_type = muninn::VADType::Silero;
+        options.silero_model_path = "models/silero_vad.onnx";
+        options.word_timestamps = false;  // Word-level timestamps (off by default)
 
         std::cout << "[DEBUG] Step 6: About to call transcribe()...\n";
         std::cout.flush();
@@ -120,12 +153,18 @@ int main(int argc, char* argv[]) {
             std::cout << "[Muninn] Real-time factor: " << (duration_ms.count() / 1000.0 / result.duration) << "x\n";
         }
 
-        // Print transcript
+        // Print transcript grouped by track
         std::cout << "\n═══════════════════════════════════════════════════════════\n";
         std::cout << "TRANSCRIPT\n";
         std::cout << "═══════════════════════════════════════════════════════════\n";
+        int current_track = -1;
         for (const auto& segment : result.segments) {
-            std::cout << segment.text << "\n";
+            if (segment.track_id != current_track) {
+                if (current_track != -1) std::cout << "\n";
+                std::cout << "[Track " << segment.track_id << "]\n";
+                current_track = segment.track_id;
+            }
+            std::cout << "[" << format_timestamp(segment.start) << "] " << segment.text << "\n";
         }
         std::cout << "═══════════════════════════════════════════════════════════\n";
 
