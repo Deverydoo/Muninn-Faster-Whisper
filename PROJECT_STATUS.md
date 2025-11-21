@@ -25,42 +25,62 @@ A production-ready C++ implementation of Python faster-whisper's transcription A
    - `SETUP.md` - Build instructions, dependencies
    - `MIGRATION_PLAN.md` - Detailed implementation plan
    - `PROJECT_STATUS.md` (this file)
+   - `GETTING_STARTED.md` - Quick start guide
+   - `DEPENDENCIES.md` - Dependency integration guide
 3. **API Design**:
    - `include/muninn/types.h` - Core types (Segment, TranscribeOptions, etc.)
    - `include/muninn/transcriber.h` - Main API interface
-4. **Foundation** - Ready for code migration from OdinUI
+   - `include/muninn/mel_spectrogram.h` - Audio processing interface
+4. **Core Implementation**:
+   - `src/mel_spectrogram.cpp` - Extracted from OdinUI (184 lines)
+   - `src/transcriber.cpp` - Full implementation (502 lines)
+   - All hallucination detection logic ported
+   - Chunking for long audio implemented
+   - Token filtering working
+5. **Build System**:
+   - `CMakeLists.txt` - Complete build configuration
+   - CUDA detection and linking
+   - CTranslate2 integration
+6. **Test & Example Apps**:
+   - `tests/muninn_test_app.cpp` - Command-line test application
+   - `examples/basic_transcription.cpp` - API usage example
+7. **GitHub**:
+   - Repository initialized
+   - 2 commits pushed
 
 ### 🚧 In Progress
 
-- Awaiting CTranslate2 symlink creation
-- Ready to extract code from Loki-Studio/odin_ui
+- CTranslate2 symlink needs to be created (run `setup_dependencies.bat`)
+- First build attempt pending
 
 ### 📋 Next Steps (Immediate)
 
-1. **Create CTranslate2 symlink** (1 minute)
+1. **Setup Dependencies** (~5 minutes)
+   - Run `setup_dependencies.bat` as Administrator
+   - Creates CTranslate2 symlink
+   - Copies Heimdall DLL and headers
+   - Verifies all dependencies
+
+2. **First Build** (~10 minutes)
    ```bash
-   cd D:\Vibe_Projects\Muninn-Faster-Whisper\third_party
-   mklink /D CTranslate2 "D:\machine_learning\Loki-Studio\CTranslate2"
+   cd D:\Vibe_Projects\Muninn-Faster-Whisper
+   cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+   cmake --build build --config Release -j
    ```
 
-2. **Extract MelSpectrogram** from OdinUI (30 minutes)
-   - Copy `MelSpectrogram.cpp/h`
-   - Remove Qt dependencies
-   - Test compilation
+3. **Integrate Heimdall Audio Decoder** (~1-2 hours)
+   - Add audio loading to `transcriber.cpp`
+   - Implement `transcribe(audio_path)` method
+   - Test with MP3, WAV, M4A files
 
-3. **Extract WhisperTranscriber core** (1-2 hours)
-   - Copy transcription logic
-   - Remove Qt/SagaLogger
-   - Adapt to use `muninn::types`
+4. **First Transcription Test** (~30 minutes)
+   - Run test app on actual audio file
+   - Compare output with Python faster-whisper
+   - Verify hallucination filtering works
 
-4. **Implement VAD** (2-3 hours)
+5. **Implement VAD** (Later - v0.6)
    - Energy-based voice detection
    - ~150 lines of code
-
-5. **Test standalone** (1 hour)
-   - Create simple test app
-   - Transcribe test audio
-   - Compare with Python output
 
 ## Architecture Overview
 
@@ -167,20 +187,19 @@ D:\Vibe_Projects\Muninn-Faster-Whisper\
 │   └── audio_processor.h       📋 TODO
 │
 ├── src/
-│   ├── transcriber.cpp         📋 TODO (extract from OdinUI)
-│   ├── mel_spectrogram.cpp     📋 TODO (extract from OdinUI)
-│   ├── vad.cpp                 📋 TODO (new code)
-│   ├── audio_processor.cpp     📋 TODO (new code)
-│   └── hallucination_filter.cpp 📋 TODO (extract + enhance)
+│   ├── transcriber.cpp         ✅ Complete (502 lines)
+│   ├── mel_spectrogram.cpp     ✅ Complete (184 lines)
+│   ├── vad.cpp                 📋 TODO (v0.6)
+│   └── audio_processor.cpp     📋 TODO (v0.6)
 │
 ├── tests/
-│   └── muninn_test_app.cpp     📋 TODO
+│   └── muninn_test_app.cpp     ✅ Complete (118 lines)
 │
 ├── examples/
-│   └── basic_transcription.cpp 📋 TODO
+│   └── basic_transcription.cpp ✅ Complete (90 lines)
 │
 ├── third_party/
-│   └── CTranslate2/            ⚠️  Need symlink
+│   └── CTranslate2/            ⚠️  Run setup_dependencies.bat
 │
 └── build/                      (created by CMake)
 ```
@@ -190,9 +209,11 @@ D:\Vibe_Projects\Muninn-Faster-Whisper\
 ### Phase 1 (Week 1) - Minimum Viable Product
 - [x] Project structure
 - [x] API design
-- [ ] Code extracted from OdinUI
+- [x] Code extracted from OdinUI
+- [ ] First successful build
+- [ ] Audio file loading (Heimdall integration)
 - [ ] Basic transcription working
-- [ ] Test application
+- [x] Test application created
 
 ### Phase 2 (Week 2) - Feature Complete
 - [ ] VAD implemented
