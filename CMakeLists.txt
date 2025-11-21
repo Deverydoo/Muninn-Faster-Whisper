@@ -47,59 +47,25 @@ if(WITH_CUDA)
 endif()
 
 # =======================
-# Heimdall Audio Decoder
+# Heimdall Audio Decoder (DLL)
 # =======================
 
-set(HEIMDALL_DIR "${CMAKE_SOURCE_DIR}/third_party/heimdall")
+set(HEIMDALL_DIR "${CMAKE_SOURCE_DIR}/lib")
 
-# Find FFmpeg libraries
-find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h
-    HINTS
-        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/include"
-        "${HEIMDALL_DIR}/ffmpeg/include"
-        "C:/ffmpeg/include"
-        "C:/Program Files/ffmpeg/include"
+# Find Heimdall DLL and import library
+find_library(HEIMDALL_LIB heimdall
+    HINTS "${HEIMDALL_DIR}"
+    NO_DEFAULT_PATH
 )
 
-find_library(AVFORMAT_LIB avformat
-    HINTS
-        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
-        "C:/ffmpeg/lib"
-        "C:/Program Files/ffmpeg/lib"
-)
-
-find_library(AVCODEC_LIB avcodec
-    HINTS
-        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
-        "C:/ffmpeg/lib"
-        "C:/Program Files/ffmpeg/lib"
-)
-
-find_library(AVUTIL_LIB avutil
-    HINTS
-        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
-        "C:/ffmpeg/lib"
-        "C:/Program Files/ffmpeg/lib"
-)
-
-find_library(SWRESAMPLE_LIB swresample
-    HINTS
-        "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib"
-        "${HEIMDALL_DIR}/ffmpeg/lib"
-        "C:/ffmpeg/lib"
-        "C:/Program Files/ffmpeg/lib"
-)
-
-if(NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIB)
-    message(WARNING "FFmpeg not found. Audio file loading will not be available.")
-    message(WARNING "You can still use transcribe(samples, sample_rate) API.")
-    set(WITH_FFMPEG OFF)
+if(HEIMDALL_LIB)
+    message(STATUS "Found Heimdall: ${HEIMDALL_LIB}")
+    set(WITH_HEIMDALL ON)
 else()
-    message(STATUS "FFmpeg found: ${FFMPEG_INCLUDE_DIR}")
-    set(WITH_FFMPEG ON)
+    message(WARNING "Heimdall not found in ${HEIMDALL_DIR}")
+    message(WARNING "Audio file loading will not be available.")
+    message(WARNING "You can still use transcribe(samples, sample_rate) API.")
+    set(WITH_HEIMDALL OFF)
 endif()
 
 # =======================
@@ -112,12 +78,9 @@ set(MUNINN_SOURCES
     src/audio_extractor.cpp
 )
 
-# Add Heimdall source if FFmpeg is available
-if(WITH_FFMPEG)
-    list(APPEND MUNINN_SOURCES
-        ${HEIMDALL_DIR}/src/audio_decoder.cpp
-    )
-    add_compile_definitions(WITH_FFMPEG)
+# Enable Heimdall if available
+if(WITH_HEIMDALL)
+    add_compile_definitions(WITH_HEIMDALL)
 endif()
 
 add_library(muninn_faster_whisper STATIC
@@ -131,11 +94,10 @@ target_include_directories(muninn_faster_whisper
         ${CTRANSLATE2_INCLUDE_DIR}
 )
 
-if(WITH_FFMPEG)
+if(WITH_HEIMDALL)
     target_include_directories(muninn_faster_whisper
         PRIVATE
-            ${FFMPEG_INCLUDE_DIR}
-            ${HEIMDALL_DIR}/src
+            ${HEIMDALL_DIR}/include
     )
 endif()
 
@@ -144,13 +106,10 @@ target_link_libraries(muninn_faster_whisper
         ${CTRANSLATE2_LIB}
 )
 
-if(WITH_FFMPEG)
+if(WITH_HEIMDALL)
     target_link_libraries(muninn_faster_whisper
         PUBLIC
-            ${AVFORMAT_LIB}
-            ${AVCODEC_LIB}
-            ${AVUTIL_LIB}
-            ${SWRESAMPLE_LIB}
+            ${HEIMDALL_LIB}
     )
 endif()
 
@@ -216,6 +175,7 @@ message(STATUS "Version:          ${PROJECT_VERSION}")
 message(STATUS "C++ Standard:     C++${CMAKE_CXX_STANDARD}")
 message(STATUS "Build Type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA Support:     ${WITH_CUDA}")
+message(STATUS "Heimdall:         ${WITH_HEIMDALL}")
 message(STATUS "CTranslate2:      ${CTRANSLATE2_LIB}")
 message(STATUS "Build Tests:      ${BUILD_TESTS}")
 message(STATUS "Build Examples:   ${BUILD_EXAMPLES}")
