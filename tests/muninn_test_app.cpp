@@ -196,7 +196,7 @@ int main(int argc, char* argv[]) {
         // ═══════════════════════════════════════════════════════════
         // NOTE: Requires ONNX Runtime providers DLLs and pyannote embedding model
         // Set to true to enable speaker detection
-        options.enable_diarization = false;  // Disabled by default (enable for testing)
+        options.enable_diarization = false;  // Disabled by default (opt-in feature)
         std::string diarization_path = model_path + "/../pyannote_embedding.onnx";
         options.diarization_model_path = diarization_path;
         options.diarization_threshold = 0.5f;  // Lower threshold = fewer speakers (0.5-0.9)

@@ -236,7 +236,7 @@ std::vector<float> Diarizer::run_embedding_model(const float* audio_data, size_t
         Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
             OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-        // This model expects exactly [1, 1, 16000] shape (1 second of audio)
+        // This model expects exactly [1, 16000] shape (1 second of audio)
         // Pad or truncate to 16000 samples
         const size_t expected_samples = 16000;
         std::vector<float> input_data(expected_samples, 0.0f);
@@ -244,15 +244,15 @@ std::vector<float> Diarizer::run_embedding_model(const float* audio_data, size_t
         size_t copy_size = std::min(num_samples, expected_samples);
         std::copy(audio_data, audio_data + copy_size, input_data.begin());
 
-        // Shape: [batch=1, channels=1, samples=16000]
-        std::vector<int64_t> input_shape = {1, 1, 16000};
+        // Shape: [batch=1, num_samples=16000]
+        std::vector<int64_t> input_shape = {1, 16000};
 
         Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
             memory_info, input_data.data(), input_data.size(),
             input_shape.data(), input_shape.size());
 
-        // Use "audio_input" as the input name (specific to this model)
-        const char* input_name = "audio_input";
+        // Use "waveform" as the input name (from our ONNX conversion script)
+        const char* input_name = "waveform";
 
         // Get output name dynamically (this model may have different output names)
         auto output_name_ort = embedding_session_->GetOutputNameAllocated(0, allocator);
