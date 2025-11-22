@@ -43,16 +43,34 @@ Muninn delivers all of this while maintaining **feature parity with Python faste
 - **Minimal External Dependencies** - Only vcpkg for FFmpeg (MSVC) or system FFmpeg
 
 ### Core Transcription
+- **Batch & Streaming APIs** - File-based transcription or real-time streaming
 - **Automatic Language Detection** - Detects 99+ languages automatically
 - **Multi-track Audio Support** - Process video files with multiple audio tracks separately
-- **Word-level Timestamps** - Precise timing for each word (optional)
+- **Word-level Timestamps** - Precise timing for each word (karaoke-style highlighting)
+- **SRT/VTT Subtitle Export** - Automatic subtitle generation with speaker labels
 - **Beam Search Decoding** - High-quality output with configurable beam size
 - **Temperature Fallback** - Automatic retry with higher temperatures on difficult segments
 
+### Streaming & Real-time (NEW!)
+- **StreamingTranscriber API** - Low-latency incremental transcription
+- **Real-Time Translation** - Speak any language, get English captions instantly (99+ languages)
+- **Speaker Diarization** - Automatic speaker detection and separation (who said what)
+- **500ms-2s Latency** - Configurable chunk processing for live captions
+- **Karaoke-Style Word Highlighting** - Words light up as spoken with precise timing
+- **Intensity-Based Coloring** - Words change color based on volume (whispered→shouted)
+- **Confidence Visualization** - Show transcription certainty with color coding
+- **Built-in Styling Presets** - HTML & ANSI formatters for OBS and terminals
+- **Thread-safe Audio Push** - Call from audio callbacks safely
+- **Non-blocking Polling** - Get results without blocking main thread
+- **Perfect for OBS Plugins** - Live streaming caption integration
+
 ### Voice Activity Detection (VAD)
-- **Energy VAD** - Fast energy-based detection (**default**, no dependencies)
-- **Silero VAD** - Neural network-based speech detection (optional, requires ONNX Runtime)
-- **Automatic Silence Skipping** - Skip non-speech regions for faster processing
+- **Auto-Detection** - Smart VAD selection per track (**default**, tested on gaming/streaming)
+- **Energy VAD** - Fast RMS-based detection (music + speech, no dependencies)
+- **Silero VAD** - Neural precision for clean speech (optional, requires ONNX Runtime)
+- **Multi-track Intelligence** - Auto-selects best VAD per audio track
+- **Noise Gate Detection** - Recognizes studio mics and noise-gated audio
+- **Automatic Silence Skipping** - Filters silence for 2-3x faster processing
 - **VAD-aware Timestamp Remapping** - Accurate timestamps on original timeline
 
 ### Quality & Hallucination Filtering
@@ -79,6 +97,8 @@ Muninn delivers all of this while maintaining **feature parity with Python faste
 
 ## Quick Start
 
+### Batch Transcription (Files)
+
 ```cpp
 #include <muninn/transcriber.h>
 
@@ -95,10 +115,6 @@ int main() {
     options.vad_filter = true;           // Enable VAD (uses Energy VAD by default)
     options.beam_size = 5;
     options.word_timestamps = false;     // Set true for word-level timing
-
-    // Optional: Enable Silero VAD for better accuracy
-    // options.vad_type = VADType::Silero;
-    // options.silero_model_path = "models/silero_vad.onnx";
 
     // Transcribe audio/video file
     auto result = transcriber.transcribe("video.mp4", options);
@@ -117,6 +133,60 @@ int main() {
 }
 ```
 
+### Streaming Transcription (Real-time)
+
+```cpp
+#include <muninn/streaming_transcriber.h>
+#include <muninn/word_styling.h>
+
+using namespace muninn;
+
+int main() {
+    // Initialize streaming transcriber
+    StreamingTranscriber stream("models/faster-whisper-large-v3-turbo");
+
+    // Configure for low latency with intensity-based coloring
+    StreamingOptions options;
+    options.chunk_length_s = 1.5f;      // Process every 1.5 seconds
+    options.word_timestamps = true;     // Enable word-level timing + intensity
+
+    // Start with callback for new segments
+    stream.start(options, [](const Segment& seg) {
+        std::cout << "[" << seg.start << "s] " << seg.text << std::endl;
+
+        // Word-level details with intensity
+        for (const auto& word : seg.words) {
+            const char* emphasis_str = "";
+            switch (word.emphasis) {
+                case EmphasisLevel::VeryLow: emphasis_str = "whispered"; break;
+                case EmphasisLevel::Low: emphasis_str = "quiet"; break;
+                case EmphasisLevel::Normal: emphasis_str = "normal"; break;
+                case EmphasisLevel::High: emphasis_str = "emphasized"; break;
+                case EmphasisLevel::VeryHigh: emphasis_str = "SHOUTED"; break;
+            }
+            printf("  %s (%.2f-%.2fs, %s, %.0f%% confident)\n",
+                   word.word.c_str(), word.start, word.end,
+                   emphasis_str, word.probability * 100);
+        }
+
+        return true;  // Continue transcription
+    });
+
+    // Push audio chunks (from microphone, OBS, etc.)
+    while (recording) {
+        float* audio_samples = get_mic_audio();  // Your audio source
+        stream.push_audio(audio_samples, 1024, 48000, 1);
+    }
+
+    // Stop and get final segments
+    auto all_segments = stream.stop();
+
+    return 0;
+}
+```
+
+See [docs/STREAMING_API.md](docs/STREAMING_API.md) for complete streaming API documentation.
+
 ## Feature Parity with faster-whisper
 
 | Feature | faster-whisper (Python) | Muninn (C++) |
@@ -130,6 +200,14 @@ int main() {
 | Hallucination Filtering | ✅ | ✅ |
 | Batched Processing | ✅ | ✅ |
 | Initial Prompt | ✅ | ✅ |
+| **Streaming API** | ❌ | ✅ |
+| **Real-Time Translation (99+ langs)** | ❌ | ✅ |
+| **Speaker Diarization (Multi-speaker)** | ❌ | ✅ |
+| **SRT/VTT Subtitle Export** | ❌ | ✅ |
+| **Karaoke Word Highlighting** | ❌ | ✅ |
+| **Intensity-Based Word Coloring** | ❌ | ✅ |
+| **Confidence Visualization** | ❌ | ✅ |
+| **Built-in HTML/ANSI Styling** | ❌ | ✅ |
 | Clip Timestamps | ✅ | ✅ |
 | Multi-track Audio | ❌ | ✅ |
 | No Python Required | ❌ | ✅ |
@@ -456,6 +534,64 @@ for (const auto& seg : result) {
 }
 ```
 
+### Speaker Diarization (Multi-Speaker)
+
+```cpp
+#include <muninn/streaming_transcriber.h>
+#include <muninn/diarization.h>
+
+// 1. Transcribe audio
+muninn::StreamingTranscriber transcriber("models/whisper-turbo");
+auto segments = transcriber.transcribe_file("podcast.mp3");
+
+// 2. Run speaker diarization
+muninn::Diarizer diarizer("models/pyannote-embedding.onnx");
+auto diarization = diarizer.diarize(audio_data, num_samples, 16000);
+
+// 3. Assign speakers to transcription
+muninn::Diarizer::assign_speakers_to_segments(segments, diarization);
+
+// 4. Custom speaker labels
+std::map<int, std::string> labels = {{0, "Host"}, {1, "Guest"}};
+muninn::Diarizer::set_speaker_labels(diarization, labels);
+
+// 5. Display with speaker labels
+for (const auto& seg : segments) {
+    std::cout << "[" << seg.speaker_label << "] " << seg.text << "\n";
+}
+// Output:
+// [Host] Welcome to the show!
+// [Guest] Thanks for having me!
+```
+
+### Subtitle Export (SRT/VTT)
+
+```cpp
+#include <muninn/transcriber.h>
+#include <muninn/subtitle_export.h>
+
+// Transcribe video
+muninn::Transcriber transcriber("models/whisper-turbo");
+auto result = transcriber.transcribe("video.mp4");
+
+// Export to SRT (creates video.srt in same directory)
+muninn::SubtitleExporter exporter;
+exporter.export_srt(result.segments, "video.mp4");
+
+// Export to VTT with speaker colors
+muninn::SubtitleExportOptions vtt_opts;
+vtt_opts.format = muninn::SubtitleFormat::VTT;
+vtt_opts.include_speakers = true;
+vtt_opts.vtt_include_speaker_colors = true;
+exporter.export_vtt(result.segments, "video.mp4", vtt_opts);
+
+// Also generate metadata JSON (Loki Studio format)
+muninn::SubtitleMetadata::generate_metadata_json(
+    result.segments, "video.mp4",
+    "large-v3-turbo", result.language, result.duration);
+// Creates: video.srt, video.vtt, video_metadata.json
+```
+
 ### Progress Callback (GUI Integration)
 
 ```cpp
@@ -474,7 +610,8 @@ auto result = transcriber.transcribe("video.mp4", options,
 | **CTranslate2** | Yes | Whisper inference engine | Build from `third_party/CTranslate2/` |
 | **FFmpeg** | Yes | Internal audio extraction | vcpkg (Windows) or system (Linux/Mac) |
 | **CUDA** | Recommended | GPU acceleration | NVIDIA CUDA Toolkit |
-| **ONNX Runtime** | Optional | Silero VAD (Energy VAD is default) | Download or build |
+| **ONNX Runtime** | Optional | Silero VAD + Speaker Diarization | Download or build |
+| **pyannote Model** | Optional | Speaker diarization embeddings | HuggingFace (ONNX) |
 
 ### Internal Audio Decoder
 
@@ -509,12 +646,20 @@ Muninn includes a **built-in FFmpeg-powered audio decoder** for self-contained o
 - [x] Initial prompt support
 - [x] Token suppression options
 - [x] Progress callbacks
+- [x] Streaming transcription API
+- [x] Real-time translation (99+ languages)
+- [x] Speaker diarization (multi-speaker)
+- [x] SRT/VTT subtitle export
+- [x] Metadata JSON generation (Loki Studio)
+- [x] Intensity-based word coloring
+- [x] Karaoke word highlighting
+- [x] HTML/ANSI styling formatters
 
 ### Planned
 - [ ] Hotwords/prefix support (logit bias)
-- [ ] Streaming transcription
 - [ ] Python bindings
 - [ ] Pre-built binaries
+- [ ] ASS subtitle format (advanced styling)
 
 ## Contributing
 

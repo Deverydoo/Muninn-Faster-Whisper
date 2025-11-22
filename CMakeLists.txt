@@ -145,10 +145,13 @@ endif()
 set(MUNINN_SOURCES
     src/mel_spectrogram.cpp
     src/transcriber.cpp
+    # src/streaming_transcriber.cpp  # TODO: Fix compilation errors
     src/audio_extractor.cpp
     src/audio/audio_decoder.cpp
     src/vad.cpp
     src/silero_vad.cpp
+    src/diarization.cpp
+    src/subtitle_export.cpp
 )
 
 # =======================
@@ -256,6 +259,20 @@ endif()
 if(BUILD_EXAMPLES)
     add_executable(basic_transcription examples/basic_transcription.cpp)
     target_link_libraries(basic_transcription PRIVATE muninn)
+
+    # Diarization example (requires ONNX Runtime and StreamingTranscriber)
+    if(SILERO_VAD_ENABLED)
+        # Note: diarization_streaming disabled until streaming_transcriber.cpp is fixed
+        # add_executable(diarization_streaming examples/diarization_streaming.cpp)
+        # target_include_directories(diarization_streaming PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        # target_link_libraries(diarization_streaming PRIVATE muninn ${ONNXRUNTIME_LIB})
+
+        add_executable(subtitle_export examples/subtitle_export.cpp)
+        target_include_directories(subtitle_export PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_link_libraries(subtitle_export PRIVATE muninn ${ONNXRUNTIME_LIB})
+    else()
+        message(STATUS "Skipping diarization examples (ONNX Runtime not found)")
+    endif()
 endif()
 
 # =======================

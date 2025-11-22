@@ -1,5 +1,6 @@
 #pragma once
 
+#include "types.h"
 #include <vector>
 #include <cstdint>
 
@@ -88,5 +89,44 @@ private:
         int sample_rate
     );
 };
+
+/**
+ * @brief Audio characteristics for VAD selection
+ */
+struct AudioCharacteristics {
+    float noise_floor;      // 10th percentile of absolute amplitude
+    float speech_level;     // 90th percentile of absolute amplitude
+    float dynamic_range;    // Difference between speech and noise
+    float max_amplitude;    // Maximum amplitude
+    bool is_silent;         // True if max amplitude is near zero
+};
+
+/**
+ * @brief Analyze audio characteristics for VAD selection
+ *
+ * @param samples Audio samples (mono, float32, normalized [-1, 1])
+ * @return Audio characteristics
+ */
+AudioCharacteristics analyze_audio_characteristics(const std::vector<float>& samples);
+
+/**
+ * @brief Auto-detect best VAD type for audio
+ *
+ * Smart VAD selection heuristics (tested on gaming/streaming content):
+ * 1. Multi-track Track 0 → Energy VAD (desktop/game audio with music)
+ * 2. Very clean speech (noise floor < 0.0001) → Silero VAD (noise gates, studio mics)
+ * 3. Clean speech (noise floor < 0.01, dynamic range > 0.15) → Silero VAD
+ * 4. Mixed/noisy content → Energy VAD (robust fallback)
+ *
+ * @param samples Audio samples to analyze
+ * @param track_id Track index (0 = first track)
+ * @param total_tracks Total number of tracks in file
+ * @return Recommended VAD type (Energy or Silero, never Auto/None)
+ */
+VADType auto_detect_vad_type(
+    const std::vector<float>& samples,
+    int track_id,
+    int total_tracks
+);
 
 } // namespace muninn

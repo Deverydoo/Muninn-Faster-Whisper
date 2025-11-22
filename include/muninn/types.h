@@ -9,12 +9,15 @@ namespace muninn {
 
 /**
  * @brief VAD algorithm type (user-selectable in GUI)
+ *
+ * API Options: Auto (default), None, Energy, Silero
  */
 enum class VADType {
-    None,           // No VAD - process all audio
-    Energy,         // Energy-based VAD (fast, no dependencies, ~1ms/chunk)
-    Silero,         // Silero VAD ONNX (most accurate, ~2MB model, ~0.5ms/chunk)
-    WebRTC          // WebRTC/Google VAD (good accuracy, small footprint) - future
+    Auto,           // Auto-detect best VAD per track (DEFAULT - recommended for multi-track)
+    None,           // No VAD - process all audio (use for clean audio or when VAD causes issues)
+    Energy,         // Energy-based VAD (fast, no dependencies, works with music/mixed audio)
+    Silero,         // Silero VAD ONNX (neural precision for clean speech, requires ONNX Runtime)
+    WebRTC          // WebRTC/Google VAD (future support)
 };
 
 /**
@@ -38,13 +41,31 @@ enum class DeviceType {
 };
 
 /**
- * @brief Word-level timestamp information
+ * @brief Word emphasis level for styling
+ */
+enum class EmphasisLevel {
+    VeryLow,        // Whispered/very quiet (< 20% intensity)
+    Low,            // Quiet speech (20-40% intensity)
+    Normal,         // Normal speech (40-70% intensity)
+    High,           // Emphasized/louder (70-90% intensity)
+    VeryHigh        // Shouted/very loud (> 90% intensity)
+};
+
+/**
+ * @brief Word-level timestamp information with styling metadata
  */
 struct Word {
     float start;             // Start time in seconds
     float end;               // End time in seconds
     std::string word;        // The word text
-    float probability;       // Confidence score
+    float probability;       // Confidence score (0.0-1.0)
+
+    // Audio characteristics for styling
+    float intensity;         // Audio intensity/volume (0.0-1.0, normalized RMS)
+    EmphasisLevel emphasis;  // Emphasis level (derived from intensity)
+
+    Word() : start(0.0f), end(0.0f), probability(1.0f),
+             intensity(0.5f), emphasis(EmphasisLevel::Normal) {}
 };
 
 /**
@@ -55,8 +76,17 @@ struct Segment {
     int track_id;                   // Audio track index (for multi-track files)
     float start;                    // Start time in seconds
     float end;                      // End time in seconds
-    std::string text;               // Transcribed text
+    std::string text;               // Transcribed/translated text
     std::vector<Word> words;        // Word-level timestamps (if enabled)
+
+    // Language detection (streaming mode)
+    std::string language;           // Detected language code ("en", "es", "ja", etc.)
+    float language_probability;     // Language detection confidence
+
+    // Speaker diarization (multi-speaker mode)
+    int speaker_id;                 // Speaker ID (-1 if not assigned, 0+ for identified speakers)
+    std::string speaker_label;      // Speaker label ("Speaker 0", "Alice", etc.)
+    float speaker_confidence;       // Speaker assignment confidence (0.0-1.0)
 
     // Quality metrics
     float temperature;              // Sampling temperature used
@@ -65,6 +95,8 @@ struct Segment {
     float no_speech_prob;           // Probability of no speech
 
     Segment() : id(0), track_id(0), start(0.0f), end(0.0f),
+                language_probability(0.0f),
+                speaker_id(-1), speaker_confidence(0.0f),
                 temperature(0.0f), avg_logprob(0.0f),
                 compression_ratio(0.0f), no_speech_prob(0.0f) {}
 };
@@ -113,7 +145,7 @@ struct TranscribeOptions {
     // ═══════════════════════════════════════════════════════════
     // Voice Activity Detection (VAD)
     // ═══════════════════════════════════════════════════════════
-    VADType vad_type = VADType::Energy;    // VAD algorithm to use
+    VADType vad_type = VADType::Auto;      // VAD algorithm to use (Auto = smart selection)
     bool vad_filter = true;                // Enable VAD (shortcut for vad_type != None)
     float vad_threshold = 0.02f;           // VAD energy threshold (Energy) or speech prob (Silero)
     int vad_min_speech_duration_ms = 250;  // Minimum speech duration to keep
@@ -150,6 +182,15 @@ struct TranscribeOptions {
     // ═══════════════════════════════════════════════════════════
     std::set<int> skip_tracks;             // Track indices to skip (empty = process all)
     bool skip_silent_tracks = true;        // Auto-skip tracks with no audio signal
+
+    // ═══════════════════════════════════════════════════════════
+    // Speaker Diarization ("Who Said What")
+    // ═══════════════════════════════════════════════════════════
+    bool enable_diarization = false;       // Enable speaker diarization (OFF by default)
+    std::string diarization_model_path;    // Path to pyannote embedding model (ONNX)
+    float diarization_threshold = 0.7f;    // Speaker clustering threshold (0.5-0.9)
+    int diarization_min_speakers = 1;      // Minimum number of speakers
+    int diarization_max_speakers = 10;     // Maximum number of speakers (0 = unlimited)
 
     // ═══════════════════════════════════════════════════════════
     // Performance Tuning

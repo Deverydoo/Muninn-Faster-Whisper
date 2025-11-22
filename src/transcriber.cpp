@@ -3,6 +3,7 @@
 #include "muninn/audio_extractor.h"
 #include "muninn/vad.h"
 #include "muninn/silero_vad.h"
+#include "muninn/diarization.h"
 #include <ctranslate2/models/whisper.h>
 #include <ctranslate2/utils.h>
 #include <algorithm>
@@ -1015,7 +1016,8 @@ TranscribeResult Transcriber::transcribe(
     const std::vector<float>& audio_samples,
     int sample_rate,
     const TranscribeOptions& options,
-    int track_id
+    int track_id,
+    int total_tracks
 ) {
     TranscribeResult result;
 
@@ -1067,7 +1069,18 @@ TranscribeResult Transcriber::transcribe(
         bool apply_vad = options.vad_filter && options.vad_type != VADType::None;
 
         if (apply_vad) {
-            switch (options.vad_type) {
+            // Auto-detect VAD type if requested
+            VADType effective_vad_type = options.vad_type;
+            if (options.vad_type == VADType::Auto) {
+                effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks);
+            }
+
+            switch (effective_vad_type) {
+                case VADType::Auto:
+                    // Should not reach here (already resolved above)
+                    effective_vad_type = VADType::Energy;
+                    [[fallthrough]];
+
                 case VADType::Silero: {
                     std::cout << "[Muninn] Applying Silero VAD filter...\n";
 
@@ -1387,7 +1400,7 @@ TranscribeResult Transcriber::transcribe(
 
         // Transcribe this track
         try {
-            auto track_result = transcribe(samples, 16000, options, track);
+            auto track_result = transcribe(samples, 16000, options, track, track_count);
 
             // Set track_id for each segment (GUI handles formatting with track names)
             for (auto& segment : track_result.segments) {
@@ -1418,6 +1431,89 @@ TranscribeResult Transcriber::transcribe(
     std::cout << "\n═══════════════════════════════════════════════════════════\n";
     std::cout << "[Muninn] All tracks complete. Total segments: " << combined_result.segments.size() << "\n";
     std::cout << "═══════════════════════════════════════════════════════════\n";
+
+    // ═══════════════════════════════════════════════════════════
+    // Speaker Diarization (if enabled)
+    // ═══════════════════════════════════════════════════════════
+    if (options.enable_diarization && !options.diarization_model_path.empty()) {
+        try {
+            std::cout << "\n[Muninn] Running speaker diarization...\n";
+
+            // Initialize diarizer
+            DiarizationOptions diar_opts;
+            diar_opts.embedding_model_path = options.diarization_model_path;
+            diar_opts.clustering_threshold = options.diarization_threshold;
+            diar_opts.min_speakers = options.diarization_min_speakers;
+            diar_opts.max_speakers = options.diarization_max_speakers;
+
+            Diarizer diarizer(options.diarization_model_path, diar_opts);
+
+            // Re-open audio file for diarization
+            AudioExtractor diar_extractor;
+            if (!diar_extractor.open(audio_path)) {
+                throw std::runtime_error("Failed to open audio for diarization: " + diar_extractor.get_last_error());
+            }
+
+            // Run diarization on each track that has segments
+            std::map<int, DiarizationResult> track_diarization;
+            for (int track = 0; track < track_count; ++track) {
+                // Check if this track has any segments
+                bool has_segments = false;
+                for (const auto& seg : combined_result.segments) {
+                    if (seg.track_id == track) {
+                        has_segments = true;
+                        break;
+                    }
+                }
+
+                if (!has_segments) continue;
+
+                std::cout << "[Diarization] Processing Track " << track << "...\n";
+
+                // Extract audio for this track
+                std::vector<float> track_audio;
+                if (!diar_extractor.extract_track(track, track_audio)) {
+                    std::cerr << "[Diarization] WARNING: Failed to extract track " << track << "\n";
+                    continue;
+                }
+
+                // Run diarization
+                auto diar_result = diarizer.diarize(track_audio.data(), track_audio.size(), 16000);
+
+                std::cout << "[Diarization] Track " << track << ": Detected "
+                          << diar_result.num_speakers << " speaker(s)\n";
+
+                track_diarization[track] = diar_result;
+            }
+
+            diar_extractor.close();
+
+            // Assign speakers to all segments
+            for (auto& segment : combined_result.segments) {
+                if (track_diarization.count(segment.track_id) > 0) {
+                    const auto& diar_result = track_diarization[segment.track_id];
+
+                    // Find speaker at segment midpoint
+                    float midpoint = (segment.start + segment.end) / 2.0f;
+                    int speaker_id = Diarizer::get_speaker_at_time(diar_result, midpoint);
+
+                    if (speaker_id >= 0) {
+                        segment.speaker_id = speaker_id;
+                        segment.speaker_label = "Speaker " + std::to_string(speaker_id);
+
+                        // Calculate confidence based on segment overlap
+                        segment.speaker_confidence = 0.8f;  // Default confidence
+                    }
+                }
+            }
+
+            std::cout << "[Muninn] ✓ Speaker diarization complete\n";
+
+        } catch (const std::exception& e) {
+            std::cerr << "[Muninn] Warning: Diarization failed: " << e.what() << "\n";
+            std::cerr << "[Muninn] Continuing without speaker labels...\n";
+        }
+    }
 
     return combined_result;
 }

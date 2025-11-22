@@ -223,4 +223,86 @@ std::vector<float> VAD::filter_silence(
     return filtered;
 }
 
+// ═══════════════════════════════════════════════════════════
+// Auto-Detection Functions
+// ═══════════════════════════════════════════════════════════
+
+AudioCharacteristics analyze_audio_characteristics(const std::vector<float>& samples) {
+    AudioCharacteristics characteristics{};
+
+    if (samples.empty()) {
+        characteristics.is_silent = true;
+        return characteristics;
+    }
+
+    // Build sorted array of absolute amplitudes (sampled for performance)
+    std::vector<float> abs_samples;
+    abs_samples.reserve(samples.size() / 1000 + 1);
+
+    float max_amp = 0.0f;
+    for (size_t i = 0; i < samples.size(); i += 1000) {
+        float amp = std::abs(samples[i]);
+        abs_samples.push_back(amp);
+        max_amp = std::max(max_amp, amp);
+    }
+
+    std::sort(abs_samples.begin(), abs_samples.end());
+
+    // Calculate percentiles
+    size_t p10_idx = static_cast<size_t>(abs_samples.size() * 0.1);
+    size_t p90_idx = static_cast<size_t>(abs_samples.size() * 0.9);
+
+    characteristics.noise_floor = abs_samples[p10_idx];
+    characteristics.speech_level = abs_samples[p90_idx];
+    characteristics.dynamic_range = characteristics.speech_level - characteristics.noise_floor;
+    characteristics.max_amplitude = max_amp;
+    characteristics.is_silent = (max_amp < 0.0001f);
+
+    return characteristics;
+}
+
+VADType auto_detect_vad_type(
+    const std::vector<float>& samples,
+    int track_id,
+    int total_tracks
+) {
+    // Multi-track scenario: Track 0 is usually desktop/game audio with mixed content
+    if (total_tracks > 1 && track_id == 0) {
+        std::cout << "[Auto-VAD] Track " << track_id
+                  << ": Multi-track desktop/game audio → Energy VAD\n";
+        return VADType::Energy;
+    }
+
+    // Analyze audio characteristics
+    auto characteristics = analyze_audio_characteristics(samples);
+
+    std::cout << "[Auto-VAD] Track " << track_id
+              << ": Noise=" << characteristics.noise_floor
+              << ", Speech=" << characteristics.speech_level
+              << ", Range=" << characteristics.dynamic_range << "\n";
+
+    // Silent track
+    if (characteristics.is_silent) {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Silent → Energy VAD\n";
+        return VADType::Energy;
+    }
+
+    // Clean speech detection - prioritize low noise floor
+    // Very clean speech: Extremely low noise (noise gates, studio mics)
+    if (characteristics.noise_floor < 0.0001f && characteristics.dynamic_range > 0.01f) {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Very clean speech (noise gate) → Silero VAD\n";
+        return VADType::Silero;
+    }
+
+    // Clean speech: Low noise floor + reasonable dynamic range
+    if (characteristics.noise_floor < 0.01f && characteristics.dynamic_range > 0.15f) {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Clean speech → Silero VAD\n";
+        return VADType::Silero;
+    }
+
+    // Mixed/noisy content or low dynamic range
+    std::cout << "[Auto-VAD] Track " << track_id << ": Mixed/noisy audio → Energy VAD\n";
+    return VADType::Energy;
+}
+
 } // namespace muninn

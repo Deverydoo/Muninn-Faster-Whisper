@@ -1,9 +1,60 @@
 #include "muninn/transcriber.h"
+#include "muninn/subtitle_export.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <chrono>
 #include <iomanip>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+
+// Helper: Auto-detect best VAD for a track based on audio characteristics
+muninn::VADType detect_best_vad(const std::vector<float>& samples, int track_id, int total_tracks) {
+    // Multi-track: Track 0 (desktop/game audio) usually has mixed content
+    if (total_tracks > 1 && track_id == 0) {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Multi-track game audio detected → Energy VAD\n";
+        return muninn::VADType::Energy;
+    }
+
+    // Single track or microphone tracks: Analyze noise characteristics
+    std::vector<float> abs_samples;
+    abs_samples.reserve(samples.size());
+    for (float s : samples) {
+        abs_samples.push_back(std::abs(s));
+    }
+
+    // Sample every 1000th value for speed
+    std::vector<float> sampled;
+    for (size_t i = 0; i < abs_samples.size(); i += 1000) {
+        sampled.push_back(abs_samples[i]);
+    }
+    std::sort(sampled.begin(), sampled.end());
+
+    if (sampled.empty()) {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Empty audio → Energy VAD\n";
+        return muninn::VADType::Energy;
+    }
+
+    // Estimate noise floor (10th percentile) and speech level (90th percentile)
+    size_t p10 = static_cast<size_t>(sampled.size() * 0.1);
+    size_t p90 = static_cast<size_t>(sampled.size() * 0.9);
+    float noise_floor = sampled[p10];
+    float speech_level = sampled[p90];
+    float dynamic_range = speech_level - noise_floor;
+
+    std::cout << "[Auto-VAD] Track " << track_id << ": Noise floor=" << noise_floor
+              << ", Speech level=" << speech_level << ", Dynamic range=" << dynamic_range << "\n";
+
+    // Decision logic
+    if (dynamic_range > 0.15f && noise_floor < 0.01f) {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Clean speech detected → Silero VAD\n";
+        return muninn::VADType::Silero;
+    } else {
+        std::cout << "[Auto-VAD] Track " << track_id << ": Mixed/noisy content detected → Energy VAD\n";
+        return muninn::VADType::Energy;
+    }
+}
 
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " <model_path> <audio_file>\n";
@@ -57,8 +108,12 @@ void save_transcript(const std::string& output_path, const muninn::TranscribeRes
             current_track = segment.track_id;
         }
 
-        // Format: [HH:MM:SS.mmm] text
-        file << "[" << format_timestamp(segment.start) << "] " << segment.text << "\n";
+        // Format: [HH:MM:SS.mmm] [Speaker X] text (if speaker detected)
+        file << "[" << format_timestamp(segment.start) << "] ";
+        if (segment.speaker_id >= 0 && !segment.speaker_label.empty()) {
+            file << "[" << segment.speaker_label << "] ";
+        }
+        file << segment.text << "\n";
 
         // Show word timestamps if available
         if (!segment.words.empty()) {
@@ -129,11 +184,29 @@ int main(int argc, char* argv[]) {
         options.beam_size = 5;
         options.temperature = 0.0f;
         options.vad_filter = true;  // Enable VAD filtering
-        options.vad_type = muninn::VADType::Silero;
-        // Silero VAD model - try in same directory as whisper model first
+        // Use auto-detection to select best VAD per track
+        options.vad_type = muninn::VADType::Auto;
+        // Silero model path (needed if auto-detection chooses Silero)
         std::string silero_path = model_path + "/../silero_vad.onnx";
         options.silero_model_path = silero_path;
         options.word_timestamps = false;  // Word-level timestamps (off by default)
+
+        // ═══════════════════════════════════════════════════════════
+        // Speaker Diarization (optional)
+        // ═══════════════════════════════════════════════════════════
+        // NOTE: Requires ONNX Runtime providers DLLs and pyannote embedding model
+        // Set to true to enable speaker detection
+        options.enable_diarization = true;  // ENABLED for testing
+        std::string diarization_path = model_path + "/../pyannote_embedding.onnx";
+        options.diarization_model_path = diarization_path;
+        options.diarization_threshold = 0.5f;  // Lower threshold = fewer speakers (0.5-0.9)
+        options.diarization_min_speakers = 1;
+        options.diarization_max_speakers = 5;   // Cap at 5 speakers for testing
+
+        std::cout << "[Muninn] Using auto-detection to select best VAD per track\n";
+        if (options.enable_diarization) {
+            std::cout << "[Muninn] Speaker diarization: ENABLED\n";
+        }
 
         std::cout << "[DEBUG] Step 6: About to call transcribe()...\n";
         std::cout.flush();
@@ -166,13 +239,90 @@ int main(int argc, char* argv[]) {
                 std::cout << "[Track " << segment.track_id << "]\n";
                 current_track = segment.track_id;
             }
-            std::cout << "[" << format_timestamp(segment.start) << "] " << segment.text << "\n";
+
+            // Show speaker label if available
+            if (segment.speaker_id >= 0 && !segment.speaker_label.empty()) {
+                std::cout << "[" << format_timestamp(segment.start) << "] "
+                          << "[" << segment.speaker_label << "] " << segment.text << "\n";
+            } else {
+                std::cout << "[" << format_timestamp(segment.start) << "] " << segment.text << "\n";
+            }
         }
         std::cout << "═══════════════════════════════════════════════════════════\n";
 
         // Save to file
         std::string output_path = audio_path + ".transcript.txt";
         save_transcript(output_path, result);
+
+        // ═══════════════════════════════════════════════════════════
+        // Export subtitles and metadata
+        // ═══════════════════════════════════════════════════════════
+        std::cout << "\n[Muninn] Exporting subtitles and metadata...\n";
+
+        muninn::SubtitleExporter exporter;
+
+        // Export SRT (native language)
+        try {
+            std::string srt_path = exporter.export_srt(result.segments, audio_path);
+            std::cout << "[Muninn] ✓ Created SRT: " << srt_path << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[Muninn] Failed to export SRT: " << e.what() << "\n";
+        }
+
+        // Export metadata JSON (Loki Studio format)
+        try {
+            std::string json_path = muninn::SubtitleMetadata::generate_metadata_json(
+                result.segments,
+                audio_path,
+                "large-v3-turbo",
+                result.language,
+                result.duration
+            );
+            std::cout << "[Muninn] ✓ Created metadata JSON: " << json_path << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[Muninn] Failed to export metadata JSON: " << e.what() << "\n";
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // Translation test (translate to Japanese)
+        // ═══════════════════════════════════════════════════════════
+        if (result.language != "ja") {
+            std::cout << "\n[Muninn] Translating to Japanese...\n";
+
+            muninn::TranscribeOptions translate_options;
+            translate_options.task = "translate";  // Translation mode
+            translate_options.language = "ja";     // Target: Japanese
+            translate_options.beam_size = 5;
+            translate_options.temperature = 0.0f;
+            translate_options.vad_filter = true;
+            translate_options.vad_type = muninn::VADType::Auto;
+            translate_options.silero_model_path = silero_path;
+
+            auto translate_start = std::chrono::high_resolution_clock::now();
+            auto translated_result = transcriber.transcribe(audio_path, translate_options);
+            auto translate_end = std::chrono::high_resolution_clock::now();
+            auto translate_duration = std::chrono::duration_cast<std::chrono::milliseconds>(translate_end - translate_start);
+
+            std::cout << "[Muninn] Translation complete! (" << (translate_duration.count() / 1000.0) << "s)\n";
+
+            // Export translated SRT
+            try {
+                muninn::SubtitleExportOptions srt_opts;
+                srt_opts.output_path = audio_path + ".ja.srt";  // Custom output with language code
+                std::string ja_srt_path = exporter.export_srt(translated_result.segments, audio_path, srt_opts);
+                std::cout << "[Muninn] ✓ Created Japanese SRT: " << ja_srt_path << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[Muninn] Failed to export Japanese SRT: " << e.what() << "\n";
+            }
+
+            // Show first few translated segments
+            std::cout << "\n[Muninn] Sample translation (Japanese):\n";
+            for (size_t i = 0; i < std::min(size_t(5), translated_result.segments.size()); ++i) {
+                std::cout << "  " << translated_result.segments[i].text << "\n";
+            }
+        }
+
+        std::cout << "\n[Muninn] All exports complete!\n";
 
         return 0;
 
