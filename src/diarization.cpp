@@ -312,29 +312,125 @@ std::vector<Speaker> Diarizer::cluster_speakers(const std::vector<SpeakerEmbeddi
         return speakers;
     }
 
-    // Simple agglomerative clustering using cosine similarity
+    // Hierarchical agglomerative clustering with average linkage
     std::vector<int> cluster_labels(embeddings.size(), -1);
-    int next_speaker_id = 0;
+    std::vector<std::vector<size_t>> clusters;  // Track which embeddings are in each cluster
 
+    // Start with each embedding in its own cluster
     for (size_t i = 0; i < embeddings.size(); ++i) {
-        if (cluster_labels[i] >= 0) {
-            continue;  // Already assigned
+        cluster_labels[i] = i;
+        clusters.push_back({i});
+    }
+
+    // Iteratively merge clusters with high average similarity
+    // clustering_threshold is the MINIMUM cosine similarity to merge clusters
+    // Lower threshold (e.g. 0.3) = merge more aggressively = fewer speakers
+    // Higher threshold (e.g. 0.8) = merge conservatively = more speakers
+    const float merge_threshold = options_.clustering_threshold;
+
+    std::cout << "[Diarizer] Clustering " << embeddings.size() << " embeddings with threshold " << merge_threshold << "\n";
+
+    bool merged = true;
+    int iteration = 0;
+    while (merged && clusters.size() > 1) {
+        merged = false;
+        float best_similarity = -1.0f;
+        size_t best_i = 0, best_j = 0;
+
+        // Find pair of clusters with highest average similarity
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            for (size_t j = i + 1; j < clusters.size(); ++j) {
+                // Compute average similarity between all pairs
+                float total_similarity = 0.0f;
+                size_t pair_count = 0;
+
+                for (size_t idx_i : clusters[i]) {
+                    for (size_t idx_j : clusters[j]) {
+                        total_similarity += cosine_similarity(embeddings[idx_i], embeddings[idx_j]);
+                        pair_count++;
+                    }
+                }
+
+                float avg_similarity = total_similarity / pair_count;
+
+                if (avg_similarity > best_similarity && avg_similarity >= merge_threshold) {
+                    best_similarity = avg_similarity;
+                    best_i = i;
+                    best_j = j;
+                    merged = true;
+                }
+            }
         }
 
-        // Start new cluster
-        int current_speaker_id = next_speaker_id++;
-        cluster_labels[i] = current_speaker_id;
+        if (merged && iteration < 5) {  // Show first few merges
+            std::cout << "[Diarizer] Iteration " << iteration << ": Merging clusters (similarity: "
+                      << best_similarity << "), " << clusters.size() << " -> " << (clusters.size() - 1) << " clusters\n";
+        }
+        iteration++;
 
-        // Find all similar embeddings
-        for (size_t j = i + 1; j < embeddings.size(); ++j) {
-            if (cluster_labels[j] >= 0) {
-                continue;
+        // Merge best pair if found
+        if (merged) {
+            // Merge cluster j into cluster i
+            clusters[best_i].insert(clusters[best_i].end(),
+                                   clusters[best_j].begin(), clusters[best_j].end());
+
+            // Update labels
+            int merged_label = best_i;
+            for (size_t idx : clusters[best_j]) {
+                cluster_labels[idx] = merged_label;
             }
 
-            float similarity = cosine_similarity(embeddings[i], embeddings[j]);
+            // Remove cluster j
+            clusters.erase(clusters.begin() + best_j);
 
-            if (similarity >= options_.clustering_threshold) {
-                cluster_labels[j] = current_speaker_id;
+            // Renumber cluster labels
+            for (size_t i = 0; i < clusters.size(); ++i) {
+                for (size_t idx : clusters[i]) {
+                    cluster_labels[idx] = i;
+                }
+            }
+        }
+    }
+
+    // Apply max speakers limit
+    if (options_.max_speakers > 0 && static_cast<int>(clusters.size()) > options_.max_speakers) {
+        // Keep merging until we reach max_speakers
+        while (static_cast<int>(clusters.size()) > options_.max_speakers) {
+            float best_similarity = -1.0f;
+            size_t best_i = 0, best_j = 0;
+
+            // Find pair with highest similarity
+            for (size_t i = 0; i < clusters.size(); ++i) {
+                for (size_t j = i + 1; j < clusters.size(); ++j) {
+                    float total_similarity = 0.0f;
+                    size_t pair_count = 0;
+
+                    for (size_t idx_i : clusters[i]) {
+                        for (size_t idx_j : clusters[j]) {
+                            total_similarity += cosine_similarity(embeddings[idx_i], embeddings[idx_j]);
+                            pair_count++;
+                        }
+                    }
+
+                    float avg_similarity = total_similarity / pair_count;
+                    if (avg_similarity > best_similarity) {
+                        best_similarity = avg_similarity;
+                        best_i = i;
+                        best_j = j;
+                    }
+                }
+            }
+
+            // Merge best pair
+            clusters[best_i].insert(clusters[best_i].end(),
+                                   clusters[best_j].begin(), clusters[best_j].end());
+            clusters.erase(clusters.begin() + best_j);
+
+            // Renumber
+            for (size_t i = 0; i < clusters.size(); ++i) {
+                for (size_t idx : clusters[i]) {
+                    cluster_labels[idx] = i;
+                }
             }
         }
     }

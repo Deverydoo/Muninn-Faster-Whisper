@@ -201,7 +201,7 @@ int main(int argc, char* argv[]) {
         options.diarization_model_path = diarization_path;
         options.diarization_threshold = 0.5f;  // Lower threshold = fewer speakers (0.5-0.9)
         options.diarization_min_speakers = 1;
-        options.diarization_max_speakers = 5;   // Cap at 5 speakers for testing
+        options.diarization_max_speakers = 10;  // Default: up to 10 speakers
 
         std::cout << "[Muninn] Using auto-detection to select best VAD per track\n";
         if (options.enable_diarization) {
