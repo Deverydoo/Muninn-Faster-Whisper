@@ -3,21 +3,13 @@
 /**
  * @file export.h
  * @brief DLL export/import macros for Muninn library
+ *
+ * NOTE: With WINDOWS_EXPORT_ALL_SYMBOLS, CMake auto-generates exports.
+ *       MUNINN_API is kept as empty macro for compatibility but has no effect.
  */
 
-#ifdef _WIN32
-    #ifdef MUNINN_EXPORTS
-        #define MUNINN_API __declspec(dllexport)
-    #else
-        #define MUNINN_API __declspec(dllimport)
-    #endif
-#else
-    #ifdef MUNINN_EXPORTS
-        #define MUNINN_API __attribute__((visibility("default")))
-    #else
-        #define MUNINN_API
-    #endif
-#endif
+// MUNINN_API is now a no-op - WINDOWS_EXPORT_ALL_SYMBOLS handles exports
+#define MUNINN_API
 
 // For classes that should not be exported (internal use only)
 #define MUNINN_INTERNAL

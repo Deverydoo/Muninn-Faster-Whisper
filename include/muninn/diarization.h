@@ -6,7 +6,11 @@
 #include <vector>
 #include <map>
 #include <memory>
+
+// Only include ONNX Runtime if Silero VAD is enabled
+#ifdef MUNINN_USE_SILERO_VAD
 #include <onnxruntime_cxx_api.h>
+#endif
 
 namespace muninn {
 

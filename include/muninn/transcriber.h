@@ -131,7 +131,8 @@ public:
         const std::vector<float>& audio_samples,
         int sample_rate = 16000,
         const TranscribeOptions& options = {},
-        int track_id = 0
+        int track_id = 0,
+        int total_tracks = 1
     );
 
     /**

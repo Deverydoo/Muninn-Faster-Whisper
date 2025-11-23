@@ -9,12 +9,13 @@ project(MuninnFasterWhisper VERSION 0.5.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Static CRT linkage (same as Heimdall)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Dynamic CRT linkage to match Qt (Qt uses /MD by default)
+# MSVC default is /MD, so we don't need to set it explicitly
+# (Removed CMAKE_MSVC_RUNTIME_LIBRARY setting to use default)
 
 # Options
 option(WITH_CUDA "Build with CUDA support" ON)
-option(WITH_SILERO_VAD "Build with Silero VAD (requires ONNX Runtime)" OFF)
+option(WITH_SILERO_VAD "Build with Silero VAD (requires ONNX Runtime)" ON)
 option(BUILD_SHARED_LIBS "Build as shared library (DLL)" ON)
 option(BUILD_TESTS "Build test applications" ON)
 option(BUILD_EXAMPLES "Build example applications" OFF)
@@ -159,7 +160,8 @@ set(MUNINN_SOURCES
 # =======================
 if(BUILD_SHARED_LIBS)
     add_library(muninn SHARED ${MUNINN_SOURCES})
-    target_compile_definitions(muninn PRIVATE MUNINN_EXPORTS)
+    # Use WINDOWS_EXPORT_ALL_SYMBOLS for automatic DLL export (Muninn pattern)
+    set_target_properties(muninn PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 else()
     add_library(muninn STATIC ${MUNINN_SOURCES})
 endif()
@@ -200,10 +202,11 @@ if(WITH_CUDA)
     target_link_libraries(muninn PRIVATE CUDA::cudart)
 endif()
 
-# MSVC Optimizations (same as Heimdall)
+# MSVC Optimizations (LTCG disabled - incompatible with WINDOWS_EXPORT_ALL_SYMBOLS)
 if(MSVC)
-    target_compile_options(muninn PRIVATE /O2 /arch:AVX2 /fp:fast /GL)
-    target_link_options(muninn PRIVATE /LTCG)
+    target_compile_options(muninn PRIVATE /O2 /arch:AVX2 /fp:fast)
+else()
+    target_compile_options(muninn PRIVATE -O3 -march=native -mavx2 -ffast-math)
 endif()
 
 # =======================
