@@ -996,12 +996,15 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                                 std::vector<int64_t> token_start_frames(text_tokens.size(), -1);
                                 std::vector<int64_t> token_end_frames(text_tokens.size(), -1);
 
+                                const int64_t max_frame = static_cast<int64_t>(n_frames) - 1;
                                 for (const auto& [token_idx, frame_idx] : align_result.alignments) {
                                     if (token_idx >= 0 && static_cast<size_t>(token_idx) < text_tokens.size()) {
+                                        // Clamp frame_idx to valid range [0, n_frames-1]
+                                        int64_t clamped_frame = std::max(int64_t(0), std::min(frame_idx, max_frame));
                                         if (token_start_frames[token_idx] < 0) {
-                                            token_start_frames[token_idx] = frame_idx;
+                                            token_start_frames[token_idx] = clamped_frame;
                                         }
-                                        token_end_frames[token_idx] = frame_idx;
+                                        token_end_frames[token_idx] = clamped_frame;
                                     }
                                 }
 
@@ -1250,12 +1253,15 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                                 std::vector<int64_t> token_start_frames(text_tokens.size(), -1);
                                 std::vector<int64_t> token_end_frames(text_tokens.size(), -1);
 
+                                const int64_t max_frame = static_cast<int64_t>(chunk_n_frames) - 1;
                                 for (const auto& [token_idx, frame_idx] : align_result.alignments) {
                                     if (token_idx >= 0 && static_cast<size_t>(token_idx) < text_tokens.size()) {
+                                        // Clamp frame_idx to valid range [0, chunk_n_frames-1]
+                                        int64_t clamped_frame = std::max(int64_t(0), std::min(frame_idx, max_frame));
                                         if (token_start_frames[token_idx] < 0) {
-                                            token_start_frames[token_idx] = frame_idx;
+                                            token_start_frames[token_idx] = clamped_frame;
                                         }
-                                        token_end_frames[token_idx] = frame_idx;
+                                        token_end_frames[token_idx] = clamped_frame;
                                     }
                                 }
 
