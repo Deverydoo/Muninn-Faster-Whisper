@@ -455,6 +455,30 @@ void extract_words_from_alignment(
         seg.words.push_back(w);
         prev_word_end = word_end_time;
     }
+
+    // Post-processing: Fix first word if it has excessive duration
+    // DTW often stretches the first token to fill silence at segment start
+    // Use stable-ts approach: for first word, trust the END time and estimate START
+    if (seg.words.size() >= 2 && use_new_format) {
+        Word& first = seg.words[0];
+        const Word& second = seg.words[1];
+
+        float first_duration = first.end - first.start;
+        float gap_to_second = second.start - first.end;
+
+        // If first word is longer than 1.5 seconds AND there's no gap to the second word
+        // (meaning the end time is accurate and flows into the next word),
+        // then the start time is the problem
+        if (first_duration > 1.5f && gap_to_second < 0.1f) {
+            // Estimate reasonable duration: ~300ms per syllable, rough estimate 150ms per character
+            // Cap at 800ms for most words
+            float estimated_duration = std::min(0.8f, std::max(0.15f, first.word.length() * 0.1f));
+            float new_start = first.end - estimated_duration;
+            // Don't go before segment start
+            new_start = std::max(new_start, seg_start);
+            first.start = new_start;
+        }
+    }
 }
 
 /**
