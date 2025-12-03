@@ -360,6 +360,7 @@ std::string Transcriber::Impl::extract_text(const std::vector<std::string>& toke
  * @param token_ids Token IDs from the result
  * @param tokens Text tokens from the result
  * @param word_buffer Buffer of (word_text, token_indices) pairs
+ * @param chunk_start_time Base time offset for the chunk (for DTW frame conversion)
  * @param seg_start Segment start time
  * @param seg_end Segment end time
  */
@@ -369,6 +370,7 @@ void extract_words_from_alignment(
     const std::vector<size_t>& token_ids,
     const std::vector<std::string>& tokens,
     const std::vector<std::pair<std::string, std::vector<size_t>>>& word_buffer,
+    float chunk_start_time,
     float seg_start,
     float seg_end
 ) {
@@ -384,11 +386,6 @@ void extract_words_from_alignment(
 
     float prev_word_end = seg_start;
 
-    // Track which alignment index corresponds to which text token
-    // We need to map word_buffer token indices to alignment indices
-    // The alignment data is for text tokens only (no timestamps/special tokens)
-    size_t align_idx = 0;
-
     for (size_t wi = 0; wi < word_buffer.size(); ++wi) {
         const auto& [word_text, token_indices] = word_buffer[wi];
 
@@ -400,15 +397,19 @@ void extract_words_from_alignment(
 
         if (use_new_format) {
             // New format: alignment[i] = [start_frame, end_frame, probability]
-            // Each alignment entry corresponds to one text token
-            for (size_t i = 0; i < token_indices.size() && align_idx < alignment.size(); ++i, ++align_idx) {
-                const auto& align_entry = alignment[align_idx];
+            // token_indices contains the actual text token indices into the alignment array
+            // IMPORTANT: Frames are relative to the CHUNK start, not the segment start
+            for (size_t tok_idx : token_indices) {
+                if (tok_idx >= alignment.size()) continue;
+
+                const auto& align_entry = alignment[tok_idx];
                 float start_frame = align_entry[0];
                 float end_frame = align_entry[1];
                 float prob = align_entry[2];
 
-                float token_start = seg_start + (start_frame * FRAME_DURATION);
-                float token_end = seg_start + (end_frame * FRAME_DURATION);
+                // Convert frames to absolute time using chunk_start_time (not seg_start)
+                float token_start = chunk_start_time + (start_frame * FRAME_DURATION);
+                float token_end = chunk_start_time + (end_frame * FRAME_DURATION);
 
                 word_start_time = std::min(word_start_time, token_start);
                 word_end_time = std::max(word_end_time, token_end);
@@ -523,8 +524,9 @@ std::vector<Segment> extract_timestamped_segments(
                 if (word_timestamps && !word_buffer.empty()) {
                     if (has_alignment) {
                         // Use alignment data for accurate word timing
+                        // Pass chunk_start_time for DTW frame conversion
                         extract_words_from_alignment(seg, alignment, token_ids, tokens,
-                                                      word_buffer, seg.start, seg.end);
+                                                      word_buffer, chunk_start_time, seg.start, seg.end);
                     } else {
                         // Fallback: Heuristic timing (align speech to end of segment)
                         // Key insight: Whisper segments often have silence at the START
@@ -601,19 +603,20 @@ std::vector<Segment> extract_timestamped_segments(
 
                 if (word_buffer.empty()) {
                     // First word token - always start a new word
-                    word_buffer.push_back({token_text, {i}});
+                    // Store text_token_idx (filtered index) for alignment lookup, not i (original index)
+                    word_buffer.push_back({token_text, {text_token_idx}});
                 } else if (is_punct) {
                     // Punctuation: attach to previous word (e.g., "them" + "," = "them,")
                     word_buffer.back().first += token_text;
-                    word_buffer.back().second.push_back(i);
+                    word_buffer.back().second.push_back(text_token_idx);
                 } else if (!starts_new_word) {
                     // BPE continuation (no Ġ prefix): append to previous word
                     // Examples: "don" + "'t" = "don't", "Mo" + "e" = "Moe"
                     word_buffer.back().first += token_text;
-                    word_buffer.back().second.push_back(i);
+                    word_buffer.back().second.push_back(text_token_idx);
                 } else {
                     // New word (has Ġ prefix): start a new entry
-                    word_buffer.push_back({token_text, {i}});
+                    word_buffer.push_back({token_text, {text_token_idx}});
                 }
             }
 
