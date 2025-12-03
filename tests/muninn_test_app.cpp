@@ -185,11 +185,11 @@ int main(int argc, char* argv[]) {
         options.temperature = 0.0f;
         options.vad_filter = true;  // Enable VAD filtering
         // Use auto-detection to select best VAD per track
-        options.vad_type = muninn::VADType::Auto;
+        options.vad_type = muninn::VADType::Auto;  // Auto-detect best VAD per track
         // Silero model path (needed if auto-detection chooses Silero)
         std::string silero_path = model_path + "/../silero_vad.onnx";
         options.silero_model_path = silero_path;
-        options.word_timestamps = false;  // Word-level timestamps (off by default)
+        options.word_timestamps = false;  // Word-level timestamps (disabled by default)
 
         // ═══════════════════════════════════════════════════════════
         // Speaker Diarization (optional)

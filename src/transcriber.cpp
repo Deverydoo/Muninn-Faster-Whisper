@@ -71,7 +71,49 @@ public:
     std::string device_str;
     std::string compute_type_str;
 
+    // Token IDs for alignment (cached after model load)
+    size_t sot_id = 0;           // Start of transcript
+    size_t eot_id = 0;           // End of text
+    size_t no_timestamps_id = 0; // No timestamps token
+    size_t timestamp_begin = 0;  // First timestamp token ID
+    bool tokens_initialized = false;
+
     Impl() : mel_converter(16000, 400, 128, 160) {}
+
+    // Initialize token IDs from vocabulary
+    void initialize_token_ids() {
+        if (tokens_initialized || !model) return;
+
+        // Get vocabulary through the replica
+        const auto& replica = model->get_first_replica();
+
+        // For Whisper models, standard token IDs are:
+        // <|startoftranscript|> = vocabulary.bos_id()
+        // <|endoftext|> = vocabulary.eos_id()
+        // <|notimestamps|> is typically at 50362 (multilingual) or 50257+100 = 50363
+        // Timestamp tokens start at 50364 (multilingual) or 50257+101 for en-only
+
+        // We can determine if multilingual by checking num_languages
+        bool is_multilingual = model->is_multilingual();
+
+        if (is_multilingual) {
+            // Multilingual model (e.g., large-v3)
+            sot_id = 50258;           // <|startoftranscript|>
+            eot_id = 50257;           // <|endoftext|>
+            no_timestamps_id = 50363; // <|notimestamps|>
+            timestamp_begin = 50364;  // First timestamp token <|0.00|>
+        } else {
+            // English-only model
+            sot_id = 50257;           // <|startoftranscript|>
+            eot_id = 50256;           // <|endoftext|>
+            no_timestamps_id = 50362; // <|notimestamps|>
+            timestamp_begin = 50363;  // First timestamp token
+        }
+
+        tokens_initialized = true;
+        std::cout << "[Muninn] Token IDs initialized: sot=" << sot_id
+                  << ", eot=" << eot_id << ", timestamp_begin=" << timestamp_begin << "\n";
+    }
 
     // Detect language from mel-spectrogram features
     std::pair<std::string, float> detect_language(
@@ -197,7 +239,60 @@ float parse_timestamp_token(const std::string& token) {
 }
 
 /**
- * @brief Clean a text token by replacing GPT-2 BPE markers
+ * @brief Check if a token starts a new word (has GPT-2 BPE space marker Ġ)
+ *
+ * In GPT-2/Whisper tokenization:
+ * - Tokens starting with Ġ (U+0120) indicate a new word (space before)
+ * - Tokens WITHOUT Ġ are continuations of the previous token
+ *
+ * Examples:
+ * - "Ġdon" → starts word "don"
+ * - "'t" → continues previous word → "don't"
+ * - "Ġlike" → starts word "like"
+ */
+bool is_word_start(const std::string& token) {
+    const std::string gpt2_space = "\xC4\xA0";  // Ġ in UTF-8 (U+0120)
+    return token.size() >= 2 && token.substr(0, 2) == gpt2_space;
+}
+
+/**
+ * @brief Check if a token is punctuation-only (no alphanumeric content)
+ */
+bool is_punctuation_only(const std::string& token) {
+    // Strip the Ġ prefix if present
+    std::string text = token;
+    const std::string gpt2_space = "\xC4\xA0";
+    if (text.size() >= 2 && text.substr(0, 2) == gpt2_space) {
+        text = text.substr(2);
+    }
+
+    // Empty after stripping = just a space marker
+    if (text.empty()) return true;
+
+    // Check if any alphanumeric character exists
+    for (char c : text) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            return false;  // Has alphanumeric content = real word
+        }
+    }
+    return true;  // Only punctuation/symbols
+}
+
+/**
+ * @brief Clean a text token by removing GPT-2 BPE markers entirely (no space replacement)
+ */
+std::string clean_token_raw(const std::string& token) {
+    std::string processed = token;
+    const std::string gpt2_space = "\xC4\xA0";  // Ġ in UTF-8 (U+0120)
+    size_t pos = 0;
+    while ((pos = processed.find(gpt2_space, pos)) != std::string::npos) {
+        processed.erase(pos, 2);  // Remove the BPE marker entirely
+    }
+    return processed;
+}
+
+/**
+ * @brief Clean a text token by replacing GPT-2 BPE markers with spaces
  */
 std::string clean_token(const std::string& token) {
     std::string processed = token;
@@ -254,20 +349,134 @@ std::string Transcriber::Impl::extract_text(const std::vector<std::string>& toke
 }
 
 /**
+ * @brief Extract word-level timestamps using CTranslate2 alignment data
+ *
+ * Uses cross-attention weights from Whisper to determine when each token
+ * was spoken in the audio. This provides much more accurate word timing
+ * than character-count distribution.
+ *
+ * @param seg The segment to add words to (modified in place)
+ * @param alignment Cross-attention alignment data for each token
+ * @param token_ids Token IDs from the result
+ * @param tokens Text tokens from the result
+ * @param word_buffer Buffer of (word_text, token_indices) pairs
+ * @param seg_start Segment start time
+ * @param seg_end Segment end time
+ */
+void extract_words_from_alignment(
+    Segment& seg,
+    const std::vector<std::vector<float>>& alignment,
+    const std::vector<size_t>& token_ids,
+    const std::vector<std::string>& tokens,
+    const std::vector<std::pair<std::string, std::vector<size_t>>>& word_buffer,
+    float seg_start,
+    float seg_end
+) {
+    if (word_buffer.empty()) return;
+
+    // Frames are 20ms apart (50 frames per second) in Whisper
+    constexpr float FRAME_DURATION = 0.02f;  // 20ms per frame
+
+    // Check alignment format:
+    // New format from align(): each entry is [start_frame, end_frame, probability]
+    // Old format (attention weights): each entry is vector of weights per frame
+    bool use_new_format = !alignment.empty() && alignment[0].size() == 3;
+
+    float prev_word_end = seg_start;
+
+    // Track which alignment index corresponds to which text token
+    // We need to map word_buffer token indices to alignment indices
+    // The alignment data is for text tokens only (no timestamps/special tokens)
+    size_t align_idx = 0;
+
+    for (size_t wi = 0; wi < word_buffer.size(); ++wi) {
+        const auto& [word_text, token_indices] = word_buffer[wi];
+
+        if (token_indices.empty()) continue;
+
+        float word_start_time = seg_end;
+        float word_end_time = seg_start;
+        float total_prob = 0.0f;
+
+        if (use_new_format) {
+            // New format: alignment[i] = [start_frame, end_frame, probability]
+            // Each alignment entry corresponds to one text token
+            for (size_t i = 0; i < token_indices.size() && align_idx < alignment.size(); ++i, ++align_idx) {
+                const auto& align_entry = alignment[align_idx];
+                float start_frame = align_entry[0];
+                float end_frame = align_entry[1];
+                float prob = align_entry[2];
+
+                float token_start = seg_start + (start_frame * FRAME_DURATION);
+                float token_end = seg_start + (end_frame * FRAME_DURATION);
+
+                word_start_time = std::min(word_start_time, token_start);
+                word_end_time = std::max(word_end_time, token_end);
+                total_prob += prob;
+            }
+        } else {
+            // Old format: attention weights per frame
+            for (size_t tok_idx : token_indices) {
+                if (tok_idx >= alignment.size()) continue;
+
+                const auto& attn = alignment[tok_idx];
+                if (attn.empty()) continue;
+
+                // Find peak attention frame for this token
+                float max_weight = 0.0f;
+                size_t peak_frame = 0;
+                for (size_t frame = 0; frame < attn.size(); ++frame) {
+                    if (attn[frame] > max_weight) {
+                        max_weight = attn[frame];
+                        peak_frame = frame;
+                    }
+                }
+
+                // Convert frame to time
+                float token_time = seg_start + (peak_frame * FRAME_DURATION);
+                word_start_time = std::min(word_start_time, token_time);
+                word_end_time = std::max(word_end_time, token_time + FRAME_DURATION);
+                total_prob += max_weight;
+            }
+        }
+
+        // Ensure word timing is valid and sequential
+        word_start_time = std::max(word_start_time, prev_word_end);
+        word_end_time = std::max(word_end_time, word_start_time + 0.05f);  // Min 50ms per word
+        word_end_time = std::min(word_end_time, seg_end);
+
+        Word w;
+        w.word = word_text;
+        w.start = word_start_time;
+        w.end = word_end_time;
+        w.probability = total_prob / std::max(1.0f, static_cast<float>(token_indices.size()));
+
+        seg.words.push_back(w);
+        prev_word_end = word_end_time;
+    }
+}
+
+/**
  * @brief Extract timestamped segments from Whisper output tokens
  *
  * Whisper outputs text interleaved with timestamp tokens:
  * <|0.00|> Hello world <|2.50|> How are you <|5.00|>
  *
  * This function parses these into separate segments with accurate timing.
+ * When alignment data is available, it uses cross-attention weights for
+ * accurate word-level timestamps instead of character-count distribution.
  *
  * @param tokens Output tokens from Whisper
+ * @param token_ids Token IDs (for alignment mapping)
+ * @param alignment Cross-attention alignment data (optional, for word timestamps)
  * @param chunk_start_time Base time offset for this chunk
  * @param word_timestamps If true, also extract word-level timing
  * @return Vector of segments with timestamps
  */
 std::vector<Segment> extract_timestamped_segments(
     const std::vector<std::string>& tokens,
+    const std::vector<size_t>& token_ids,
+    const std::vector<std::vector<float>>& alignment,
     float chunk_start_time,
     bool word_timestamps
 ) {
@@ -275,7 +484,14 @@ std::vector<Segment> extract_timestamped_segments(
 
     float current_start = -1.0f;
     std::string current_text;
-    std::vector<std::pair<std::string, float>> word_buffer;  // (token, time when it appeared)
+
+    // Word buffer now stores (word_text, token_indices) for alignment lookup
+    std::vector<std::pair<std::string, std::vector<size_t>>> word_buffer;
+
+    // Track token index for alignment correlation
+    size_t text_token_idx = 0;  // Index into non-timestamp tokens
+
+    bool has_alignment = !alignment.empty();
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         const auto& token = tokens[i];
@@ -305,25 +521,50 @@ std::vector<Segment> extract_timestamped_segments(
 
                 // Extract word timestamps if requested
                 if (word_timestamps && !word_buffer.empty()) {
-                    // Distribute timing across words based on character count
-                    float seg_duration = seg.end - seg.start;
-                    size_t total_chars = 0;
-                    for (const auto& [text, _] : word_buffer) {
-                        total_chars += text.length();
-                    }
+                    if (has_alignment) {
+                        // Use alignment data for accurate word timing
+                        extract_words_from_alignment(seg, alignment, token_ids, tokens,
+                                                      word_buffer, seg.start, seg.end);
+                    } else {
+                        // Fallback: Heuristic timing (align speech to end of segment)
+                        // Key insight: Whisper segments often have silence at the START
+                        // Speech typically occurs near the END of the segment
 
-                    float word_start = seg.start;
-                    for (const auto& [text, _] : word_buffer) {
-                        Word w;
-                        w.word = text;
-                        w.start = word_start;
-                        float word_duration = (total_chars > 0)
-                            ? seg_duration * (float(text.length()) / float(total_chars))
-                            : seg_duration / float(word_buffer.size());
-                        w.end = word_start + word_duration;
-                        w.probability = 1.0f;  // We don't have per-word probs from basic approach
-                        seg.words.push_back(w);
-                        word_start = w.end;
+                        float seg_duration = seg.end - seg.start;
+                        size_t word_count = word_buffer.size();
+
+                        // Estimate actual speech duration based on word count
+                        // Use ~0.35 sec/word as baseline (slightly faster than average)
+                        float estimated_speech_duration = word_count * 0.35f;
+
+                        // Cap at segment duration
+                        if (estimated_speech_duration > seg_duration) {
+                            estimated_speech_duration = seg_duration;
+                        }
+
+                        // Align speech to END of segment (where speech usually is)
+                        float speech_start = seg.end - estimated_speech_duration;
+
+                        // Distribute words proportionally by character count within speech window
+                        size_t total_chars = 0;
+                        for (const auto& [text, indices] : word_buffer) {
+                            total_chars += text.length();
+                        }
+
+                        float word_start = speech_start;
+
+                        for (const auto& [text, indices] : word_buffer) {
+                            Word w;
+                            w.word = text;
+                            w.start = word_start;
+                            float word_duration = (total_chars > 0)
+                                ? estimated_speech_duration * (float(text.length()) / float(total_chars))
+                                : estimated_speech_duration / float(word_buffer.size());
+                            w.end = word_start + word_duration;
+                            w.probability = 1.0f;
+                            seg.words.push_back(w);
+                            word_start = w.end;
+                        }
                     }
                 }
 
@@ -341,14 +582,42 @@ std::vector<Segment> extract_timestamped_segments(
             std::string cleaned = clean_token(token);
             current_text += cleaned;
 
-            // For word timestamps, split on spaces
+            // For word timestamps, use BPE-aware token merging
+            // GPT-2/Whisper BPE rules:
+            // - Tokens starting with Ġ (U+0120) are word starts
+            // - Tokens without Ġ are continuations of previous word
+            // - Punctuation-only tokens attach to previous word
             if (word_timestamps) {
-                std::istringstream iss(cleaned);
-                std::string word;
-                while (iss >> word) {
-                    word_buffer.push_back({word, 0.0f});
+                std::string token_text = clean_token_raw(token);  // Remove Ġ without adding space
+
+                if (token_text.empty()) {
+                    // Empty token (just a space marker), skip
+                    text_token_idx++;
+                    continue;
+                }
+
+                bool starts_new_word = is_word_start(token);
+                bool is_punct = is_punctuation_only(token);
+
+                if (word_buffer.empty()) {
+                    // First word token - always start a new word
+                    word_buffer.push_back({token_text, {i}});
+                } else if (is_punct) {
+                    // Punctuation: attach to previous word (e.g., "them" + "," = "them,")
+                    word_buffer.back().first += token_text;
+                    word_buffer.back().second.push_back(i);
+                } else if (!starts_new_word) {
+                    // BPE continuation (no Ġ prefix): append to previous word
+                    // Examples: "don" + "'t" = "don't", "Mo" + "e" = "Moe"
+                    word_buffer.back().first += token_text;
+                    word_buffer.back().second.push_back(i);
+                } else {
+                    // New word (has Ġ prefix): start a new entry
+                    word_buffer.push_back({token_text, {i}});
                 }
             }
+
+            text_token_idx++;
         }
     }
 
@@ -677,9 +946,95 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
             // Extract text from sequences with proper timestamps
             if (!result.sequences.empty()) {
+                // Get token IDs for alignment correlation
+                std::vector<size_t> token_ids;
+                if (!result.sequences_ids.empty()) {
+                    token_ids = result.sequences_ids[0];
+                }
+
+                // Get alignment data using CTranslate2's align() for word timestamps
+                std::vector<std::vector<float>> alignment_data;
+
+                if (options.word_timestamps && tokens_initialized && !token_ids.empty()) {
+                    try {
+                        // Filter text tokens (exclude timestamps and special tokens)
+                        std::vector<size_t> text_tokens;
+                        for (size_t tok_id : token_ids) {
+                            // Skip timestamp tokens (>= timestamp_begin)
+                            if (tok_id >= timestamp_begin) continue;
+                            // Skip special tokens (sot, eot, no_timestamps)
+                            if (tok_id == sot_id || tok_id == eot_id || tok_id == no_timestamps_id) continue;
+                            // Skip language/task tokens (usually in range 50259-50363 for multilingual)
+                            if (tok_id >= 50259 && tok_id < timestamp_begin) continue;
+                            text_tokens.push_back(tok_id);
+                        }
+
+                        if (!text_tokens.empty()) {
+                            // Build start sequence: just [sot_id] for alignment
+                            std::vector<size_t> start_sequence = {sot_id};
+
+                            // Number of mel frames in this chunk
+                            std::vector<size_t> num_frames_vec = {static_cast<size_t>(n_frames)};
+
+                            // Median filter width (7 is standard)
+                            ctranslate2::dim_t median_filter_width = 7;
+
+                            // Call align() to get frame-accurate word alignments
+                            auto align_futures = model->align(
+                                features,
+                                start_sequence,
+                                {text_tokens},
+                                num_frames_vec,
+                                median_filter_width
+                            );
+
+                            if (!align_futures.empty()) {
+                                auto align_result = align_futures[0].get();
+
+                                // Alignments are DTW path entries: (token_index, frame_index)
+                                // Group by token to get frame ranges for each token
+                                std::vector<int64_t> token_start_frames(text_tokens.size(), -1);
+                                std::vector<int64_t> token_end_frames(text_tokens.size(), -1);
+
+                                for (const auto& [token_idx, frame_idx] : align_result.alignments) {
+                                    if (token_idx >= 0 && static_cast<size_t>(token_idx) < text_tokens.size()) {
+                                        if (token_start_frames[token_idx] < 0) {
+                                            token_start_frames[token_idx] = frame_idx;
+                                        }
+                                        token_end_frames[token_idx] = frame_idx;
+                                    }
+                                }
+
+                                // Build alignment_data with [start_frame, end_frame, probability]
+                                alignment_data.reserve(text_tokens.size());
+                                for (size_t i = 0; i < text_tokens.size(); ++i) {
+                                    int64_t start_f = token_start_frames[i];
+                                    int64_t end_f = token_end_frames[i];
+                                    if (start_f < 0) start_f = 0;
+                                    if (end_f < 0) end_f = start_f;
+
+                                    float prob = (i < align_result.text_token_probs.size())
+                                        ? align_result.text_token_probs[i] : 1.0f;
+
+                                    alignment_data.push_back({
+                                        static_cast<float>(start_f),
+                                        static_cast<float>(end_f),
+                                        prob
+                                    });
+                                }
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        // Alignment failed - fall back to heuristic approach
+                        std::cerr << "[Muninn] Alignment failed, using heuristic: " << e.what() << "\n";
+                        alignment_data.clear();
+                    }
+                }
+
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
-                    result.sequences[0], chunk_start_time, options.word_timestamps);
+                    result.sequences[0], token_ids, alignment_data,
+                    chunk_start_time, options.word_timestamps);
 
                 if (!timestamped_segs.empty()) {
                     // Use Whisper's native timestamp tokens for accurate timing
@@ -837,9 +1192,102 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
 
             // Extract text with timestamps
             if (!result.sequences.empty()) {
+                // Get token IDs for alignment correlation
+                std::vector<size_t> token_ids;
+                if (!result.sequences_ids.empty()) {
+                    token_ids = result.sequences_ids[0];
+                }
+
+                // Get alignment data using CTranslate2's align() for word timestamps
+                std::vector<std::vector<float>> alignment_data;
+
+                if (options.word_timestamps && tokens_initialized && !token_ids.empty()) {
+                    try {
+                        // Filter text tokens (exclude timestamps and special tokens)
+                        std::vector<size_t> text_tokens;
+                        for (size_t tok_id : token_ids) {
+                            if (tok_id >= timestamp_begin) continue;
+                            if (tok_id == sot_id || tok_id == eot_id || tok_id == no_timestamps_id) continue;
+                            if (tok_id >= 50259 && tok_id < timestamp_begin) continue;
+                            text_tokens.push_back(tok_id);
+                        }
+
+                        if (!text_tokens.empty()) {
+                            // Build features for this single chunk from the batch
+                            // Note: We need to extract just this chunk's features
+                            const auto& mel_features = batch_mel_features[b];
+                            int chunk_n_frames = mel_features.size();
+                            int chunk_n_mels = mel_features[0].size();
+
+                            std::vector<float> chunk_flat;
+                            chunk_flat.reserve(chunk_n_mels * chunk_n_frames);
+                            for (int mel = 0; mel < chunk_n_mels; mel++) {
+                                for (int frame = 0; frame < chunk_n_frames; frame++) {
+                                    chunk_flat.push_back(mel_features[frame][mel]);
+                                }
+                            }
+
+                            ctranslate2::StorageView chunk_features(
+                                ctranslate2::Shape{1, static_cast<ctranslate2::dim_t>(chunk_n_mels),
+                                                   static_cast<ctranslate2::dim_t>(chunk_n_frames)},
+                                chunk_flat
+                            );
+
+                            std::vector<size_t> start_sequence = {sot_id};
+                            std::vector<size_t> num_frames_vec = {static_cast<size_t>(chunk_n_frames)};
+                            ctranslate2::dim_t median_filter_width = 7;
+
+                            auto align_futures = model->align(
+                                chunk_features, start_sequence, {text_tokens},
+                                num_frames_vec, median_filter_width
+                            );
+
+                            if (!align_futures.empty()) {
+                                auto align_result = align_futures[0].get();
+
+                                // Alignments are DTW path entries: (token_index, frame_index)
+                                // Group by token to get frame ranges for each token
+                                std::vector<int64_t> token_start_frames(text_tokens.size(), -1);
+                                std::vector<int64_t> token_end_frames(text_tokens.size(), -1);
+
+                                for (const auto& [token_idx, frame_idx] : align_result.alignments) {
+                                    if (token_idx >= 0 && static_cast<size_t>(token_idx) < text_tokens.size()) {
+                                        if (token_start_frames[token_idx] < 0) {
+                                            token_start_frames[token_idx] = frame_idx;
+                                        }
+                                        token_end_frames[token_idx] = frame_idx;
+                                    }
+                                }
+
+                                // Build alignment_data with [start_frame, end_frame, probability]
+                                alignment_data.reserve(text_tokens.size());
+                                for (size_t i = 0; i < text_tokens.size(); ++i) {
+                                    int64_t start_f = token_start_frames[i];
+                                    int64_t end_f = token_end_frames[i];
+                                    if (start_f < 0) start_f = 0;
+                                    if (end_f < 0) end_f = start_f;
+
+                                    float prob = (i < align_result.text_token_probs.size())
+                                        ? align_result.text_token_probs[i] : 1.0f;
+
+                                    alignment_data.push_back({
+                                        static_cast<float>(start_f),
+                                        static_cast<float>(end_f),
+                                        prob
+                                    });
+                                }
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        // Alignment failed - fall back to heuristic
+                        alignment_data.clear();
+                    }
+                }
+
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
-                    result.sequences[0], chunk_start_time, options.word_timestamps);
+                    result.sequences[0], token_ids, alignment_data,
+                    chunk_start_time, options.word_timestamps);
 
                 size_t num_tokens = result.sequences_ids[0].size();
 
@@ -965,6 +1413,9 @@ Transcriber::Transcriber(
         pimpl_->model_loaded = true;
         pimpl_->device_str = device;
         pimpl_->compute_type_str = compute_type;
+
+        // Initialize token IDs for word-level alignment
+        pimpl_->initialize_token_ids();
 
         std::cout << "✓ Model loaded successfully\n";
         std::cout << "═══════════════════════════════════════════════════════════\n";
@@ -1285,6 +1736,11 @@ TranscribeResult Transcriber::transcribe(
                     float orig_end = remap_timestamp_to_original(seg.end, speech_segments);
                     seg.start = orig_start;
                     seg.end = orig_end;
+                    // Also remap word timestamps to original timeline
+                    for (auto& word : seg.words) {
+                        word.start = remap_timestamp_to_original(word.start, speech_segments);
+                        word.end = remap_timestamp_to_original(word.end, speech_segments);
+                    }
                 }
 
                 // Filter segments in silent regions (hallucination silence threshold)
@@ -1308,6 +1764,11 @@ TranscribeResult Transcriber::transcribe(
                     float orig_end = remap_timestamp_to_original(seg.end, speech_segments);
                     seg.start = orig_start;
                     seg.end = orig_end;
+                    // Also remap word timestamps to original timeline
+                    for (auto& word : seg.words) {
+                        word.start = remap_timestamp_to_original(word.start, speech_segments);
+                        word.end = remap_timestamp_to_original(word.end, speech_segments);
+                    }
                 }
 
                 // Filter segments in silent regions (hallucination silence threshold)
