@@ -65,22 +65,17 @@ static const std::unordered_map<std::string, std::string> CODE_TO_NLLB = {
     {"ur", "urd_Arab"},      // Urdu
 };
 
-// NLLB code -> short code (reverse mapping) - initialized thread-safely
+// NLLB code -> short code (reverse mapping) - initialized thread-safely with std::call_once
 static std::unordered_map<std::string, std::string> NLLB_TO_CODE;
-static std::mutex reverse_mapping_mutex;
-static std::atomic<bool> reverse_mapping_initialized(false);
+static std::once_flag reverse_mapping_once;
 
-// Initialize reverse mapping (thread-safe via double-checked locking with acquire/release)
+// Initialize reverse mapping (guaranteed thread-safe by std::call_once)
 static void init_reverse_mapping() {
-    if (reverse_mapping_initialized.load(std::memory_order_acquire)) return;
-
-    std::lock_guard<std::mutex> lock(reverse_mapping_mutex);
-    if (!reverse_mapping_initialized.load(std::memory_order_relaxed)) {
+    std::call_once(reverse_mapping_once, []() {
         for (const auto& pair : CODE_TO_NLLB) {
             NLLB_TO_CODE[pair.second] = pair.first;
         }
-        reverse_mapping_initialized.store(true, std::memory_order_release);
-    }
+    });
 }
 
 // Language info for supported_languages()
@@ -118,6 +113,7 @@ public:
     std::string model_path_;
     bool loaded = false;
     std::atomic<bool> shutdown_requested{false};
+    std::atomic<bool> cancelled{false};
 
 #ifdef MUNINN_USE_SENTENCEPIECE
     sentencepiece::SentencePieceProcessor sp_processor;
@@ -360,6 +356,16 @@ std::vector<std::string> Translator::translate_batch(
     all_translations.reserve(texts.size());
 
     for (size_t chunk_start = 0; chunk_start < texts.size(); chunk_start += CHUNK_SIZE) {
+        // Check for cancellation
+        if (pimpl_->cancelled.load(std::memory_order_acquire)) {
+            std::cout << "[Muninn] Translation cancelled\n";
+            // Return what we have so far, fill rest with originals
+            for (size_t i = chunk_start; i < texts.size(); ++i) {
+                all_translations.push_back(texts[i]);
+            }
+            break;
+        }
+
         size_t chunk_end = std::min(chunk_start + CHUNK_SIZE, texts.size());
 
         try {
@@ -470,6 +476,23 @@ void Translator::shutdown() {
     if (pimpl_) {
         pimpl_->shutdown();
     }
+}
+
+void Translator::cancel() {
+    if (pimpl_) {
+        pimpl_->cancelled.store(true, std::memory_order_release);
+        std::cout << "[Muninn] Translator cancellation requested\n";
+    }
+}
+
+void Translator::reset_cancel() {
+    if (pimpl_) {
+        pimpl_->cancelled.store(false, std::memory_order_release);
+    }
+}
+
+bool Translator::is_cancelled() const {
+    return pimpl_ && pimpl_->cancelled.load(std::memory_order_acquire);
 }
 
 } // namespace muninn

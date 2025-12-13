@@ -94,6 +94,10 @@ struct Segment {
     float compression_ratio;        // Text compression ratio
     float no_speech_prob;           // Probability of no speech
 
+    // Translation (when post-transcription translation is enabled)
+    std::string translated_text;    // Translated text (empty if no translation)
+    std::string translation_target; // Target language code ("es", "fr", etc.)
+
     Segment() : id(0), track_id(0), start(0.0f), end(0.0f),
                 language_probability(0.0f),
                 speaker_id(-1), speaker_confidence(0.0f),
@@ -109,8 +113,9 @@ struct TranscribeResult {
     std::string language;            // Detected/specified language
     float language_probability;      // Language detection confidence
     float duration;                  // Total audio duration in seconds
+    bool was_cancelled;              // True if transcription was cancelled by user
 
-    TranscribeResult() : language_probability(0.0f), duration(0.0f) {}
+    TranscribeResult() : language_probability(0.0f), duration(0.0f), was_cancelled(false) {}
 
     // Iterator support for range-based for loops
     auto begin() const { return segments.begin(); }

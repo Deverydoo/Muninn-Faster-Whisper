@@ -182,6 +182,27 @@ public:
      */
     void shutdown();
 
+    /**
+     * @brief Request cancellation of ongoing translation
+     *
+     * Thread-safe method that can be called from any thread (e.g., UI thread)
+     * to request cancellation of ongoing translate_batch() calls.
+     */
+    void cancel();
+
+    /**
+     * @brief Reset cancellation flag
+     *
+     * Call this before starting a new translation if a previous one was cancelled.
+     */
+    void reset_cancel();
+
+    /**
+     * @brief Check if cancellation was requested
+     * @return true if cancel() was called and not yet reset
+     */
+    bool is_cancelled() const;
+
 private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;

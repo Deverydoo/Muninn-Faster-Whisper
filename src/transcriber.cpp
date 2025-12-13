@@ -1,4 +1,5 @@
 #include "muninn/transcriber.h"
+#include "muninn/logging.h"
 #include "muninn/mel_spectrogram.h"
 #include "muninn/audio_extractor.h"
 #include "muninn/vad.h"
@@ -13,6 +14,10 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <atomic>
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+#endif
 
 namespace {
 
@@ -70,6 +75,8 @@ public:
     bool model_loaded = false;
     std::string device_str;
     std::string compute_type_str;
+    bool using_cuda = false;      // Actual device after model load
+    int device_index = 0;         // GPU index
 
     // Token IDs for alignment (cached after model load)
     size_t sot_id = 0;           // Start of transcript
@@ -77,6 +84,9 @@ public:
     size_t no_timestamps_id = 0; // No timestamps token
     size_t timestamp_begin = 0;  // First timestamp token ID
     bool tokens_initialized = false;
+
+    // Cancellation support - atomic for thread-safe access from UI thread
+    std::atomic<bool> cancelled{false};
 
     Impl() : mel_converter(16000, 400, 128, 160) {}
 
@@ -119,6 +129,12 @@ public:
     std::pair<std::string, float> detect_language(
         const std::vector<std::vector<float>>& mel_features
     ) {
+        // Bounds check to prevent crash on empty input
+        if (mel_features.empty() || mel_features[0].empty()) {
+            std::cerr << "[Muninn] Warning: Empty mel features for language detection, defaulting to English\n";
+            return {"en", 0.0f};
+        }
+
         int n_frames = mel_features.size();
         int n_mels = mel_features[0].size();
 
@@ -1136,6 +1152,12 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         size_t batch_size = batch_mel_features.size();
         std::cout << "[Muninn] Batch inference: " << batch_size << " chunks\n";
 
+        // Bounds check to prevent crash on empty input
+        if (batch_mel_features[0].empty() || batch_mel_features[0][0].empty()) {
+            std::cerr << "[Muninn] Warning: Empty mel features in batch, skipping\n";
+            return all_segments;
+        }
+
         // Find max frames across batch for padding
         int max_frames = 0;
         int n_mels = batch_mel_features[0][0].size();
@@ -1338,6 +1360,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                                 all_segments[b].push_back(seg);
                                 std::cout << "[Muninn] Batch[" << b << "] [" << seg.start << "-" << seg.end << "]: "
                                          << seg.text.substr(0, std::min(size_t(60), seg.text.length())) << "\n";
+                                std::cout.flush();
                             }
                         }
                     }
@@ -1364,6 +1387,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         }
 
         std::cout << "[Muninn] Batch complete\n";
+        std::cout.flush();
 
     } catch (const std::exception& e) {
         std::cerr << "[Muninn] Batch transcription failed: " << e.what() << "\n";
@@ -1383,9 +1407,7 @@ Transcriber::Transcriber(
 ) : pimpl_(std::make_unique<Impl>()) {
 
     try {
-        std::cout << "═══════════════════════════════════════════════════════════\n";
         std::cout << "MUNINN FASTER-WHISPER - LOADING MODEL\n";
-        std::cout << "═══════════════════════════════════════════════════════════\n";
 
         // Determine short model name from path
         std::string model_name = "unknown";
@@ -1447,15 +1469,33 @@ Transcriber::Transcriber(
         pimpl_->device_str = device;
         pimpl_->compute_type_str = compute_type;
 
+        // Determine actual device used
+        pimpl_->using_cuda = (ct_device == ctranslate2::Device::CUDA);
+        pimpl_->device_index = 0;
+
+        // Log device info
+        if (pimpl_->using_cuda) {
+#ifdef WITH_CUDA
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+                Logger::info("Device: CUDA - " + std::string(prop.name) + " (" + std::to_string(prop.totalGlobalMem / (1024*1024)) + " MB)");
+            } else {
+                Logger::info("Device: CUDA (GPU details unavailable)");
+            }
+#else
+            Logger::info("Device: CUDA (GPU)");
+#endif
+        } else {
+            Logger::info("Device: CPU");
+        }
+
         // Initialize token IDs for word-level alignment
         pimpl_->initialize_token_ids();
 
-        std::cout << "✓ Model loaded successfully\n";
-        std::cout << "═══════════════════════════════════════════════════════════\n";
+        Logger::info("Model loaded successfully");
 
     } catch (const std::exception& e) {
-        std::cerr << "✗ Failed to load Whisper model: " << e.what() << "\n";
-        std::cerr << "═══════════════════════════════════════════════════════════\n";
+        Logger::error("Failed to load Whisper model: " + std::string(e.what()));
         pimpl_->model_loaded = false;
         throw;
     }
@@ -1501,13 +1541,27 @@ TranscribeResult Transcriber::transcribe(
     int sample_rate,
     const TranscribeOptions& options,
     int track_id,
-    int total_tracks
+    int total_tracks,
+    ProgressCallback progress_callback
 ) {
     TranscribeResult result;
+
+    // Reset cancellation flag at start of new transcription
+    pimpl_->cancelled.store(false, std::memory_order_release);
 
     if (!pimpl_->model_loaded) {
         throw std::runtime_error("Whisper model not loaded");
     }
+
+    // Helper lambda to check cancellation
+    auto check_cancelled = [this, &result]() -> bool {
+        if (pimpl_->cancelled.load(std::memory_order_acquire)) {
+            std::cout << "[Muninn] Transcription cancelled\n";
+            result.was_cancelled = true;
+            return true;
+        }
+        return false;
+    };
 
     try {
         // TODO: Resample if sample_rate != 16000
@@ -1559,9 +1613,29 @@ TranscribeResult Transcriber::transcribe(
                 effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks);
             }
 
+            // Helper lambda for Energy VAD (used as fallback from Silero)
+            auto apply_energy_vad = [&]() {
+                std::cout << "[Muninn] Applying Energy VAD filter...\n";
+
+                VADOptions vad_opts;
+                vad_opts.threshold = options.vad_threshold;
+                vad_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
+                vad_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms;
+                vad_opts.speech_pad_ms = options.vad_speech_pad_ms;
+
+                VAD vad(vad_opts);
+                processed_samples = vad.filter_silence(clipped_samples, 16000, speech_segments);
+
+                std::cout << "[Muninn] Energy VAD: " << speech_segments.size() << " speech segments, "
+                          << (processed_samples.size() / 16000.0f) << "s of speech\n";
+            };
+
+            // Flag to track if we need energy VAD fallback
+            bool use_energy_vad = false;
+
             switch (effective_vad_type) {
                 case VADType::Auto:
-                    // Should not reach here (already resolved above)
+                    // Should not reach here (already resolved above), fall through to Energy
                     effective_vad_type = VADType::Energy;
                     [[fallthrough]];
 
@@ -1570,12 +1644,14 @@ TranscribeResult Transcriber::transcribe(
 
                     if (!is_silero_vad_available()) {
                         std::cerr << "[Muninn] Silero VAD not available, falling back to Energy VAD\n";
-                        goto energy_vad;
+                        use_energy_vad = true;
+                        break;
                     }
 
                     if (options.silero_model_path.empty()) {
                         std::cerr << "[Muninn] Silero model path not specified, falling back to Energy VAD\n";
-                        goto energy_vad;
+                        use_energy_vad = true;
+                        break;
                     }
 
                     try {
@@ -1602,45 +1678,35 @@ TranscribeResult Transcriber::transcribe(
                                   << (processed_samples.size() / 16000.0f) << "s of speech\n";
                     } catch (const std::exception& e) {
                         std::cerr << "[Muninn] Silero VAD failed: " << e.what() << ", falling back to Energy VAD\n";
-                        goto energy_vad;
+                        use_energy_vad = true;
                     }
                     break;
                 }
 
                 case VADType::WebRTC:
                     std::cerr << "[Muninn] WebRTC VAD not yet implemented, falling back to Energy VAD\n";
-                    // Fall through to Energy VAD
-                    [[fallthrough]];
+                    use_energy_vad = true;
+                    break;
 
                 case VADType::Energy:
-                energy_vad: {
-                    std::cout << "[Muninn] Applying Energy VAD filter...\n";
-
-                    VADOptions vad_opts;
-                    vad_opts.threshold = options.vad_threshold;
-                    vad_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
-                    vad_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms;
-                    vad_opts.speech_pad_ms = options.vad_speech_pad_ms;
-
-                    VAD vad(vad_opts);
-                    processed_samples = vad.filter_silence(clipped_samples, 16000, speech_segments);
-
-                    if (processed_samples.empty()) {
-                        std::cout << "[Muninn] No speech detected (Energy VAD)\n";
-                        result.duration = original_duration;
-                        result.language = options.language;
-                        return result;
-                    }
-
-                    std::cout << "[Muninn] Energy VAD: " << speech_segments.size() << " speech segments, "
-                              << (processed_samples.size() / 16000.0f) << "s of speech\n";
+                    use_energy_vad = true;
                     break;
-                }
 
                 case VADType::None:
                 default:
                     processed_samples = clipped_samples;
                     break;
+            }
+
+            // Apply energy VAD if needed (fallback or direct selection)
+            if (use_energy_vad) {
+                apply_energy_vad();
+                if (processed_samples.empty()) {
+                    std::cout << "[Muninn] No speech detected (Energy VAD)\n";
+                    result.duration = original_duration;
+                    result.language = options.language;
+                    return result;
+                }
             }
         } else {
             processed_samples = clipped_samples;
@@ -1719,12 +1785,25 @@ TranscribeResult Transcriber::transcribe(
             }
 
             // Process in batches
+            int total_batches = (num_chunks + BATCH_SIZE - 1) / BATCH_SIZE;
+
+            // Report initial progress (10%)
+            if (progress_callback) {
+                progress_callback(track_id, total_tracks, 0.10f, "Starting transcription...");
+            }
+
             for (int batch_start = 0; batch_start < num_chunks; batch_start += BATCH_SIZE) {
+                // Check for cancellation before each batch
+                if (check_cancelled()) {
+                    return result;
+                }
+
                 int batch_end = std::min(batch_start + BATCH_SIZE, num_chunks);
                 int current_batch_size = batch_end - batch_start;
+                int batch_num = batch_start / BATCH_SIZE + 1;
 
-                std::cout << "[Muninn] Processing batch " << (batch_start / BATCH_SIZE + 1)
-                          << "/" << ((num_chunks + BATCH_SIZE - 1) / BATCH_SIZE)
+                std::cout << "[Muninn] Processing batch " << batch_num
+                          << "/" << total_batches
                           << " (chunks " << (batch_start + 1) << "-" << batch_end << ")\n";
 
                 // Extract batch
@@ -1757,13 +1836,35 @@ TranscribeResult Transcriber::transcribe(
                         result.segments.push_back(seg);
                     }
                 }
+
+                // Report progress AFTER batch completes (scales from 10% to 90%)
+                // batch_num/total_batches gives 0.x to 1.0, scale to 10%-90% range
+                if (progress_callback) {
+                    float batch_progress = 0.10f + (static_cast<float>(batch_num) / total_batches) * 0.80f;
+                    bool should_continue = progress_callback(
+                        track_id, total_tracks, batch_progress,
+                        "Transcribed batch " + std::to_string(batch_num) + "/" + std::to_string(total_batches)
+                    );
+                    if (!should_continue) {
+                        std::cout << "[Muninn] Transcription cancelled by callback\n";
+                        result.was_cancelled = true;
+                        return result;
+                    }
+                }
+
+                // Also check atomic cancel flag (for cancel() called from another thread)
+                if (check_cancelled()) {
+                    return result;
+                }
             }
 
             std::cout << "[Muninn] Completed batched transcription: " << result.segments.size() << " total segments\n";
+            std::cout.flush();
 
             // Remap timestamps from filtered audio back to original timeline if VAD was applied
             if (!speech_segments.empty()) {
                 std::cout << "[Muninn] Remapping timestamps to original timeline...\n";
+                std::cout.flush();
                 for (auto& seg : result.segments) {
                     float orig_start = remap_timestamp_to_original(seg.start, speech_segments);
                     float orig_end = remap_timestamp_to_original(seg.end, speech_segments);
@@ -1785,9 +1886,19 @@ TranscribeResult Transcriber::transcribe(
             // Single chunk processing (audio <= 30 seconds)
             std::cout << "[Muninn] Audio short enough for single-pass transcription\n";
 
+            // Report progress - Starting single-chunk transcription (10%)
+            if (progress_callback) {
+                progress_callback(track_id, total_tracks, 0.10f, "Transcribing (single pass)...");
+            }
+
             // Use initial prompt as previous text for context conditioning
             std::string prev_text = effective_options.initial_prompt;
             result.segments = pimpl_->transcribe_chunk(mel_features, 0.0f, effective_options, prev_text);
+
+            // Report progress - Transcription complete (90%)
+            if (progress_callback) {
+                progress_callback(track_id, total_tracks, 0.90f, "Transcription complete");
+            }
 
             // Remap timestamps from filtered audio back to original timeline if VAD was applied
             if (!speech_segments.empty()) {
@@ -1867,11 +1978,16 @@ TranscribeResult Transcriber::transcribe(
             continue;
         }
 
-        std::cout << "\n═══════════════════════════════════════════════════════════\n";
         std::cout << "[Muninn] Processing Track " << track << "/" << track_count << "\n";
-        std::cout << "═══════════════════════════════════════════════════════════\n";
 
-        // Report progress to GUI
+        // Check for cancellation before each track
+        if (pimpl_->cancelled.load(std::memory_order_acquire)) {
+            std::cout << "[Muninn] Transcription cancelled\n";
+            combined_result.was_cancelled = true;
+            break;
+        }
+
+        // Report progress to GUI - Starting track (0%)
         if (progress_callback) {
             bool should_continue = progress_callback(
                 track, track_count, 0.0f,
@@ -1879,8 +1995,14 @@ TranscribeResult Transcriber::transcribe(
             );
             if (!should_continue) {
                 std::cout << "[Muninn] Transcription cancelled by user\n";
+                combined_result.was_cancelled = true;
                 break;
             }
+        }
+
+        // Report progress - Extracting audio (2%)
+        if (progress_callback) {
+            progress_callback(track, track_count, 0.02f, "Extracting audio track " + std::to_string(track + 1));
         }
 
         std::vector<float> samples;
@@ -1892,9 +2014,25 @@ TranscribeResult Transcriber::transcribe(
 
         std::cout << "[Muninn] Track " << track << ": " << samples.size() << " samples\n";
 
-        // Transcribe this track
+        // Report progress - Audio extracted (5%)
+        if (progress_callback) {
+            progress_callback(track, track_count, 0.05f, "Audio extracted, preparing transcription...");
+        }
+
+        // Transcribe this track - inner function reports progress from 10% to 90%
         try {
-            auto track_result = transcribe(samples, 16000, options, track, track_count);
+            auto track_result = transcribe(samples, 16000, options, track, track_count, progress_callback);
+
+            // Check if inner transcription was cancelled
+            if (track_result.was_cancelled) {
+                combined_result.was_cancelled = true;
+                break;
+            }
+
+            // Report progress - Transcription complete, processing results (95%)
+            if (progress_callback) {
+                progress_callback(track, track_count, 0.95f, "Processing results for track " + std::to_string(track + 1));
+            }
 
             // Set track_id for each segment (GUI handles formatting with track names)
             for (auto& segment : track_result.segments) {
@@ -1906,8 +2044,9 @@ TranscribeResult Transcriber::transcribe(
                 track_result.segments.begin(), track_result.segments.end());
 
             std::cout << "[Muninn] Track " << track << ": " << track_result.segments.size() << " segment(s)\n";
+            std::cout.flush();
 
-            // Report track completion
+            // Report track completion (100%)
             if (progress_callback) {
                 progress_callback(
                     track, track_count, 1.0f,
@@ -1922,9 +2061,8 @@ TranscribeResult Transcriber::transcribe(
 
     extractor.close();
 
-    std::cout << "\n═══════════════════════════════════════════════════════════\n";
     std::cout << "[Muninn] All tracks complete. Total segments: " << combined_result.segments.size() << "\n";
-    std::cout << "═══════════════════════════════════════════════════════════\n";
+    std::cout.flush();
 
     // ═══════════════════════════════════════════════════════════
     // Speaker Diarization (if enabled)
@@ -2028,6 +2166,57 @@ Transcriber::ModelInfo Transcriber::get_model_info() const {
     info.model_type = "unknown";
 
     return info;
+}
+
+
+
+Transcriber::DeviceInfo Transcriber::get_device_info() const {
+    DeviceInfo info;
+
+    if (!pimpl_->model_loaded) {
+        info.device = "none";
+        info.compute_type = "none";
+        info.is_cuda = false;
+        info.device_index = 0;
+        info.gpu_name = "";
+        info.gpu_memory_mb = 0;
+        return info;
+    }
+
+    info.device = pimpl_->using_cuda ? "cuda" : "cpu";
+    info.compute_type = pimpl_->compute_type_str;
+    info.is_cuda = pimpl_->using_cuda;
+    info.device_index = pimpl_->device_index;
+
+    // Get GPU info if using CUDA
+    if (pimpl_->using_cuda) {
+#ifdef WITH_CUDA
+        // Query CUDA device properties
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, pimpl_->device_index) == cudaSuccess) {
+            info.gpu_name = prop.name;
+            info.gpu_memory_mb = prop.totalGlobalMem / (1024 * 1024);
+        }
+#else
+        info.gpu_name = "CUDA GPU";
+        info.gpu_memory_mb = 0;
+#endif
+    }
+
+    return info;
+}
+
+void Transcriber::cancel() {
+    pimpl_->cancelled.store(true, std::memory_order_release);
+    std::cout << "[Muninn] Cancellation requested\n";
+}
+
+void Transcriber::reset_cancel() {
+    pimpl_->cancelled.store(false, std::memory_order_release);
+}
+
+bool Transcriber::is_cancelled() const {
+    return pimpl_->cancelled.load(std::memory_order_acquire);
 }
 
 } // namespace muninn

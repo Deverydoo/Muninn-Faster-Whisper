@@ -123,6 +123,8 @@ public:
      * @param sample_rate Sample rate (will be resampled to 16kHz if needed)
      * @param options Transcription configuration
      * @param track_id Track identifier for multi-track results (default 0)
+     * @param total_tracks Total number of tracks being processed
+     * @param progress_callback Optional callback for progress updates (GUI integration)
      * @return Transcription result with segments and metadata
      *
      * @throws std::runtime_error if transcription fails
@@ -132,7 +134,8 @@ public:
         int sample_rate = 16000,
         const TranscribeOptions& options = {},
         int track_id = 0,
-        int total_tracks = 1
+        int total_tracks = 1,
+        ProgressCallback progress_callback = nullptr
     );
 
     /**
@@ -147,6 +150,48 @@ public:
         std::string model_type;  // "tiny", "base", "small", etc.
     };
     ModelInfo get_model_info() const;
+
+    /**
+     * @brief Get device information after initialization
+     *
+     * @return Device info including actual device used, compute type, and GPU details
+     */
+    struct DeviceInfo {
+        std::string device;        // "cuda" or "cpu"
+        std::string compute_type;  // "float16", "int8", "float32"
+        bool is_cuda;              // True if using CUDA
+        int device_index;          // GPU index (0 for CPU)
+        std::string gpu_name;      // GPU name (empty for CPU)
+        size_t gpu_memory_mb;      // GPU total memory in MB (0 for CPU)
+    };
+    DeviceInfo get_device_info() const;
+
+    /**
+     * @brief Request cancellation of ongoing transcription
+     *
+     * Thread-safe method that can be called from any thread (e.g., UI thread)
+     * to request cancellation of an ongoing transcribe() call.
+     *
+     * The cancellation is cooperative - the transcription will stop at the
+     * next safe checkpoint (typically between batches or chunks).
+     *
+     * After cancellation, call reset_cancel() before starting a new transcription.
+     */
+    void cancel();
+
+    /**
+     * @brief Reset cancellation flag
+     *
+     * Call this before starting a new transcription if a previous one was cancelled.
+     * This is automatically called at the start of transcribe().
+     */
+    void reset_cancel();
+
+    /**
+     * @brief Check if cancellation was requested
+     * @return true if cancel() was called and not yet reset
+     */
+    bool is_cancelled() const;
 
 private:
     class Impl;  // Forward declaration for pimpl idiom
