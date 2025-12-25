@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <atomic>
+#include <unordered_map>
 #ifdef WITH_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -295,30 +296,179 @@ bool is_punctuation_only(const std::string& token) {
 }
 
 /**
+ * @brief GPT-2/Whisper byte-level BPE decoder
+ *
+ * GPT-2 and Whisper use byte-level BPE where raw bytes (0x00-0xFF) are mapped
+ * to Unicode characters. This is necessary for handling non-ASCII text like
+ * Japanese, Chinese, Korean, Arabic, etc.
+ *
+ * The encoding maps:
+ * - Printable ASCII (0x21-0x7E) and Latin-1 Extended (0xA1-0xAC, 0xAE-0xFF) -> themselves
+ * - Other bytes (0x00-0x20, 0x7F-0xA0, 0xAD) -> U+0100 to U+0143
+ *
+ * When decoding, we reverse this: convert each Unicode char back to its original byte,
+ * then interpret the resulting byte sequence as UTF-8.
+ */
+class GPT2ByteDecoder {
+public:
+    GPT2ByteDecoder() {
+        // Build the byte-to-unicode encoder mapping (same as Python's bytes_to_unicode())
+        std::vector<int> bs;
+        std::vector<int> cs;
+
+        // Printable ASCII and Latin-1 Extended characters stay as-is
+        for (int b = '!'; b <= '~'; b++) bs.push_back(b);
+        for (int b = 0xA1; b <= 0xAC; b++) bs.push_back(b);
+        for (int b = 0xAE; b <= 0xFF; b++) bs.push_back(b);
+
+        cs = bs;  // These map to themselves
+
+        // Other bytes get mapped to U+0100 onwards
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+                bs.push_back(b);
+                cs.push_back(256 + n);
+                n++;
+            }
+        }
+
+        // Build the decoder map (Unicode codepoint -> original byte)
+        for (size_t i = 0; i < bs.size(); i++) {
+            decoder_[cs[i]] = static_cast<uint8_t>(bs[i]);
+        }
+    }
+
+    /**
+     * @brief Decode a GPT-2/Whisper token string to raw UTF-8 bytes
+     *
+     * The token string contains Unicode characters that represent raw bytes.
+     * We convert each char to its original byte value, giving us the UTF-8 bytes.
+     */
+    std::string decode(const std::string& token) const {
+        std::vector<uint8_t> bytes;
+        bytes.reserve(token.size());
+
+        // Parse UTF-8 to get Unicode codepoints
+        size_t i = 0;
+        while (i < token.size()) {
+            uint32_t codepoint = 0;
+            uint8_t c = static_cast<uint8_t>(token[i]);
+
+            // Decode UTF-8 to get the Unicode codepoint
+            if ((c & 0x80) == 0) {
+                // Single byte (ASCII)
+                codepoint = c;
+                i += 1;
+            } else if ((c & 0xE0) == 0xC0) {
+                // Two bytes
+                codepoint = (c & 0x1F) << 6;
+                if (i + 1 < token.size()) {
+                    codepoint |= (static_cast<uint8_t>(token[i + 1]) & 0x3F);
+                }
+                i += 2;
+            } else if ((c & 0xF0) == 0xE0) {
+                // Three bytes
+                codepoint = (c & 0x0F) << 12;
+                if (i + 1 < token.size()) {
+                    codepoint |= (static_cast<uint8_t>(token[i + 1]) & 0x3F) << 6;
+                }
+                if (i + 2 < token.size()) {
+                    codepoint |= (static_cast<uint8_t>(token[i + 2]) & 0x3F);
+                }
+                i += 3;
+            } else if ((c & 0xF8) == 0xF0) {
+                // Four bytes
+                codepoint = (c & 0x07) << 18;
+                if (i + 1 < token.size()) {
+                    codepoint |= (static_cast<uint8_t>(token[i + 1]) & 0x3F) << 12;
+                }
+                if (i + 2 < token.size()) {
+                    codepoint |= (static_cast<uint8_t>(token[i + 2]) & 0x3F) << 6;
+                }
+                if (i + 3 < token.size()) {
+                    codepoint |= (static_cast<uint8_t>(token[i + 3]) & 0x3F);
+                }
+                i += 4;
+            } else {
+                // Invalid UTF-8, skip
+                i += 1;
+                continue;
+            }
+
+            // Look up the original byte for this codepoint
+            auto it = decoder_.find(codepoint);
+            if (it != decoder_.end()) {
+                bytes.push_back(it->second);
+            } else {
+                // Not a BPE byte token - this shouldn't happen for valid Whisper output
+                // but encode the codepoint back to UTF-8 as fallback
+                if (codepoint < 0x80) {
+                    bytes.push_back(static_cast<uint8_t>(codepoint));
+                } else if (codepoint < 0x800) {
+                    bytes.push_back(static_cast<uint8_t>(0xC0 | (codepoint >> 6)));
+                    bytes.push_back(static_cast<uint8_t>(0x80 | (codepoint & 0x3F)));
+                } else if (codepoint < 0x10000) {
+                    bytes.push_back(static_cast<uint8_t>(0xE0 | (codepoint >> 12)));
+                    bytes.push_back(static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3F)));
+                    bytes.push_back(static_cast<uint8_t>(0x80 | (codepoint & 0x3F)));
+                } else {
+                    bytes.push_back(static_cast<uint8_t>(0xF0 | (codepoint >> 18)));
+                    bytes.push_back(static_cast<uint8_t>(0x80 | ((codepoint >> 12) & 0x3F)));
+                    bytes.push_back(static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3F)));
+                    bytes.push_back(static_cast<uint8_t>(0x80 | (codepoint & 0x3F)));
+                }
+            }
+        }
+
+        // The resulting bytes are the actual UTF-8 text
+        return std::string(bytes.begin(), bytes.end());
+    }
+
+private:
+    std::unordered_map<uint32_t, uint8_t> decoder_;
+};
+
+// Global instance (thread-safe initialization in C++11+)
+static const GPT2ByteDecoder& get_gpt2_decoder() {
+    static GPT2ByteDecoder decoder;
+    return decoder;
+}
+
+/**
  * @brief Clean a text token by removing GPT-2 BPE markers entirely (no space replacement)
  */
 std::string clean_token_raw(const std::string& token) {
-    std::string processed = token;
-    const std::string gpt2_space = "\xC4\xA0";  // Ġ in UTF-8 (U+0120)
-    size_t pos = 0;
-    while ((pos = processed.find(gpt2_space, pos)) != std::string::npos) {
-        processed.erase(pos, 2);  // Remove the BPE marker entirely
+    // First decode the GPT-2 byte-level BPE encoding
+    std::string decoded = get_gpt2_decoder().decode(token);
+
+    // Then remove the space marker (now it's a regular space since we decoded it)
+    std::string processed;
+    processed.reserve(decoded.size());
+    for (size_t i = 0; i < decoded.size(); i++) {
+        // The space marker (U+0120 = Ġ) decodes to a space (0x20)
+        // But we want to remove it, not keep it
+        if (i == 0 && decoded[i] == ' ') {
+            continue;  // Skip leading space from Ġ marker
+        }
+        processed.push_back(decoded[i]);
     }
     return processed;
 }
 
 /**
- * @brief Clean a text token by replacing GPT-2 BPE markers with spaces
+ * @brief Clean a text token by decoding GPT-2 BPE and handling space markers
+ *
+ * This function:
+ * 1. Decodes GPT-2 byte-level BPE encoding (converts Unicode chars to raw bytes)
+ * 2. Handles the Ġ (U+0120) space marker by converting it to an actual space
+ *
+ * The result is proper UTF-8 text that can be displayed correctly.
  */
 std::string clean_token(const std::string& token) {
-    std::string processed = token;
-    const std::string gpt2_space = "\xC4\xA0";  // Ġ in UTF-8 (U+0120)
-    size_t pos = 0;
-    while ((pos = processed.find(gpt2_space, pos)) != std::string::npos) {
-        processed.replace(pos, 2, " ");
-        pos += 1;
-    }
-    return processed;
+    // Decode GPT-2 byte-level BPE to get raw UTF-8 bytes
+    std::string decoded = get_gpt2_decoder().decode(token);
+    return decoded;
 }
 
 /**
@@ -1360,6 +1510,17 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                                 all_segments[b].push_back(seg);
                                 std::cout << "[Muninn] Batch[" << b << "] [" << seg.start << "-" << seg.end << "]: "
                                          << seg.text.substr(0, std::min(size_t(60), seg.text.length())) << "\n";
+
+                                // Debug: Log hex bytes of first segment's text for encoding diagnosis
+                                if (b == 0 && all_segments[b].size() == 1) {
+                                    std::cout << "[Muninn] DEBUG encoding - first 40 bytes: ";
+                                    for (size_t i = 0; i < std::min(size_t(40), seg.text.size()); i++) {
+                                        std::cout << std::hex << (static_cast<unsigned char>(seg.text[i]) >> 4);
+                                        std::cout << (static_cast<unsigned char>(seg.text[i]) & 0xF) << " ";
+                                    }
+                                    std::cout << std::dec << "\n";
+                                }
+
                                 std::cout.flush();
                             }
                         }
@@ -1407,7 +1568,7 @@ Transcriber::Transcriber(
 ) : pimpl_(std::make_unique<Impl>()) {
 
     try {
-        std::cout << "MUNINN FASTER-WHISPER - LOADING MODEL\n";
+        Logger::info("Loading Whisper model...");
 
         // Determine short model name from path
         std::string model_name = "unknown";
@@ -1427,41 +1588,161 @@ Transcriber::Transcriber(
             model_name = "tiny";
         }
 
-        std::cout << "Model: " << model_name << "\n";
+        Logger::info("Model: " + model_name);
 
         // Determine device
         ctranslate2::Device ct_device;
+        bool cuda_fallback_to_cpu = false;
+        std::string fallback_reason;
+
+#ifdef WITH_CUDA
+        // PROACTIVE GPU CHECK: Detect incompatible GPUs BEFORE they crash
+        // CTranslate2/cuBLAS requires compute capability >= 6.0 (Pascal or newer)
+        // Older GPUs (Maxwell 5.x, Kepler 3.x) will crash during inference
+        bool cuda_available = false;
+        bool cuda_compatible = false;
+        int gpu_count = 0;
+
+        cudaError_t cuda_err = cudaGetDeviceCount(&gpu_count);
+        if (cuda_err == cudaSuccess && gpu_count > 0) {
+            cuda_available = true;
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+                int compute_major = prop.major;
+                int compute_minor = prop.minor;
+                size_t vram_mb = prop.totalGlobalMem / (1024 * 1024);
+
+                Logger::info("GPU detected: " + std::string(prop.name));
+                Logger::info("Compute capability: " + std::to_string(compute_major) + "." + std::to_string(compute_minor));
+                Logger::info("VRAM: " + std::to_string(vram_mb) + " MB");
+
+                // Minimum compute capability 6.0 (Pascal) required for stable CTranslate2
+                // Maxwell (5.x) and older crash during cuBLAS operations
+                if (compute_major >= 6) {
+                    cuda_compatible = true;
+                    Logger::info("GPU is compatible (compute >= 6.0)");
+                } else {
+                    cuda_compatible = false;
+                    fallback_reason = "GPU compute capability " + std::to_string(compute_major) + "." +
+                                     std::to_string(compute_minor) + " is below required 6.0 (Pascal)";
+                    Logger::warn(fallback_reason);
+                    Logger::warn("Maxwell (5.x) and older GPUs are not supported for CUDA inference - forcing CPU mode");
+                }
+
+                // Also warn about low VRAM (< 2GB is risky even for tiny model)
+                if (cuda_compatible && vram_mb < 2048) {
+                    Logger::warn("Low VRAM detected (" + std::to_string(vram_mb) + " MB), may cause out-of-memory errors");
+                }
+            }
+        } else {
+            Logger::info("No CUDA GPUs available");
+        }
+#else
+        bool cuda_available = false;
+        bool cuda_compatible = false;
+#endif
+
+        // Now determine device based on request and GPU compatibility
         if (device == "cuda") {
-            ct_device = ctranslate2::Device::CUDA;
-            std::cout << "Device: CUDA (GPU)\n";
+#ifdef WITH_CUDA
+            if (cuda_available && cuda_compatible) {
+                ct_device = ctranslate2::Device::CUDA;
+                Logger::info("Device: CUDA (GPU)");
+            } else if (cuda_available && !cuda_compatible) {
+                // GPU exists but not compatible - force CPU with warning
+                ct_device = ctranslate2::Device::CPU;
+                cuda_fallback_to_cpu = true;
+                Logger::info("Device: CPU (forced - incompatible GPU)");
+            } else {
+                ct_device = ctranslate2::Device::CPU;
+                cuda_fallback_to_cpu = true;
+                fallback_reason = "No CUDA GPU available";
+                Logger::info("Device: CPU (no GPU)");
+            }
+#else
+            ct_device = ctranslate2::Device::CPU;
+            cuda_fallback_to_cpu = true;
+            fallback_reason = "CUDA support not compiled";
+            Logger::info("Device: CPU (CUDA not compiled)");
+#endif
         } else if (device == "cpu") {
             ct_device = ctranslate2::Device::CPU;
-            std::cout << "Device: CPU\n";
+            Logger::info("Device: CPU");
         } else {
-            // Auto-detect
-            ct_device = ctranslate2::Device::CUDA;  // Try CUDA first
-            std::cout << "Device: Auto (trying CUDA)\n";
+            // Auto-detect - only use CUDA if available AND compatible
+#ifdef WITH_CUDA
+            if (cuda_available && cuda_compatible) {
+                ct_device = ctranslate2::Device::CUDA;
+                Logger::info("Device: Auto -> CUDA (compatible GPU found)");
+            } else {
+                ct_device = ctranslate2::Device::CPU;
+                if (cuda_available && !cuda_compatible) {
+                    cuda_fallback_to_cpu = true;
+                    Logger::info("Device: Auto -> CPU (GPU incompatible)");
+                } else {
+                    Logger::info("Device: Auto -> CPU (no GPU)");
+                }
+            }
+#else
+            ct_device = ctranslate2::Device::CPU;
+            Logger::info("Device: Auto -> CPU");
+#endif
         }
 
-        // Load the model
-        pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
-            model_path,
-            ct_device
-        );
+        // Track if CUDA was the final decision (for exception fallback)
+        bool cuda_was_requested = (ct_device == ctranslate2::Device::CUDA);
+
+        if (cuda_was_requested) {
+            try {
+                pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
+                    model_path,
+                    ct_device
+                );
+            } catch (const std::exception& cuda_error) {
+                // CUDA initialization failed - fall back to CPU
+                // Common reasons: compute capability too low, driver issues, AMD GPU, etc.
+                Logger::warn("CUDA initialization failed: " + std::string(cuda_error.what()));
+                Logger::warn("Falling back to CPU transcription");
+
+                ct_device = ctranslate2::Device::CPU;
+                cuda_fallback_to_cpu = true;
+
+                // Retry with CPU
+                pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
+                    model_path,
+                    ct_device
+                );
+            }
+        } else {
+            // CPU was explicitly requested
+            pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
+                model_path,
+                ct_device
+            );
+        }
+
+        // Log if we had to fall back
+        if (cuda_fallback_to_cpu) {
+            if (!fallback_reason.empty()) {
+                Logger::info("Using CPU mode: " + fallback_reason);
+            } else {
+                Logger::info("Now using CPU (fallback from CUDA)");
+            }
+        }
 
         // Get model information
         size_t num_languages = pimpl_->model->num_languages();
         bool is_multilingual = pimpl_->model->is_multilingual();
         size_t n_mels = pimpl_->model->n_mels();
 
-        std::cout << "Languages: " << (is_multilingual ? "Multilingual" : "English-only")
-                  << " (" << num_languages << " languages)\n";
-        std::cout << "Mel features: " << n_mels << "\n";
+        Logger::info("Languages: " + std::string(is_multilingual ? "Multilingual" : "English-only") +
+                    " (" + std::to_string(num_languages) + " languages)");
+        Logger::info("Mel features: " + std::to_string(n_mels));
 
         // Reconfigure mel-spectrogram converter to match model's expected mel bins
         if (n_mels != static_cast<size_t>(pimpl_->mel_converter.getMelBins())) {
-            std::cout << "Reconfiguring mel-spectrogram: " << pimpl_->mel_converter.getMelBins()
-                      << " -> " << n_mels << " mel bins\n";
+            Logger::info("Reconfiguring mel-spectrogram: " + std::to_string(pimpl_->mel_converter.getMelBins()) +
+                        " -> " + std::to_string(n_mels) + " mel bins");
             pimpl_->mel_converter = MelSpectrogram(16000, 400, static_cast<int>(n_mels), 160);
         }
 
@@ -2034,14 +2315,32 @@ TranscribeResult Transcriber::transcribe(
                 progress_callback(track, track_count, 0.95f, "Processing results for track " + std::to_string(track + 1));
             }
 
-            // Set track_id for each segment (GUI handles formatting with track names)
+            // Set track_id and per-track language for each segment
+            // This enables proper per-track language handling in multi-language multi-track files
             for (auto& segment : track_result.segments) {
                 segment.track_id = track;
+                // Copy tracks detected language to each segment for per-track translation
+                if (segment.language.empty() && !track_result.language.empty()) {
+                    segment.language = track_result.language;
+                    segment.language_probability = track_result.language_probability;
+                }
             }
 
             // Merge into combined result
             combined_result.segments.insert(combined_result.segments.end(),
                 track_result.segments.begin(), track_result.segments.end());
+
+
+            // Update combined result language from first track's detected language
+            // This is critical for translation - when language is "auto", Whisper detects
+            // the actual language (e.g., "en", "ja", "ko") and we need to preserve that
+            // for NLLB translation to work correctly
+            if (combined_result.language == "auto" && !track_result.language.empty() && track_result.language != "auto") {
+                combined_result.language = track_result.language;
+                combined_result.language_probability = track_result.language_probability;
+                std::cout << "[Muninn] Detected language from track " << track << ": " << track_result.language
+                          << " (confidence: " << (track_result.language_probability * 100.0f) << "%)\n";
+            }
 
             std::cout << "[Muninn] Track " << track << ": " << track_result.segments.size() << " segment(s)\n";
             std::cout.flush();
@@ -2217,6 +2516,17 @@ void Transcriber::reset_cancel() {
 
 bool Transcriber::is_cancelled() const {
     return pimpl_->cancelled.load(std::memory_order_acquire);
+}
+
+void Transcriber::clear_cache() {
+    // Clear internal caches to free GPU memory
+    // The model remains loaded, but temporary buffers are freed
+    if (pimpl_ && pimpl_->model) {
+        // CTranslate2 doesn't expose a direct cache clear, but we can
+        // trigger garbage collection by resetting any internal state
+        // For now, this is a no-op placeholder that satisfies the ABI
+        // Future: Could call ctranslate2 allocator clear_cache if exposed
+    }
 }
 
 } // namespace muninn
