@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <atomic>
 #include <unordered_map>
+#include <set>
 #ifdef WITH_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -625,20 +626,30 @@ void extract_words_from_alignment(
     // Post-processing: Fix first word if it has excessive duration
     // DTW often stretches the first token to fill silence at segment start
     // Use stable-ts approach: for first word, trust the END time and estimate START
-    if (seg.words.size() >= 2 && use_new_format) {
+    if (seg.words.size() >= 1 && use_new_format) {
         Word& first = seg.words[0];
-        const Word& second = seg.words[1];
+
+        // Calculate expected max duration based on word length
+        // Short words (1-3 chars): max 400ms
+        // Medium words (4-6 chars): max 600ms
+        // Long words (7+ chars): max 800ms
+        float max_expected_duration;
+        size_t word_len = first.word.length();
+        if (word_len <= 3) {
+            max_expected_duration = 0.4f;
+        } else if (word_len <= 6) {
+            max_expected_duration = 0.6f;
+        } else {
+            max_expected_duration = 0.8f;
+        }
 
         float first_duration = first.end - first.start;
-        float gap_to_second = second.start - first.end;
 
-        // If first word is longer than 1.5 seconds AND there's no gap to the second word
-        // (meaning the end time is accurate and flows into the next word),
-        // then the start time is the problem
-        if (first_duration > 1.5f && gap_to_second < 0.1f) {
-            // Estimate reasonable duration: ~300ms per syllable, rough estimate 150ms per character
-            // Cap at 800ms for most words
-            float estimated_duration = std::min(0.8f, std::max(0.15f, first.word.length() * 0.1f));
+        // If first word is longer than its expected max duration,
+        // the start time is likely wrong (DTW stretching into silence)
+        if (first_duration > max_expected_duration) {
+            // Estimate reasonable duration: ~100ms per character, min 200ms
+            float estimated_duration = std::max(0.2f, std::min(max_expected_duration, word_len * 0.1f));
             float new_start = first.end - estimated_duration;
             // Don't go before segment start
             new_start = std::max(new_start, seg_start);
@@ -661,6 +672,7 @@ void extract_words_from_alignment(
  * @param token_ids Token IDs (for alignment mapping)
  * @param alignment Cross-attention alignment data (optional, for word timestamps)
  * @param chunk_start_time Base time offset for this chunk
+ * @param chunk_duration Duration of this chunk in seconds (for timestamp clamping)
  * @param word_timestamps If true, also extract word-level timing
  * @return Vector of segments with timestamps
  */
@@ -669,12 +681,28 @@ std::vector<Segment> extract_timestamped_segments(
     const std::vector<size_t>& token_ids,
     const std::vector<std::vector<float>>& alignment,
     float chunk_start_time,
+    float chunk_duration,
     bool word_timestamps
 ) {
     std::vector<Segment> segments;
 
+    // Calculate the maximum valid absolute time for this chunk
+    float chunk_end_time = chunk_start_time + chunk_duration;
+
+    // DIAGNOSTIC: Log input state
+    Logger::info("extract_timestamped_segments: " + std::to_string(tokens.size()) + " tokens, chunk_start=" + std::to_string(chunk_start_time) + ", chunk_duration=" + std::to_string(chunk_duration));
+
+    // Log first 15 tokens to see what Whisper actually returned
+    std::string token_preview = "Tokens: ";
+    for (size_t i = 0; i < std::min(size_t(15), tokens.size()); i++) {
+        token_preview += "[" + tokens[i] + "] ";
+    }
+    Logger::info(token_preview);
+
     float current_start = -1.0f;
     std::string current_text;
+    int timestamp_count = 0;
+    int text_token_count = 0;
 
     // Word buffer now stores (word_text, token_indices) for alignment lookup
     std::vector<std::pair<std::string, std::vector<size_t>>> word_buffer;
@@ -692,7 +720,16 @@ std::vector<Segment> extract_timestamped_segments(
 
         if (timestamp >= 0.0f) {
             // This is a timestamp token
+            timestamp_count++;
             float absolute_time = chunk_start_time + timestamp;
+
+            // Clamp timestamp to valid chunk range
+            // This fixes issues where Whisper outputs timestamps beyond chunk duration
+            // (especially on partial final chunks that are shorter than 30 seconds)
+            if (absolute_time > chunk_end_time) {
+                Logger::info("Clamping timestamp " + std::to_string(absolute_time) + " to chunk_end " + std::to_string(chunk_end_time));
+                absolute_time = chunk_end_time;
+            }
 
             if (current_start < 0.0f) {
                 // First timestamp - marks start of first segment
@@ -771,6 +808,7 @@ std::vector<Segment> extract_timestamped_segments(
             }
         } else if (!is_special_token(token)) {
             // Regular text token
+            text_token_count++;
             std::string cleaned = clean_token(token);
             current_text += cleaned;
 
@@ -814,6 +852,13 @@ std::vector<Segment> extract_timestamped_segments(
         }
     }
 
+    // DIAGNOSTIC: Summary of what we found
+    Logger::info("extract_timestamped_segments RESULT: " + std::to_string(timestamp_count) + " timestamps, " +
+                 std::to_string(text_token_count) + " text tokens, " + std::to_string(segments.size()) + " segments created");
+    if (segments.empty() && !current_text.empty()) {
+        Logger::warn("No segments created but had text: '" + current_text.substr(0, 100) + "'");
+    }
+
     return segments;
 }
 
@@ -824,23 +869,32 @@ bool Transcriber::Impl::is_hallucination(
     float no_speech_prob,
     const TranscribeOptions& options
 ) {
+    // DIAGNOSTIC: Log what we're checking
+    Logger::info("is_hallucination check: text_len=" + std::to_string(segment.text.length()) +
+                 ", tokens=" + std::to_string(num_tokens) +
+                 ", logprob=" + std::to_string(avg_logprob) +
+                 ", no_speech=" + std::to_string(no_speech_prob) +
+                 ", thresholds: no_speech>" + std::to_string(options.no_speech_threshold) +
+                 ", logprob<" + std::to_string(options.log_prob_threshold));
+
     // 1. No-speech detection (both conditions must be met)
     if (no_speech_prob > options.no_speech_threshold && avg_logprob < options.log_prob_threshold) {
-        std::cerr << "[Muninn] Skipping no-speech segment (no_speech: " << no_speech_prob
-                  << ", avg_logprob: " << avg_logprob << ")\n";
+        Logger::warn("FILTERED: no-speech (no_speech=" + std::to_string(no_speech_prob) +
+                     " > " + std::to_string(options.no_speech_threshold) +
+                     " AND logprob=" + std::to_string(avg_logprob) +
+                     " < " + std::to_string(options.log_prob_threshold) + ")");
         return true;
     }
 
     // 2. Skip suspiciously short segments
     if (segment.text.length() <= 3) {
-        std::cerr << "[Muninn] Skipping suspiciously short segment: '" << segment.text << "'\n";
+        Logger::warn("FILTERED: short segment <=3 chars: '" + segment.text + "'");
         return true;
     }
 
     // 3. Skip very low token count with poor confidence
     if (num_tokens <= 2 && avg_logprob < -0.5f) {
-        std::cerr << "[Muninn] Skipping low-token hallucination: '" << segment.text
-                  << "' (tokens: " << num_tokens << ", avg_logprob: " << avg_logprob << ")\n";
+        Logger::warn("FILTERED: low-token (tokens=" + std::to_string(num_tokens) + ", logprob=" + std::to_string(avg_logprob) + ")");
         return true;
     }
 
@@ -895,7 +949,75 @@ bool Transcriber::Impl::is_hallucination(
         }
     }
 
-    // 5. Compression ratio check (like faster-whisper)
+
+    // 5. Character-level repetition detection for CJK text (e.g., "ぃぃぃぃぃぃぃぃ")
+    // CJK text doesn't use spaces, so word-based detection misses these patterns
+    // Decode UTF-8 to count codepoints and detect character repetition
+    {
+        std::vector<uint32_t> codepoints;
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(segment.text.c_str());
+        const unsigned char* end = p + segment.text.length();
+
+        while (p < end) {
+            uint32_t cp = 0;
+            if ((*p & 0x80) == 0) {
+                cp = *p++;
+            } else if ((*p & 0xE0) == 0xC0) {
+                cp = (*p++ & 0x1F) << 6;
+                if (p < end) cp |= (*p++ & 0x3F);
+            } else if ((*p & 0xF0) == 0xE0) {
+                cp = (*p++ & 0x0F) << 12;
+                if (p < end) cp |= (*p++ & 0x3F) << 6;
+                if (p < end) cp |= (*p++ & 0x3F);
+            } else if ((*p & 0xF8) == 0xF0) {
+                cp = (*p++ & 0x07) << 18;
+                if (p < end) cp |= (*p++ & 0x3F) << 12;
+                if (p < end) cp |= (*p++ & 0x3F) << 6;
+                if (p < end) cp |= (*p++ & 0x3F);
+            } else {
+                p++;  // Skip invalid byte
+                continue;
+            }
+            codepoints.push_back(cp);
+        }
+
+        // Check for consecutive character repetition
+        if (codepoints.size() >= 6) {
+            int max_char_repeat = 1;
+            int current_repeat = 1;
+
+            for (size_t i = 1; i < codepoints.size(); i++) {
+                if (codepoints[i] == codepoints[i-1]) {
+                    current_repeat++;
+                    max_char_repeat = std::max(max_char_repeat, current_repeat);
+                } else {
+                    current_repeat = 1;
+                }
+            }
+
+            // If same character repeats 6+ times consecutively, it's a hallucination
+            if (max_char_repeat >= 6) {
+                std::cerr << "[Muninn] Skipping character-repetition hallucination: '"
+                          << segment.text.substr(0, std::min(size_t(60), segment.text.length()))
+                          << "...' (" << max_char_repeat << " consecutive same characters)\n";
+                return true;
+            }
+
+            // Also check unique character ratio - if very low diversity, likely hallucination
+            std::set<uint32_t> unique_chars(codepoints.begin(), codepoints.end());
+            float unique_ratio = static_cast<float>(unique_chars.size()) / static_cast<float>(codepoints.size());
+
+            // If less than 10% unique characters in a string of 10+ chars, it's suspicious
+            if (codepoints.size() >= 10 && unique_ratio < 0.10f) {
+                std::cerr << "[Muninn] Skipping low-diversity hallucination: '"
+                          << segment.text.substr(0, std::min(size_t(60), segment.text.length()))
+                          << "...' (unique ratio: " << (unique_ratio * 100.0f) << "%)\n";
+                return true;
+            }
+        }
+    }
+
+    // 6. Compression ratio check (like faster-whisper)
     float compression_ratio = static_cast<float>(num_tokens) /
                              static_cast<float>(std::max(1, static_cast<int>(segment.text.length())));
 
@@ -1099,15 +1221,23 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
             whisper_options.suppress_tokens = options.suppress_tokens;
 
             // Run Whisper generation
+            Logger::info("Calling CTranslate2 generate() with beam_size=" + std::to_string(options.beam_size) +
+                         ", temp=" + std::to_string(current_temp) + ", lang=" + options.language);
             auto future_results = model->generate(features, prompts, whisper_options);
 
             if (future_results.empty()) {
-                std::cerr << "[Muninn] No results from Whisper inference for chunk\n";
+                Logger::error("No results from Whisper inference for chunk");
                 return segments;
             }
+            Logger::info("CTranslate2 returned " + std::to_string(future_results.size()) + " result(s)");
 
             // Get result from first future
             auto result = future_results[0].get();
+            Logger::info("Whisper result: sequences=" + std::to_string(result.sequences.size()) +
+                         ", no_speech_prob=" + std::to_string(result.no_speech_prob));
+            if (!result.sequences.empty() && !result.sequences[0].empty()) {
+                Logger::info("First sequence has " + std::to_string(result.sequences[0].size()) + " tokens");
+            }
 
             // Calculate average log probability
             float avg_logprob = 0.0f;
@@ -1230,7 +1360,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
                     result.sequences[0], token_ids, alignment_data,
-                    chunk_start_time, options.word_timestamps);
+                    chunk_start_time, chunk_duration, options.word_timestamps);
 
                 if (!timestamped_segs.empty()) {
                     // Use Whisper's native timestamp tokens for accurate timing
@@ -1281,9 +1411,10 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
         }
 
     } catch (const std::exception& e) {
-        std::cerr << "[Muninn] Chunk transcription failed: " << e.what() << "\n";
+        Logger::error("Chunk transcription failed: " + std::string(e.what()));
     }
 
+    Logger::info("Chunk returned " + std::to_string(segments.size()) + " segments");
     return segments;
 }
 
@@ -1300,7 +1431,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
 
     try {
         size_t batch_size = batch_mel_features.size();
-        std::cout << "[Muninn] Batch inference: " << batch_size << " chunks\n";
+        Logger::info("Batch inference: " + std::to_string(batch_size) + " chunks");
 
         // Bounds check to prevent crash on empty input
         if (batch_mel_features[0].empty() || batch_mel_features[0][0].empty()) {
@@ -1374,11 +1505,32 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         whisper_options.suppress_tokens = {-1};
 
         // Run batched Whisper generation
+        Logger::info("Calling CTranslate2 batch generate() with batch_size=" + std::to_string(batch_size));
         auto future_results = model->generate(features, prompts, whisper_options);
+        Logger::info("CTranslate2 batch returned " + std::to_string(future_results.size()) + " futures");
 
         // Process results for each batch item
+        Logger::info("Processing " + std::to_string(batch_size) + " batch results...");
         for (size_t b = 0; b < batch_size; ++b) {
+          try {
+            Logger::info("Getting future " + std::to_string(b) + "...");
             auto result = future_results[b].get();
+            Logger::info("Batch item " + std::to_string(b) + ": sequences=" + std::to_string(result.sequences.size()) +
+                         ", no_speech_prob=" + std::to_string(result.no_speech_prob));
+
+            // Log raw token info
+            if (!result.sequences.empty()) {
+                Logger::info("Batch " + std::to_string(b) + " has " + std::to_string(result.sequences[0].size()) + " tokens in sequence[0]");
+                if (!result.sequences[0].empty()) {
+                    std::string first_tokens = "First 10 tokens: ";
+                    for (size_t t = 0; t < std::min(size_t(10), result.sequences[0].size()); t++) {
+                        first_tokens += "[" + result.sequences[0][t] + "] ";
+                    }
+                    Logger::info(first_tokens);
+                }
+            } else {
+                Logger::warn("Batch " + std::to_string(b) + " has EMPTY sequences!");
+            }
 
             int n_frames = batch_mel_features[b].size();
             float chunk_duration = n_frames * 0.01f;
@@ -1492,7 +1644,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
                     result.sequences[0], token_ids, alignment_data,
-                    chunk_start_time, options.word_timestamps);
+                    chunk_start_time, chunk_duration, options.word_timestamps);
 
                 size_t num_tokens = result.sequences_ids[0].size();
 
@@ -1545,6 +1697,9 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                     }
                 }
             }
+          } catch (const std::exception& e) {
+            Logger::error("Batch item " + std::to_string(b) + " EXCEPTION: " + std::string(e.what()));
+          }
         }
 
         std::cout << "[Muninn] Batch complete\n";
@@ -1826,13 +1981,16 @@ TranscribeResult Transcriber::transcribe(
     ProgressCallback progress_callback
 ) {
     TranscribeResult result;
+    Logger::info("=== transcribe(samples) ENTERED: " + std::to_string(audio_samples.size()) + " samples ===");
 
     // Reset cancellation flag at start of new transcription
     pimpl_->cancelled.store(false, std::memory_order_release);
 
     if (!pimpl_->model_loaded) {
+        Logger::error("Model not loaded!");
         throw std::runtime_error("Whisper model not loaded");
     }
+    Logger::info("Model is loaded, proceeding...");
 
     // Helper lambda to check cancellation
     auto check_cancelled = [this, &result]() -> bool {
@@ -1886,6 +2044,9 @@ TranscribeResult Transcriber::transcribe(
         std::vector<SpeechSegment> speech_segments;
 
         bool apply_vad = options.vad_filter && options.vad_type != VADType::None;
+        Logger::info("VAD: filter=" + std::string(options.vad_filter ? "ON" : "OFF") +
+                     ", type=" + std::to_string(static_cast<int>(options.vad_type)) +
+                     ", will_apply=" + std::string(apply_vad ? "YES" : "NO"));
 
         if (apply_vad) {
             // Auto-detect VAD type if requested
@@ -1949,7 +2110,7 @@ TranscribeResult Transcriber::transcribe(
                         processed_samples = silero.filter_silence(clipped_samples, 16000, speech_segments);
 
                         if (processed_samples.empty()) {
-                            std::cout << "[Muninn] No speech detected (Silero VAD)\n";
+                            Logger::warn("No speech detected (Silero VAD) - returning empty result");
                             result.duration = original_duration;
                             result.language = options.language;
                             return result;
@@ -1983,7 +2144,7 @@ TranscribeResult Transcriber::transcribe(
             if (use_energy_vad) {
                 apply_energy_vad();
                 if (processed_samples.empty()) {
-                    std::cout << "[Muninn] No speech detected (Energy VAD)\n";
+                    Logger::warn("No speech detected (Energy VAD) - returning empty result");
                     result.duration = original_duration;
                     result.language = options.language;
                     return result;
@@ -1991,15 +2152,16 @@ TranscribeResult Transcriber::transcribe(
             }
         } else {
             processed_samples = clipped_samples;
+            Logger::info("VAD disabled, using all " + std::to_string(processed_samples.size()) + " samples");
         }
 
         // Convert to mel-spectrogram
-        std::cout << "[Muninn] Converting to mel-spectrogram\n";
+        Logger::info("Converting to mel-spectrogram from " + std::to_string(processed_samples.size()) + " samples");
         auto mel_features = pimpl_->compute_mel(processed_samples);
 
         int n_frames = mel_features.size();
-        std::cout << "[Muninn] Mel-spectrogram: " << n_frames << " frames x "
-                  << pimpl_->mel_converter.getMelBins() << " mels\n";
+        Logger::info("Mel-spectrogram: " + std::to_string(n_frames) + " frames x " +
+                     std::to_string(pimpl_->mel_converter.getMelBins()) + " mels");
 
         result.duration = original_duration;  // Report original duration, not filtered
 
@@ -2042,8 +2204,8 @@ TranscribeResult Transcriber::transcribe(
         constexpr int BATCH_SIZE = 4;  // Process 4 chunks in parallel on GPU
 
         if (n_frames > MAX_FRAMES) {
-            std::cout << "[Muninn] Audio too long (" << n_frames << " frames), splitting into chunks of "
-                      << MAX_FRAMES << " frames\n";
+            Logger::info("Audio too long (" + std::to_string(n_frames) + " frames), splitting into " +
+                         std::to_string((n_frames + MAX_FRAMES - 1) / MAX_FRAMES) + " chunks");
 
             // Calculate number of chunks needed
             int num_chunks = (n_frames + MAX_FRAMES - 1) / MAX_FRAMES;
@@ -2236,16 +2398,18 @@ TranscribeResult Transcriber::transcribe(
     // Open audio file to get track count
     AudioExtractor extractor;
 
-    std::cout << "[Muninn] Loading audio from: " << audio_path << "\n";
+    Logger::info("Loading audio from: " + audio_path);
 
     if (!extractor.open(audio_path)) {
-        throw std::runtime_error("Failed to open audio file: " + extractor.get_last_error());
+        std::string error = "Failed to open audio file: " + extractor.get_last_error();
+        Logger::error(error);
+        throw std::runtime_error(error);
     }
 
     int track_count = extractor.get_track_count();
     float duration = extractor.get_duration();
 
-    std::cout << "[Muninn] Found " << track_count << " audio track(s), duration: " << duration << "s\n";
+    Logger::info("Found " + std::to_string(track_count) + " audio track(s), duration: " + std::to_string(duration) + "s");
 
     combined_result.duration = duration;
     combined_result.language = options.language;
@@ -2255,11 +2419,11 @@ TranscribeResult Transcriber::transcribe(
     for (int track = 0; track < track_count; ++track) {
         // Check if track should be skipped (user-specified)
         if (options.skip_tracks.count(track) > 0) {
-            std::cout << "[Muninn] Skipping Track " << track << " (user-specified)\n";
+            Logger::debug("Skipping Track " + std::to_string(track) + " (user-specified)");
             continue;
         }
 
-        std::cout << "[Muninn] Processing Track " << track << "/" << track_count << "\n";
+        Logger::info("Processing Track " + std::to_string(track) + "/" + std::to_string(track_count));
 
         // Check for cancellation before each track
         if (pimpl_->cancelled.load(std::memory_order_acquire)) {
@@ -2288,12 +2452,12 @@ TranscribeResult Transcriber::transcribe(
 
         std::vector<float> samples;
         if (!extractor.extract_track(track, samples)) {
-            std::cerr << "[Muninn] WARNING: Failed to extract track " << track << ": "
-                      << extractor.get_last_error() << "\n";
+            Logger::warn("Failed to extract track " + std::to_string(track) + ": " + extractor.get_last_error());
             continue;
         }
 
-        std::cout << "[Muninn] Track " << track << ": " << samples.size() << " samples\n";
+        Logger::info("Track " + std::to_string(track) + ": " + std::to_string(samples.size()) + " samples (" +
+                     std::to_string(samples.size() / 16000.0f) + "s)");
 
         // Report progress - Audio extracted (5%)
         if (progress_callback) {
@@ -2301,14 +2465,12 @@ TranscribeResult Transcriber::transcribe(
         }
 
         // Transcribe this track - inner function reports progress from 10% to 90%
+        Logger::info("Calling transcribe() for track " + std::to_string(track) + " with " +
+                     std::to_string(samples.size()) + " samples, vad_filter=" +
+                     std::string(options.vad_filter ? "ON" : "OFF"));
         try {
             auto track_result = transcribe(samples, 16000, options, track, track_count, progress_callback);
-
-            // Check if inner transcription was cancelled
-            if (track_result.was_cancelled) {
-                combined_result.was_cancelled = true;
-                break;
-            }
+            Logger::info("transcribe() returned " + std::to_string(track_result.segments.size()) + " segments");
 
             // Report progress - Transcription complete, processing results (95%)
             if (progress_callback) {
@@ -2326,9 +2488,19 @@ TranscribeResult Transcriber::transcribe(
                 }
             }
 
-            // Merge into combined result
+            // Merge into combined result BEFORE checking cancellation
+            // This ensures any completed segments are preserved even if user cancels mid-transcription
             combined_result.segments.insert(combined_result.segments.end(),
                 track_result.segments.begin(), track_result.segments.end());
+
+            // Check if inner transcription was cancelled AFTER merging segments
+            // This way any completed work is preserved
+            if (track_result.was_cancelled) {
+                Logger::info("Transcription was cancelled but " + std::to_string(track_result.segments.size()) +
+                             " segments were preserved");
+                combined_result.was_cancelled = true;
+                break;
+            }
 
 
             // Update combined result language from first track's detected language
@@ -2342,7 +2514,7 @@ TranscribeResult Transcriber::transcribe(
                           << " (confidence: " << (track_result.language_probability * 100.0f) << "%)\n";
             }
 
-            std::cout << "[Muninn] Track " << track << ": " << track_result.segments.size() << " segment(s)\n";
+            Logger::info("Track " + std::to_string(track) + ": " + std::to_string(track_result.segments.size()) + " segment(s)");
             std::cout.flush();
 
             // Report track completion (100%)
@@ -2354,13 +2526,15 @@ TranscribeResult Transcriber::transcribe(
             }
 
         } catch (const std::exception& e) {
-            std::cerr << "[Muninn] WARNING: Track " << track << " transcription failed: " << e.what() << "\n";
+            Logger::error("Track " + std::to_string(track) + " transcription EXCEPTION: " + std::string(e.what()));
+        } catch (...) {
+            Logger::error("Track " + std::to_string(track) + " transcription UNKNOWN EXCEPTION");
         }
     }
 
     extractor.close();
 
-    std::cout << "[Muninn] All tracks complete. Total segments: " << combined_result.segments.size() << "\n";
+    Logger::info("All tracks complete. Total segments: " + std::to_string(combined_result.segments.size()));
     std::cout.flush();
 
     // ═══════════════════════════════════════════════════════════
