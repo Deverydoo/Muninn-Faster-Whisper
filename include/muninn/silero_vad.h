@@ -14,8 +14,9 @@ struct SileroVADOptions {
     float threshold = 0.5f;                 // Speech probability threshold (0.0-1.0)
     int min_speech_duration_ms = 250;       // Minimum speech duration to keep
     int min_silence_duration_ms = 100;      // Minimum silence duration for split
-    int speech_pad_ms = 30;                 // Padding around speech segments
+    int speech_pad_ms = 300;                // Padding around speech segments (300ms to capture gradual onset)
     int max_speech_duration_s = 30;         // Force split long segments (for Whisper)
+    int audio_preamble_ms = 2000;           // Always include first N ms of audio (handles VAD warm-up)
 
     // GPU acceleration
     // NOTE: CPU is typically FASTER for Silero VAD due to small inference windows (512 samples).

@@ -243,6 +243,76 @@ print(f"Accuracy: {python_text == cpp_text}")
 - **Issues**: https://github.com/Deverydoo/Muninn-Faster-Whisper/issues
 - **Discussions**: https://github.com/Deverydoo/Muninn-Faster-Whisper/discussions
 
+## Translation Feature (NEW)
+
+Muninn now supports **multi-target translation** using Meta's NLLB-200 model. Transcribe in any language, then translate to 20+ languages!
+
+### Supported Languages
+
+| Code | Language | Code | Language |
+|------|----------|------|----------|
+| en | English | ru | Russian |
+| es | Spanish | uk | Ukrainian |
+| fr | French | zh | Chinese |
+| de | German | ja | Japanese |
+| it | Italian | ko | Korean |
+| pt | Portuguese | ar | Arabic |
+| nl | Dutch | hi | Hindi |
+| pl | Polish | vi | Vietnamese |
+| tr | Turkish | th | Thai |
+
+### Setup NLLB Model
+
+```bash
+# Install Python converter (one-time setup)
+pip install ctranslate2 transformers sentencepiece
+
+# Convert NLLB model to CTranslate2 format (choose one)
+# Option 1: 600M (fast, ~1.2GB, recommended)
+ct2-transformers-converter \
+    --model facebook/nllb-200-distilled-600M \
+    --output_dir models/nllb-200-distilled-600M \
+    --quantization float16
+
+# Option 2: 1.3B (better quality, ~2.6GB)
+ct2-transformers-converter \
+    --model facebook/nllb-200-distilled-1.3B \
+    --output_dir models/nllb-200-distilled-1.3B \
+    --quantization float16
+```
+
+### Usage Example
+
+```cpp
+#include <muninn/transcriber.h>
+#include <muninn/translator.h>
+
+// Transcribe Japanese audio
+muninn::Transcriber transcriber("models/faster-whisper-large-v3-turbo");
+auto result = transcriber.transcribe("japanese_video.mp4");
+
+// Translate to multiple languages
+muninn::Translator translator("models/nllb-200-distilled-600M");
+
+for (auto& segment : result.segments) {
+    std::cout << "Japanese: " << segment.text << "\n";
+    std::cout << "English:  " << translator.translate(segment.text, "ja", "en") << "\n";
+    std::cout << "Spanish:  " << translator.translate(segment.text, "ja", "es") << "\n";
+}
+```
+
+### Memory Requirements
+
+| Model Combination | VRAM Usage |
+|------------------|------------|
+| Whisper large-v3-turbo | ~3GB |
+| NLLB 600M float16 | ~1.2GB |
+| **Both loaded** | **~4.2GB** |
+
+Both models fit on an 8GB GPU with room to spare!
+
+---
+
 ## FAQ
 
 **Q: Do I need CUDA?**

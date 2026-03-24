@@ -24,6 +24,11 @@ MelSpectrogram::MelSpectrogram(int sample_rate, int n_fft, int n_mels, int hop_l
 std::vector<float> MelSpectrogram::createHannWindow(int size)
 {
     std::vector<float> window(size);
+    // Prevent division by zero if size <= 1
+    if (size <= 1) {
+        if (size == 1) window[0] = 1.0f;
+        return window;
+    }
     for (int i = 0; i < size; i++) {
         window[i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (size - 1)));
     }

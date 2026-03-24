@@ -71,9 +71,6 @@ public:
         state_.assign(2 * 1 * 128, 0.0f);
         // Initialize context buffer (64 samples of previous audio)
         context_.assign(context_size_, 0.0f);
-        triggered_ = false;
-        temp_end_ = 0;
-        current_sample_ = 0;
     }
 
     float predict(const std::vector<float>& chunk) {
@@ -164,6 +161,11 @@ public:
         int min_speech_samples = static_cast<int>(min_speech_sec * sample_rate);
         int max_speech_samples = static_cast<int>(max_speech_sec * sample_rate);
 
+        // Hysteresis thresholds (per official Silero VAD implementation)
+        // Use higher threshold for speech onset, lower for offset to prevent premature cutoffs
+        float onset_threshold = options_.threshold;
+        float offset_threshold = std::max(0.15f, options_.threshold - 0.15f);
+
         // Process audio in chunks
         for (size_t i = 0; i + window_size <= samples.size(); i += window_size) {
             std::vector<float> chunk(samples.begin() + i, samples.begin() + i + window_size);
@@ -171,24 +173,28 @@ public:
 
             int current_pos = static_cast<int>(i);
 
-            if (speech_prob >= options_.threshold) {
-                // Speech detected
-                if (speech_start < 0) {
+            if (speech_start < 0) {
+                // Not currently in speech - check for onset
+                if (speech_prob >= onset_threshold) {
                     speech_start = current_pos;
-                }
-                neg_threshold_count = 0;
-
-                // Force split if segment too long
-                if (speech_start >= 0 && (current_pos - speech_start) > max_speech_samples) {
-                    segments.emplace_back(
-                        static_cast<float>(speech_start) / sample_rate,
-                        static_cast<float>(current_pos) / sample_rate
-                    );
-                    speech_start = current_pos;
+                    neg_threshold_count = 0;
                 }
             } else {
-                // No speech
-                if (speech_start >= 0) {
+                // Currently in speech segment
+                if (speech_prob >= offset_threshold) {
+                    // Still in speech (using lower offset threshold for hysteresis)
+                    neg_threshold_count = 0;
+
+                    // Force split if segment too long
+                    if ((current_pos - speech_start) > max_speech_samples) {
+                        segments.emplace_back(
+                            static_cast<float>(speech_start) / sample_rate,
+                            static_cast<float>(current_pos) / sample_rate
+                        );
+                        speech_start = current_pos;
+                    }
+                } else {
+                    // Below offset threshold - count silence
                     neg_threshold_count += window_size;
 
                     if (neg_threshold_count >= min_silence_samples) {
@@ -231,6 +237,30 @@ public:
             seg.end = std::min(audio_duration, seg.end + pad_sec);
         }
 
+        // Apply audio preamble: always include first N ms of audio
+        // This handles VAD warm-up issues and speech that starts immediately
+        float preamble_sec = options_.audio_preamble_ms / 1000.0f;
+        if (preamble_sec > 0.0f && audio_duration > 0.0f) {
+            float preamble_end = std::min(preamble_sec, audio_duration);
+
+            if (segments.empty()) {
+                // No speech detected, but include preamble as a segment
+                segments.emplace_back(0.0f, preamble_end);
+                std::cout << "[SileroVAD] No speech detected, adding preamble segment 0.0-" << preamble_end << "s\n";
+            } else if (segments[0].start > 0.0f) {
+                // First segment doesn't start at 0, extend it or insert preamble
+                if (segments[0].start <= preamble_end) {
+                    // Extend first segment to include preamble
+                    segments[0].start = 0.0f;
+                    std::cout << "[SileroVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
+                } else {
+                    // Insert preamble as separate segment at the beginning
+                    segments.insert(segments.begin(), SpeechSegment(0.0f, preamble_end));
+                    std::cout << "[SileroVAD] Inserted preamble segment 0.0-" << preamble_end << "s\n";
+                }
+            }
+        }
+
         std::cout << "[SileroVAD] Detected " << segments.size() << " speech segments\n";
         return segments;
     }
@@ -248,11 +278,6 @@ private:
     // Context buffer for previous audio samples
     static constexpr size_t context_size_ = 64;
     std::vector<float> context_;
-
-    // Detection state
-    bool triggered_ = false;
-    int temp_end_ = 0;
-    int current_sample_ = 0;
 };
 
 // SileroVAD public interface implementation

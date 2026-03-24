@@ -4,19 +4,37 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 
 namespace muninn {
 
 /**
+ * @brief Track type hint for VAD decisions
+ *
+ * Used to tell Muninn what kind of audio each track contains,
+ * enabling smarter VAD selection per track.
+ */
+enum class TrackType {
+    Unknown,        // Unknown track type (use heuristics)
+    Microphone,     // Voice recording (mic, commentary) - use VAD
+    SystemAudio,    // Desktop/system audio - disable VAD
+    GameAudio,      // Game audio with music/effects - disable VAD
+    MovieAudio,     // Movie/video audio - disable VAD
+    Music,          // Music track - disable VAD
+    VoiceChat       // Discord/voice chat - use VAD
+};
+
+/**
  * @brief VAD algorithm type (user-selectable in GUI)
  *
- * API Options: Auto (default), None, Energy, Silero
+ * API Options: Auto (default), None, Energy, Silero, TEN
  */
 enum class VADType {
     Auto,           // Auto-detect best VAD per track (DEFAULT - recommended for multi-track)
     None,           // No VAD - process all audio (use for clean audio or when VAD causes issues)
     Energy,         // Energy-based VAD (fast, no dependencies, works with music/mixed audio)
     Silero,         // Silero VAD ONNX (neural precision for clean speech, requires ONNX Runtime)
+    TEN,            // TEN VAD ONNX (lightweight, fast, ~308KB model, no delay issues)
     WebRTC          // WebRTC/Google VAD (future support)
 };
 
@@ -156,10 +174,14 @@ struct TranscribeOptions {
     int vad_min_speech_duration_ms = 250;  // Minimum speech duration to keep
     int vad_max_speech_duration_s = 30;    // Maximum speech duration before split
     int vad_min_silence_duration_ms = 500; // Minimum silence for split (Energy: 500ms, Silero: 100ms)
-    int vad_speech_pad_ms = 100;           // Padding around speech segments
+    int vad_speech_pad_ms = 300;           // Padding around speech segments (300ms to capture gradual speech onset)
+    int vad_audio_preamble_ms = 2000;      // Always include first N ms of audio (handles VAD warm-up and immediate speech)
 
     // Silero VAD specific
     std::string silero_model_path;         // Path to silero_vad.onnx (required for VADType::Silero)
+
+    // TEN VAD specific
+    std::string ten_vad_model_path;        // Path to ten-vad.onnx (required for VADType::TEN)
 
     // ═══════════════════════════════════════════════════════════
     // Hallucination Filtering
@@ -187,6 +209,7 @@ struct TranscribeOptions {
     // ═══════════════════════════════════════════════════════════
     std::set<int> skip_tracks;             // Track indices to skip (empty = process all)
     bool skip_silent_tracks = true;        // Auto-skip tracks with no audio signal
+    std::map<int, TrackType> track_hints;  // Track type hints for VAD decisions (track_id -> TrackType)
 
     // ═══════════════════════════════════════════════════════════
     // Speaker Diarization ("Who Said What")

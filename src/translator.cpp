@@ -1,4 +1,5 @@
 #include "muninn/translator.h"
+#include "muninn/logging.h"
 #include <ctranslate2/translator.h>
 #include <unordered_map>
 #include <sstream>
@@ -45,6 +46,7 @@ static const std::unordered_map<std::string, std::string> CODE_TO_NLLB = {
     {"ru", "rus_Cyrl"},      // Russian
     {"uk", "ukr_Cyrl"},      // Ukrainian
     {"bg", "bul_Cyrl"},      // Bulgarian
+    {"be", "bel_Cyrl"},      // Belarusian
 
     // Asian languages
     {"zh", "zho_Hans"},      // Chinese (Simplified)
@@ -54,6 +56,7 @@ static const std::unordered_map<std::string, std::string> CODE_TO_NLLB = {
     {"th", "tha_Thai"},      // Thai
     {"id", "ind_Latn"},      // Indonesian
     {"ms", "zsm_Latn"},      // Malay
+    {"tl", "tgl_Latn"},      // Filipino/Tagalog
 
     // Middle Eastern / South Asian
     {"ar", "arb_Arab"},      // Arabic
@@ -90,6 +93,8 @@ static const std::vector<TranslationLanguage> SUPPORTED_LANGUAGES = {
     {"pl", "pol_Latn", "Polish"},
     {"ru", "rus_Cyrl", "Russian"},
     {"uk", "ukr_Cyrl", "Ukrainian"},
+    {"bg", "bul_Cyrl", "Bulgarian"},
+    {"be", "bel_Cyrl", "Belarusian"},
     {"zh", "zho_Hans", "Chinese (Simplified)"},
     {"ja", "jpn_Jpan", "Japanese"},
     {"ko", "kor_Hang", "Korean"},
@@ -100,6 +105,7 @@ static const std::vector<TranslationLanguage> SUPPORTED_LANGUAGES = {
     {"tr", "tur_Latn", "Turkish"},
     {"id", "ind_Latn", "Indonesian"},
     {"he", "heb_Hebr", "Hebrew"},
+    {"tl", "tgl_Latn", "Filipino"},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -114,6 +120,9 @@ public:
     bool loaded = false;
     std::atomic<bool> shutdown_requested{false};
     std::atomic<bool> cancelled{false};
+
+    // Mutex to protect model pointer access during load/unload/translate
+    mutable std::mutex model_mutex;
 
 #ifdef MUNINN_USE_SENTENCEPIECE
     sentencepiece::SentencePieceProcessor sp_processor;
@@ -131,6 +140,7 @@ public:
             return;  // Already shutting down
         }
 
+        std::lock_guard<std::mutex> lock(model_mutex);
         loaded = false;
 
         // Destroy CTranslate2 model first - this triggers ThreadPool shutdown
@@ -290,6 +300,105 @@ public:
 
         return cleaned;
     }
+
+    // Split text into sentences for better NLLB translation quality
+    // NLLB-200 works best on individual sentences, not long paragraphs
+    // This uses simple heuristics - not perfect but good enough for captions/subtitles
+    std::vector<std::string> split_sentences(const std::string& text) {
+        std::vector<std::string> sentences;
+        if (text.empty()) return sentences;
+
+        std::string current;
+        current.reserve(text.size());
+
+        for (size_t i = 0; i < text.size(); ++i) {
+            char c = text[i];
+            current += c;
+
+            // Check for sentence-ending punctuation
+            bool is_sentence_end = (c == '.' || c == '!' || c == '?');
+
+            // Also check for Chinese/Japanese sentence enders
+            // Note: These are multi-byte UTF-8, so we check the sequence
+            if (i >= 2) {
+                // Check for CJK sentence-ending punctuation (3-byte UTF-8)
+                unsigned char b1 = text[i-2];
+                unsigned char b2 = text[i-1];
+                unsigned char b3 = c;
+                // 。(U+3002) = E3 80 82, ！(U+FF01) = EF BC 81, ？(U+FF1F) = EF BC 9F
+                if ((b1 == 0xE3 && b2 == 0x80 && b3 == 0x82) ||  // 。
+                    (b1 == 0xEF && b2 == 0xBC && b3 == 0x81) ||  // ！
+                    (b1 == 0xEF && b2 == 0xBC && b3 == 0x9F)) {  // ？
+                    is_sentence_end = true;
+                }
+            }
+
+            if (is_sentence_end) {
+                // Check for common abbreviations that shouldn't end sentences
+                // e.g., "Dr.", "Mr.", "vs.", etc.
+                bool is_abbreviation = false;
+                if (c == '.' && current.size() >= 3) {
+                    // Check last 3-4 chars for common abbreviations
+                    std::string tail = current.size() >= 4 ? current.substr(current.size() - 4) : current;
+                    if (tail.find("Dr.") != std::string::npos ||
+                        tail.find("Mr.") != std::string::npos ||
+                        tail.find("Ms.") != std::string::npos ||
+                        tail.find("vs.") != std::string::npos ||
+                        tail.find("Jr.") != std::string::npos ||
+                        tail.find("Sr.") != std::string::npos ||
+                        tail.find("St.") != std::string::npos ||
+                        tail.find("No.") != std::string::npos) {
+                        is_abbreviation = true;
+                    }
+                }
+
+                // Check if followed by lowercase letter (probably not sentence end)
+                // e.g., "The item costs 3.5 dollars" - the "." in "3.5" isn't a sentence end
+                if (c == '.' && i + 2 < text.size()) {
+                    char after_space = text[i + 1] == ' ' ? text[i + 2] : text[i + 1];
+                    if (after_space >= 'a' && after_space <= 'z') {
+                        is_abbreviation = true;  // Not a real sentence end
+                    }
+                }
+
+                if (!is_abbreviation) {
+                    // Skip any trailing whitespace
+                    while (i + 1 < text.size() && (text[i + 1] == ' ' || text[i + 1] == '\n')) {
+                        i++;
+                    }
+
+                    // Trim and save sentence
+                    auto start = current.find_first_not_of(" \t\n\r");
+                    auto end = current.find_last_not_of(" \t\n\r");
+                    if (start != std::string::npos && end != std::string::npos) {
+                        sentences.push_back(current.substr(start, end - start + 1));
+                    }
+                    current.clear();
+                }
+            }
+        }
+
+        // Don't forget the last sentence if it doesn't end with punctuation
+        if (!current.empty()) {
+            auto start = current.find_first_not_of(" \t\n\r");
+            auto end = current.find_last_not_of(" \t\n\r");
+            if (start != std::string::npos && end != std::string::npos) {
+                sentences.push_back(current.substr(start, end - start + 1));
+            }
+        }
+
+        return sentences;
+    }
+
+    // Join translated sentences back together
+    std::string join_sentences(const std::vector<std::string>& sentences) {
+        std::string result;
+        for (size_t i = 0; i < sentences.size(); ++i) {
+            if (i > 0) result += " ";
+            result += sentences[i];
+        }
+        return result;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -303,7 +412,53 @@ Translator::Translator(const std::string& model_path,
     : pimpl_(std::make_unique<Impl>(model_path, device, compute_type, device_index))
 {}
 
-Translator::~Translator() = default;
+Translator::~Translator() {
+    if (pimpl_) {
+        unload_model(5000);  // Match CTranslate2's internal Worker::join(5000) timeout
+    }
+}
+
+void Translator::unload_model(int timeout_ms) {
+    if (!pimpl_) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
+    if (!pimpl_->model) {
+        return;
+    }
+
+    Logger::info("TEMPORARY: NLLB unload_model() ENTERED");
+    pimpl_->loaded = false;
+
+    Logger::info("TEMPORARY: Step 1 — calling detach_models()...");
+    auto detached_models = pimpl_->model->detach_models();
+    Logger::info("TEMPORARY: Step 1 complete — detached " + std::to_string(detached_models.size()) + " model(s)");
+
+    int i = 0;
+    for (auto& model : detached_models) {
+        Logger::info("TEMPORARY: Step 2 — releasing GPU memory on model " + std::to_string(i) + "...");
+        const_cast<ctranslate2::models::Model*>(model.get())->release_gpu_memory();
+        Logger::info("TEMPORARY: Step 2 — model " + std::to_string(i) + " GPU memory released");
+        i++;
+    }
+    detached_models.clear();
+    Logger::info("TEMPORARY: Step 3 — shared_ptrs cleared");
+
+    // Step 4: Clear CUDA allocator cache
+    Logger::info("TEMPORARY: Step 4 — clearing CUDA allocator cache...");
+    try {
+        ctranslate2::get_allocator(ctranslate2::Device::CUDA).clear_cache();
+        Logger::info("TEMPORARY: Step 4 — allocator cache cleared");
+    } catch (...) {
+        Logger::warn("TEMPORARY: Step 4 — allocator cache clear failed (non-fatal)");
+    }
+
+    // DO NOT call model.reset() — corrupts CUDA context for subsequent operations.
+    // pimpl_->model.reset();  // INTENTIONALLY SKIPPED
+
+    Logger::info("TEMPORARY: NLLB unload complete — VRAM freed");
+}
 
 Translator::Translator(Translator&&) noexcept = default;
 Translator& Translator::operator=(Translator&&) noexcept = default;
@@ -322,13 +477,24 @@ std::vector<std::string> Translator::translate_batch(
     const std::string& target_lang,
     const TranslationOptions& options)
 {
-    if (texts.empty() || !pimpl_->loaded) {
-        return texts;
+    std::cout << "[Muninn] translate_batch called: source=" << source_lang
+              << ", target=" << target_lang << ", texts=" << texts.size() << "\n";
+    std::cout.flush();
+
+    {
+        std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
+        if (texts.empty() || !pimpl_->loaded || !pimpl_->model) {
+            std::cout << "[Muninn] translate_batch: empty texts or not loaded, returning originals\n";
+            return texts;
+        }
     }
 
     // Get NLLB codes
     std::string src_nllb = to_nllb_code(source_lang);
     std::string tgt_nllb = to_nllb_code(target_lang);
+
+    std::cout << "[Muninn] NLLB codes: src=" << src_nllb << ", tgt=" << tgt_nllb << "\n";
+    std::cout.flush();
 
     if (src_nllb.empty() || tgt_nllb.empty()) {
         std::cerr << "[Muninn] Unsupported language pair: " << source_lang
@@ -338,10 +504,12 @@ std::vector<std::string> Translator::translate_batch(
 
     // Skip translation if source == target
     if (src_nllb == tgt_nllb) {
+        std::cout << "[Muninn] translate_batch: source == target, returning originals\n";
         return texts;
     }
 
     // Set translation options
+    // Note: no_repeat_ngram_size=3 by default prevents hallucination loops
     ctranslate2::TranslationOptions ct_options;
     ct_options.beam_size = options.beam_size;
     ct_options.length_penalty = options.length_penalty;
@@ -349,24 +517,52 @@ std::vector<std::string> Translator::translate_batch(
     ct_options.no_repeat_ngram_size = options.no_repeat_ngram_size;
     ct_options.max_decoding_length = options.max_length;
 
-    // Process in chunks to avoid GPU memory issues and hangs
-    // Chunk size of 8 is safe for most GPUs while still being efficient
-    const size_t CHUNK_SIZE = 8;
-    std::vector<std::string> all_translations;
-    all_translations.reserve(texts.size());
+    // =========================================================================
+    // SENTENCE-LEVEL TRANSLATION
+    // NLLB-200 works best on individual sentences, not long paragraphs.
+    // We split each input text into sentences, translate each sentence,
+    // then rejoin them. This significantly improves translation quality.
+    // =========================================================================
 
-    for (size_t chunk_start = 0; chunk_start < texts.size(); chunk_start += CHUNK_SIZE) {
+    // Step 1: Split all texts into sentences, tracking which original text each came from
+    std::vector<std::string> all_sentences;
+    std::vector<size_t> text_boundaries;  // Index where each original text's sentences start
+    text_boundaries.push_back(0);
+
+    for (const auto& text : texts) {
+        auto sentences = pimpl_->split_sentences(text);
+        if (sentences.empty()) {
+            // Text has no sentence structure, treat whole thing as one "sentence"
+            all_sentences.push_back(text);
+        } else {
+            for (const auto& sentence : sentences) {
+                all_sentences.push_back(sentence);
+            }
+        }
+        text_boundaries.push_back(all_sentences.size());
+    }
+
+    std::cout << "[Muninn] Split " << texts.size() << " texts into "
+              << all_sentences.size() << " sentences for better translation quality\n";
+    std::cout.flush();
+
+    // Step 2: Translate all sentences in batches
+    const size_t CHUNK_SIZE = 8;
+    std::vector<std::string> translated_sentences;
+    translated_sentences.reserve(all_sentences.size());
+
+    for (size_t chunk_start = 0; chunk_start < all_sentences.size(); chunk_start += CHUNK_SIZE) {
         // Check for cancellation
         if (pimpl_->cancelled.load(std::memory_order_acquire)) {
             std::cout << "[Muninn] Translation cancelled\n";
             // Return what we have so far, fill rest with originals
-            for (size_t i = chunk_start; i < texts.size(); ++i) {
-                all_translations.push_back(texts[i]);
+            for (size_t i = chunk_start; i < all_sentences.size(); ++i) {
+                translated_sentences.push_back(all_sentences[i]);
             }
             break;
         }
 
-        size_t chunk_end = std::min(chunk_start + CHUNK_SIZE, texts.size());
+        size_t chunk_end = std::min(chunk_start + CHUNK_SIZE, all_sentences.size());
 
         try {
             // Tokenize inputs for this chunk
@@ -378,8 +574,8 @@ std::vector<std::string> Translator::translate_batch(
                 std::vector<std::string> tokens;
                 tokens.push_back(src_nllb);  // NLLB requires source lang token first
 
-                // Tokenize the text
-                auto text_tokens = pimpl_->tokenize(texts[i]);
+                // Tokenize the sentence
+                auto text_tokens = pimpl_->tokenize(all_sentences[i]);
                 tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
 
                 // Add EOS token at end of source
@@ -403,21 +599,53 @@ std::vector<std::string> Translator::translate_batch(
                 if (!results[i].hypotheses.empty()) {
                     std::string translated = pimpl_->detokenize(results[i].hypotheses[0]);
                     translated = pimpl_->clean_output(translated, tgt_nllb);
-                    all_translations.push_back(translated);
+                    translated_sentences.push_back(translated);
+                    // Debug: Log first translation
+                    if (chunk_start == 0 && i == 0) {
+                        std::cout << "[Muninn] First sentence translation:\n";
+                        std::cout << "  Input: " << all_sentences[0].substr(0, 50) << "...\n";
+                        std::cout << "  Output: " << translated.substr(0, 50) << "...\n";
+                        std::cout.flush();
+                    }
                 } else {
-                    // Fallback to original text
-                    all_translations.push_back(texts[chunk_start + i]);
+                    // Fallback to original sentence
+                    std::cout << "[Muninn] WARNING: Empty hypotheses for sentence " << (chunk_start + i) << ", using original\n";
+                    translated_sentences.push_back(all_sentences[chunk_start + i]);
                 }
             }
 
         } catch (const std::exception& e) {
             std::cerr << "[Muninn] Translation error in chunk " << (chunk_start / CHUNK_SIZE)
                       << ": " << e.what() << "\n";
-            // On error, add original texts for this chunk
+            // On error, add original sentences for this chunk
             for (size_t i = chunk_start; i < chunk_end; ++i) {
-                all_translations.push_back(texts[i]);
+                translated_sentences.push_back(all_sentences[i]);
             }
         }
+    }
+
+    // Step 3: Rejoin translated sentences back into original text structure
+    std::vector<std::string> all_translations;
+    all_translations.reserve(texts.size());
+
+    for (size_t text_idx = 0; text_idx < texts.size(); ++text_idx) {
+        size_t start = text_boundaries[text_idx];
+        size_t end = text_boundaries[text_idx + 1];
+
+        if (start >= translated_sentences.size()) {
+            // Safety: if we don't have enough translations, use original
+            all_translations.push_back(texts[text_idx]);
+            continue;
+        }
+
+        // Collect all sentences for this original text
+        std::vector<std::string> text_sentences;
+        for (size_t i = start; i < end && i < translated_sentences.size(); ++i) {
+            text_sentences.push_back(translated_sentences[i]);
+        }
+
+        // Join them back together
+        all_translations.push_back(pimpl_->join_sentences(text_sentences));
     }
 
     return all_translations;

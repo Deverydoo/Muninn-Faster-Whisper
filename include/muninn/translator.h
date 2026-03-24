@@ -18,13 +18,18 @@ struct TranslationLanguage {
 
 /**
  * @brief Options for text translation
+ *
+ * Defaults are tuned for NLLB-200 based on research:
+ * - no_repeat_ngram_size=3 prevents hallucination/repetition loops
+ * - beam_size=4 is optimal quality/speed tradeoff
+ * - length_penalty=1.0 produces natural length outputs
  */
 struct TranslationOptions {
     int beam_size = 4;              // Beam search width (1-10)
     float length_penalty = 1.0f;    // Length penalty (>1 = longer, <1 = shorter)
     int max_length = 256;           // Maximum output tokens per segment
     float repetition_penalty = 1.0f; // Repetition penalty
-    int no_repeat_ngram_size = 0;   // Prevent n-gram repetitions (0 = disabled)
+    int no_repeat_ngram_size = 3;   // Prevent 3-gram repetitions (prevents hallucination loops)
 };
 
 /**
@@ -79,6 +84,17 @@ public:
     Translator& operator=(const Translator&) = delete;
     Translator(Translator&&) noexcept;
     Translator& operator=(Translator&&) noexcept;
+
+    /**
+     * @brief Unload the model and release GPU resources
+     *
+     * Releases the CTranslate2 model and its CUDA resources without blocking.
+     * Uses a timeout for thread pool shutdown to avoid hanging on CUDA teardown.
+     * After calling this, the translator cannot be used until a new one is created.
+     *
+     * @param timeout_ms Maximum time to wait for thread pool shutdown (default 3000ms)
+     */
+    void unload_model(int timeout_ms = 3000);
 
     /**
      * @brief Translate a single text

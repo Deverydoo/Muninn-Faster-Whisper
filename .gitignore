@@ -102,3 +102,13 @@ docs/_generated/
 # Repository map (auto-generated)
 REPOMAP.md
 nul
+
+# Test output files
+test*.txt
+test*.json
+debug*.txt
+*.srt
+*.transcript.txt
+
+# Archived planning docs (kept in docs/archive/)
+docs/archive/

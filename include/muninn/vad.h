@@ -24,6 +24,7 @@ struct VADOptions {
     int min_speech_duration_ms = 250;     // Minimum speech duration to keep
     int min_silence_duration_ms = 500;    // Minimum silence to split segments
     int speech_pad_ms = 100;              // Padding around speech segments
+    int audio_preamble_ms = 2000;         // Always include first N ms of audio (handles speech starting immediately)
     bool adaptive_threshold = true;       // Auto-adjust threshold based on noise floor
     float noise_floor_percentile = 0.1f;  // Percentile for noise floor estimation
 };
@@ -112,21 +113,24 @@ AudioCharacteristics analyze_audio_characteristics(const std::vector<float>& sam
 /**
  * @brief Auto-detect best VAD type for audio
  *
- * Smart VAD selection heuristics (tested on gaming/streaming content):
- * 1. Multi-track Track 0 → Energy VAD (desktop/game audio with music)
- * 2. Very clean speech (noise floor < 0.0001) → Silero VAD (noise gates, studio mics)
- * 3. Clean speech (noise floor < 0.01, dynamic range > 0.15) → Silero VAD
- * 4. Mixed/noisy content → Energy VAD (robust fallback)
+ * Smart VAD selection heuristics:
+ * 1. Track hint = SystemAudio/GameAudio/MovieAudio/Music → No VAD (Whisper segments)
+ * 2. Track hint = Microphone/VoiceChat → Silero VAD (speech detection)
+ * 3. Multi-track Track 0 with no hint → No VAD (assume system/game audio)
+ * 4. Clean speech (noise floor < 0.01, dynamic range > 0.15) → Silero VAD
+ * 5. Mixed/noisy content → Energy VAD (robust fallback)
  *
  * @param samples Audio samples to analyze
  * @param track_id Track index (0 = first track)
  * @param total_tracks Total number of tracks in file
- * @return Recommended VAD type (Energy or Silero, never Auto/None)
+ * @param track_type Track type hint (Unknown = use heuristics)
+ * @return Recommended VAD type (Energy, Silero, or None)
  */
 VADType auto_detect_vad_type(
     const std::vector<float>& samples,
     int track_id,
-    int total_tracks
+    int total_tracks,
+    TrackType track_type = TrackType::Unknown
 );
 
 } // namespace muninn

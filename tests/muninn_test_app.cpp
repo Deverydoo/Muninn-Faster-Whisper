@@ -143,41 +143,19 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[Test] Model: " << model_path << "\n";
     std::cout << "[Test] Audio: " << audio_path << "\n\n";
-    std::cout.flush();
-
-    std::cout << "[DEBUG] Step 1: Entering try block\n";
-    std::cout.flush();
 
     try {
-        // Initialize transcriber
-        std::cout << "[DEBUG] Step 2: About to construct Transcriber...\n";
-        std::cout.flush();
-
         std::cout << "[Muninn] Loading model...\n";
-        std::cout.flush();
 
         muninn::Transcriber transcriber(model_path, "cuda", "float16");
-
-        std::cout << "[DEBUG] Step 3: Transcriber constructed successfully\n";
-        std::cout.flush();
-
-        // Get model info
-        std::cout << "[DEBUG] Step 4: Getting model info...\n";
-        std::cout.flush();
 
         auto model_info = transcriber.get_model_info();
         std::cout << "\n[Muninn] Model Information:\n";
         std::cout << "  Multilingual: " << (model_info.is_multilingual ? "Yes" : "No") << "\n";
         std::cout << "  Languages: " << model_info.num_languages << "\n";
         std::cout << "  Mel bins: " << model_info.n_mels << "\n\n";
-        std::cout.flush();
-
-        // Transcribe audio file
-        std::cout << "[DEBUG] Step 5: Setting up transcription options...\n";
-        std::cout.flush();
 
         std::cout << "[Muninn] Starting transcription...\n\n";
-        std::cout.flush();
 
         muninn::TranscribeOptions options;
         options.language = "auto";  // Auto-detect language
@@ -189,7 +167,7 @@ int main(int argc, char* argv[]) {
         // Silero model path (needed if auto-detection chooses Silero)
         std::string silero_path = model_path + "/../silero_vad.onnx";
         options.silero_model_path = silero_path;
-        options.word_timestamps = false;  // Word-level timestamps (disabled by default)
+        options.word_timestamps = true;  // Enable word-level alignment
 
         // ═══════════════════════════════════════════════════════════
         // Speaker Diarization (optional)
@@ -203,21 +181,15 @@ int main(int argc, char* argv[]) {
         options.diarization_min_speakers = 1;
         options.diarization_max_speakers = 10;  // Default: up to 10 speakers
 
-        std::cout << "[Muninn] Using auto-detection to select best VAD per track\n";
+        std::cout << "[Muninn] VAD: auto-detection | Word timestamps: "
+                  << (options.word_timestamps ? "enabled" : "disabled") << "\n";
         if (options.enable_diarization) {
             std::cout << "[Muninn] Speaker diarization: ENABLED\n";
         }
 
-        std::cout << "[DEBUG] Step 6: About to call transcribe()...\n";
-        std::cout.flush();
-
         auto start_time = std::chrono::high_resolution_clock::now();
         auto result = transcriber.transcribe(audio_path, options);
         auto end_time = std::chrono::high_resolution_clock::now();
-
-        std::cout << "[DEBUG] Step 7: Transcription completed\n";
-        std::cout.flush();
-
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
         std::cout << "\n[Muninn] Transcription complete!\n";
@@ -254,75 +226,14 @@ int main(int argc, char* argv[]) {
         std::string output_path = audio_path + ".transcript.txt";
         save_transcript(output_path, result);
 
-        // ═══════════════════════════════════════════════════════════
-        // Export subtitles and metadata
-        // ═══════════════════════════════════════════════════════════
-        std::cout << "\n[Muninn] Exporting subtitles and metadata...\n";
-
+        // Export SRT subtitle file
         muninn::SubtitleExporter exporter;
-
-        // Export SRT (native language)
         try {
             std::string srt_path = exporter.export_srt(result.segments, audio_path);
-            std::cout << "[Muninn] ✓ Created SRT: " << srt_path << "\n";
+            std::cout << "[Muninn] Created SRT: " << srt_path << "\n";
         } catch (const std::exception& e) {
             std::cerr << "[Muninn] Failed to export SRT: " << e.what() << "\n";
         }
-
-        // Export metadata JSON (Loki Studio format)
-        try {
-            std::string json_path = muninn::SubtitleMetadata::generate_metadata_json(
-                result.segments,
-                audio_path,
-                "large-v3-turbo",
-                result.language,
-                result.duration
-            );
-            std::cout << "[Muninn] ✓ Created metadata JSON: " << json_path << "\n";
-        } catch (const std::exception& e) {
-            std::cerr << "[Muninn] Failed to export metadata JSON: " << e.what() << "\n";
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // Translation test (translate to Japanese)
-        // ═══════════════════════════════════════════════════════════
-        if (result.language != "ja") {
-            std::cout << "\n[Muninn] Translating to Japanese...\n";
-
-            muninn::TranscribeOptions translate_options;
-            translate_options.task = "translate";  // Translation mode
-            translate_options.language = "ja";     // Target: Japanese
-            translate_options.beam_size = 5;
-            translate_options.temperature = 0.0f;
-            translate_options.vad_filter = true;
-            translate_options.vad_type = muninn::VADType::Auto;
-            translate_options.silero_model_path = silero_path;
-
-            auto translate_start = std::chrono::high_resolution_clock::now();
-            auto translated_result = transcriber.transcribe(audio_path, translate_options);
-            auto translate_end = std::chrono::high_resolution_clock::now();
-            auto translate_duration = std::chrono::duration_cast<std::chrono::milliseconds>(translate_end - translate_start);
-
-            std::cout << "[Muninn] Translation complete! (" << (translate_duration.count() / 1000.0) << "s)\n";
-
-            // Export translated SRT
-            try {
-                muninn::SubtitleExportOptions srt_opts;
-                srt_opts.output_path = audio_path + ".ja.srt";  // Custom output with language code
-                std::string ja_srt_path = exporter.export_srt(translated_result.segments, audio_path, srt_opts);
-                std::cout << "[Muninn] ✓ Created Japanese SRT: " << ja_srt_path << "\n";
-            } catch (const std::exception& e) {
-                std::cerr << "[Muninn] Failed to export Japanese SRT: " << e.what() << "\n";
-            }
-
-            // Show first few translated segments
-            std::cout << "\n[Muninn] Sample translation (Japanese):\n";
-            for (size_t i = 0; i < std::min(size_t(5), translated_result.segments.size()); ++i) {
-                std::cout << "  " << translated_result.segments[i].text << "\n";
-            }
-        }
-
-        std::cout << "\n[Muninn] All exports complete!\n";
 
         return 0;
 

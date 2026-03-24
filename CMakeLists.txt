@@ -9,6 +9,14 @@ project(MuninnFasterWhisper VERSION 0.5.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CRITICAL: Force UTF-8 encoding for MSVC on Windows
+# Without this, string literals with non-ASCII (like CJK) get double-encoded
+# /utf-8 sets both /source-charset:utf-8 and /execution-charset:utf-8
+if(MSVC)
+    add_compile_options(/utf-8)
+    message(STATUS "MSVC: Enabling UTF-8 source and execution charset")
+endif()
+
 # Dynamic CRT linkage to match Qt (Qt uses /MD by default)
 # MSVC default is /MD, so we don't need to set it explicitly
 # (Removed CMAKE_MSVC_RUNTIME_LIBRARY setting to use default)
@@ -80,18 +88,62 @@ if(WITH_CUDA)
 endif()
 
 # =======================
-# FFmpeg for Internal Audio Decoder (via vcpkg - same as Heimdall)
+# FFmpeg for Internal Audio Decoder
 # =======================
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat
-    libavcodec
-    libavutil
-    libswresample
-)
-message(STATUS "Found FFmpeg via vcpkg")
+# Option 1: Direct path (FFMPEG_DIR) - for builds without vcpkg
+# Option 2: vcpkg via pkg-config (original method)
+if(FFMPEG_DIR)
+    message(STATUS "Using FFmpeg from: ${FFMPEG_DIR}")
+    set(FFMPEG_INCLUDE_DIRS "${FFMPEG_DIR}/include")
+    set(FFMPEG_LIBRARIES
+        "${FFMPEG_DIR}/lib/avformat.lib"
+        "${FFMPEG_DIR}/lib/avcodec.lib"
+        "${FFMPEG_DIR}/lib/avutil.lib"
+        "${FFMPEG_DIR}/lib/swresample.lib"
+    )
+    # Create imported target to match pkg-config behavior
+    add_library(PkgConfig::FFMPEG INTERFACE IMPORTED)
+    set_target_properties(PkgConfig::FFMPEG PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIRS}"
+        INTERFACE_LINK_LIBRARIES "${FFMPEG_LIBRARIES}"
+    )
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+        libavformat
+        libavcodec
+        libavutil
+        libswresample
+    )
+    message(STATUS "Found FFmpeg via vcpkg")
+endif()
 message(STATUS "FFmpeg include: ${FFMPEG_INCLUDE_DIRS}")
 message(STATUS "FFmpeg libs: ${FFMPEG_LIBRARIES}")
+
+# =======================
+# SentencePiece for NLLB Translation
+# =======================
+set(SENTENCEPIECE_DIR "${CMAKE_SOURCE_DIR}/third_party/sentencepiece" CACHE PATH "Path to SentencePiece")
+set(SENTENCEPIECE_BUILD_DIR "${SENTENCEPIECE_DIR}/build")
+
+find_library(SENTENCEPIECE_LIB
+    NAMES sentencepiece
+    PATHS
+        "${SENTENCEPIECE_BUILD_DIR}/src/Release"
+        "${SENTENCEPIECE_BUILD_DIR}/src"
+    NO_DEFAULT_PATH
+)
+
+if(SENTENCEPIECE_LIB)
+    set(SENTENCEPIECE_INCLUDE_DIR "${SENTENCEPIECE_DIR}/src")
+    message(STATUS "Found SentencePiece: ${SENTENCEPIECE_LIB}")
+    message(STATUS "SentencePiece includes: ${SENTENCEPIECE_INCLUDE_DIR}")
+    set(SENTENCEPIECE_ENABLED ON)
+    add_compile_definitions(MUNINN_USE_SENTENCEPIECE)
+else()
+    message(WARNING "SentencePiece not found. Translation will use basic tokenization.")
+    set(SENTENCEPIECE_ENABLED OFF)
+endif()
 
 # =======================
 # ONNX Runtime for Silero VAD
@@ -144,15 +196,31 @@ endif()
 # Muninn Library Sources
 # =======================
 set(MUNINN_SOURCES
+    src/logging.cpp
     src/mel_spectrogram.cpp
     src/transcriber.cpp
-    # src/streaming_transcriber.cpp  # TODO: Fix compilation errors
+    src/streaming_transcriber.cpp
+    src/translator.cpp
     src/audio_extractor.cpp
     src/audio/audio_decoder.cpp
     src/vad.cpp
     src/silero_vad.cpp
+    src/ten_vad.cpp
     src/diarization.cpp
     src/subtitle_export.cpp
+    # Caption Engine System
+    src/caption_types.cpp
+    src/caption_options.cpp
+    src/caption_engine.cpp
+    src/caption_engine_base.cpp
+    src/caption_router.cpp
+    # Caption Engine Families
+    src/engines/cjk_engine.cpp
+    src/engines/latin_engine.cpp
+    src/engines/cyrillic_engine.cpp
+    src/engines/rtl_engine.cpp
+    src/engines/indic_engine.cpp
+    src/engines/thai_engine.cpp
 )
 
 # =======================
@@ -187,19 +255,45 @@ if(SILERO_VAD_ENABLED)
     target_include_directories(muninn PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
 
+if(SENTENCEPIECE_ENABLED)
+    target_include_directories(muninn PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
+endif()
+
+# Find dav1d library (AV1 codec, required by FFmpeg)
+find_library(DAV1D_LIB
+    NAMES dav1d
+    PATHS "C:/vcpkg/installed/x64-windows-static/lib"
+    NO_DEFAULT_PATH
+)
+if(DAV1D_LIB)
+    message(STATUS "Found dav1d: ${DAV1D_LIB}")
+else()
+    message(WARNING "dav1d not found - AV1 video decoding may fail")
+endif()
+
 # Link libraries
 target_link_libraries(muninn
     PRIVATE
         ${CTRANSLATE2_LIB}
         PkgConfig::FFMPEG
 )
+if(DAV1D_LIB)
+    target_link_libraries(muninn PRIVATE ${DAV1D_LIB})
+endif()
 
 if(SILERO_VAD_ENABLED)
     target_link_libraries(muninn PRIVATE ${ONNXRUNTIME_LIB})
 endif()
 
+if(SENTENCEPIECE_ENABLED)
+    target_link_libraries(muninn PRIVATE ${SENTENCEPIECE_LIB})
+endif()
+
 if(WITH_CUDA)
-    target_link_libraries(muninn PRIVATE CUDA::cudart)
+    # Link to CUDA driver API (nvcuda.dll) for device enumeration
+    # Avoid linking cudart statically - it conflicts with onnxruntime's cudart64_12.dll
+    # CTranslate2 already provides the CUDA runtime it needs
+    target_link_libraries(muninn PRIVATE CUDA::cuda_driver)
 endif()
 
 # MSVC Optimizations (LTCG disabled - incompatible with WINDOWS_EXPORT_ALL_SYMBOLS)
@@ -245,12 +339,33 @@ if(BUILD_TESTS)
     add_executable(test_audio_extraction tests/test_audio_extraction.cpp)
     target_link_libraries(test_audio_extraction PRIVATE muninn)
 
+    # Translation test (transcribe + translate to multiple languages)
+    add_executable(test_translation tests/test_translation.cpp)
+    target_link_libraries(test_translation PRIVATE muninn)
+
+    # Quick UTF-8 output test (translation only, no transcription)
+    add_executable(test_utf8_output tests/test_utf8_output.cpp)
+    target_link_libraries(test_utf8_output PRIVATE muninn)
+
+    # VAD parameter tuning test (iterates through VAD configs for CJK optimization)
+    add_executable(vad_tuning_app tests/vad_tuning_app.cpp)
+    target_link_libraries(vad_tuning_app PRIVATE muninn)
+
     # Ensure test apps can find DLLs
     if(BUILD_SHARED_LIBS)
         set_target_properties(muninn_test_app PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
         )
         set_target_properties(test_audio_extraction PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+        )
+        set_target_properties(test_translation PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+        )
+        set_target_properties(test_utf8_output PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+        )
+        set_target_properties(vad_tuning_app PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
         )
     endif()
@@ -262,6 +377,10 @@ endif()
 if(BUILD_EXAMPLES)
     add_executable(basic_transcription examples/basic_transcription.cpp)
     target_link_libraries(basic_transcription PRIVATE muninn)
+
+    # Translation example (transcribe + translate to multiple languages)
+    add_executable(translation_example examples/translation_example.cpp)
+    target_link_libraries(translation_example PRIVATE muninn)
 
     # Diarization example (requires ONNX Runtime and StreamingTranscriber)
     if(SILERO_VAD_ENABLED)
@@ -309,6 +428,7 @@ message(STATUS "Toolchain:        vcpkg (x64-windows-static)")
 message(STATUS "CUDA Support:     ${WITH_CUDA}")
 message(STATUS "Audio Decoder:    Internal (FFmpeg via vcpkg)")
 message(STATUS "Silero VAD:       ${SILERO_VAD_ENABLED}")
+message(STATUS "SentencePiece:    ${SENTENCEPIECE_ENABLED}")
 message(STATUS "CTranslate2:      ${CTRANSLATE2_LIB}")
 if(CTRANSLATE2_DLL)
     message(STATUS "CTranslate2 DLL:  ${CTRANSLATE2_DLL}")

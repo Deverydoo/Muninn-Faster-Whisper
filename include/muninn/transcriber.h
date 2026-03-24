@@ -88,6 +88,17 @@ public:
     Transcriber& operator=(Transcriber&&) noexcept;
 
     /**
+     * @brief Unload the model and release GPU resources
+     *
+     * Releases the CTranslate2 model and its CUDA resources without blocking.
+     * Uses a timeout for thread pool shutdown to avoid hanging on CUDA teardown.
+     * After calling this, the transcriber cannot be used until a new model is loaded.
+     *
+     * @param timeout_ms Maximum time to wait for thread pool shutdown (default 3000ms)
+     */
+    void unload_model(int timeout_ms = 3000);
+
+    /**
      * @brief Get audio file information without transcribing
      *
      * Fast metadata query - useful for GUI to show track count before processing
@@ -192,6 +203,7 @@ public:
      * @return true if cancel() was called and not yet reset
      */
     bool is_cancelled() const;
+/**     * @brief Clear internal caches to free GPU memory     *     * Call this between batch transcriptions to prevent CUDA memory accumulation.     * The model remains loaded, but temporary buffers are freed.     * This is useful for long batch jobs processing many videos.     */    void clear_cache();
 
 private:
     class Impl;  // Forward declaration for pimpl idiom

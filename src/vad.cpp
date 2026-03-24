@@ -163,6 +163,28 @@ std::vector<SpeechSegment> VAD::post_process_segments(
         }
     }
 
+    // Apply audio preamble: always include first N ms of audio
+    // This handles speech that starts immediately
+    float preamble_sec = options_.audio_preamble_ms / 1000.0f;
+    if (preamble_sec > 0.0f) {
+        if (result.empty()) {
+            // No speech detected, but include preamble as a segment
+            result.emplace_back(0.0f, preamble_sec);
+            std::cout << "[VAD] No speech detected, adding preamble segment 0.0-" << preamble_sec << "s\n";
+        } else if (result[0].start > 0.0f) {
+            // First segment doesn't start at 0, extend it or insert preamble
+            if (result[0].start <= preamble_sec) {
+                // Extend first segment to include preamble
+                result[0].start = 0.0f;
+                std::cout << "[VAD] Extended first segment to include preamble (now 0.0-" << result[0].end << "s)\n";
+            } else {
+                // Insert preamble as separate segment at the beginning
+                result.insert(result.begin(), SpeechSegment(0.0f, preamble_sec));
+                std::cout << "[VAD] Inserted preamble segment 0.0-" << preamble_sec << "s\n";
+            }
+        }
+    }
+
     return result;
 }
 
@@ -264,16 +286,64 @@ AudioCharacteristics analyze_audio_characteristics(const std::vector<float>& sam
 VADType auto_detect_vad_type(
     const std::vector<float>& samples,
     int track_id,
-    int total_tracks
+    int total_tracks,
+    TrackType track_type
 ) {
-    // Multi-track scenario: Track 0 is usually desktop/game audio with mixed content
-    if (total_tracks > 1 && track_id == 0) {
-        std::cout << "[Auto-VAD] Track " << track_id
-                  << ": Multi-track desktop/game audio → Energy VAD\n";
-        return VADType::Energy;
+    // ═══════════════════════════════════════════════════════════
+    // Priority 1: Use track type hints if provided
+    // ═══════════════════════════════════════════════════════════
+    switch (track_type) {
+        case TrackType::SystemAudio:
+            std::cout << "[Auto-VAD] Track " << track_id
+                      << ": Type=SystemAudio → No VAD (Whisper segmentation)\n";
+            return VADType::None;
+
+        case TrackType::GameAudio:
+            std::cout << "[Auto-VAD] Track " << track_id
+                      << ": Type=GameAudio → No VAD (Whisper segmentation)\n";
+            return VADType::None;
+
+        case TrackType::MovieAudio:
+            std::cout << "[Auto-VAD] Track " << track_id
+                      << ": Type=MovieAudio → No VAD (Whisper segmentation)\n";
+            return VADType::None;
+
+        case TrackType::Music:
+            std::cout << "[Auto-VAD] Track " << track_id
+                      << ": Type=Music → No VAD (Whisper segmentation)\n";
+            return VADType::None;
+
+        case TrackType::Microphone:
+            std::cout << "[Auto-VAD] Track " << track_id
+                      << ": Type=Microphone → Silero VAD\n";
+            return VADType::Silero;
+
+        case TrackType::VoiceChat:
+            std::cout << "[Auto-VAD] Track " << track_id
+                      << ": Type=VoiceChat → Silero VAD\n";
+            return VADType::Silero;
+
+        case TrackType::Unknown:
+        default:
+            // Fall through to heuristic detection below
+            break;
     }
 
-    // Analyze audio characteristics
+    // ═══════════════════════════════════════════════════════════
+    // Priority 2: Multi-track heuristic (Track 0 = system audio)
+    // ═══════════════════════════════════════════════════════════
+    // Multi-track scenario: Track 0 is usually desktop/game audio with mixed content
+    // System audio (games, movies, etc.) should NOT use VAD - Whisper handles it better
+    // VAD is designed for microphone speech with clear speech/silence boundaries
+    if (total_tracks > 1 && track_id == 0) {
+        std::cout << "[Auto-VAD] Track " << track_id
+                  << ": Multi-track system/game audio → No VAD (let Whisper segment)\n";
+        return VADType::None;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Priority 3: Analyze audio characteristics
+    // ═══════════════════════════════════════════════════════════
     auto characteristics = analyze_audio_characteristics(samples);
 
     std::cout << "[Auto-VAD] Track " << track_id

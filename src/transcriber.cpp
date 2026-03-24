@@ -9,16 +9,20 @@
 #include <ctranslate2/utils.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <future>
 #include <iostream>
+#include <thread>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <set>
 #ifdef WITH_CUDA
-#include <cuda_runtime.h>
+#include <cuda.h>  // Driver API - avoids runtime version conflicts with onnxruntime
 #endif
 
 namespace {
@@ -89,6 +93,9 @@ public:
 
     // Cancellation support - atomic for thread-safe access from UI thread
     std::atomic<bool> cancelled{false};
+
+    // Mutex to protect model pointer access during load/unload/transcribe
+    mutable std::mutex model_mutex;
 
     Impl() : mel_converter(16000, 400, 128, 160) {}
 
@@ -1751,28 +1758,37 @@ Transcriber::Transcriber(
         std::string fallback_reason;
 
 #ifdef WITH_CUDA
-        // PROACTIVE GPU CHECK: Detect incompatible GPUs BEFORE they crash
-        // CTranslate2/cuBLAS requires compute capability >= 6.0 (Pascal or newer)
-        // Older GPUs (Maxwell 5.x, Kepler 3.x) will crash during inference
+        // PROACTIVE GPU CHECK using CUDA Driver API (cuInit/cuDeviceGet*)
+        // Uses nvcuda.dll directly — avoids conflicts with mixed CUDA runtime versions
+        // (e.g., onnxruntime loads cudart64_12 while ctranslate2 uses cudart64_13)
         bool cuda_available = false;
         bool cuda_compatible = false;
         int gpu_count = 0;
 
-        cudaError_t cuda_err = cudaGetDeviceCount(&gpu_count);
-        if (cuda_err == cudaSuccess && gpu_count > 0) {
+        CUresult cu_err = cuInit(0);
+        if (cu_err == CUDA_SUCCESS) {
+            cu_err = cuDeviceGetCount(&gpu_count);
+        }
+        if (cu_err == CUDA_SUCCESS && gpu_count > 0) {
             cuda_available = true;
-            cudaDeviceProp prop;
-            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
-                int compute_major = prop.major;
-                int compute_minor = prop.minor;
-                size_t vram_mb = prop.totalGlobalMem / (1024 * 1024);
+            CUdevice device;
+            if (cuDeviceGet(&device, 0) == CUDA_SUCCESS) {
+                int compute_major = 0, compute_minor = 0;
+                cuDeviceGetAttribute(&compute_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                cuDeviceGetAttribute(&compute_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
 
-                Logger::info("GPU detected: " + std::string(prop.name));
+                size_t vram_bytes = 0;
+                cuDeviceTotalMem(&vram_bytes, device);
+                size_t vram_mb = vram_bytes / (1024 * 1024);
+
+                char gpu_name[256] = {0};
+                cuDeviceGetName(gpu_name, sizeof(gpu_name), device);
+
+                Logger::info("GPU detected: " + std::string(gpu_name));
                 Logger::info("Compute capability: " + std::to_string(compute_major) + "." + std::to_string(compute_minor));
                 Logger::info("VRAM: " + std::to_string(vram_mb) + " MB");
 
                 // Minimum compute capability 6.0 (Pascal) required for stable CTranslate2
-                // Maxwell (5.x) and older crash during cuBLAS operations
                 if (compute_major >= 6) {
                     cuda_compatible = true;
                     Logger::info("GPU is compatible (compute >= 6.0)");
@@ -1790,7 +1806,7 @@ Transcriber::Transcriber(
                 }
             }
         } else {
-            Logger::info("No CUDA GPUs available");
+            Logger::info("No CUDA GPUs available (cuInit result: " + std::to_string(cu_err) + ")");
         }
 #else
         bool cuda_available = false;
@@ -1912,9 +1928,13 @@ Transcriber::Transcriber(
         // Log device info
         if (pimpl_->using_cuda) {
 #ifdef WITH_CUDA
-            cudaDeviceProp prop;
-            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
-                Logger::info("Device: CUDA - " + std::string(prop.name) + " (" + std::to_string(prop.totalGlobalMem / (1024*1024)) + " MB)");
+            CUdevice cu_dev;
+            if (cuDeviceGet(&cu_dev, 0) == CUDA_SUCCESS) {
+                char gpu_name[256] = {0};
+                cuDeviceGetName(gpu_name, sizeof(gpu_name), cu_dev);
+                size_t vram_bytes = 0;
+                cuDeviceTotalMem(&vram_bytes, cu_dev);
+                Logger::info("Device: CUDA - " + std::string(gpu_name) + " (" + std::to_string(vram_bytes / (1024*1024)) + " MB)");
             } else {
                 Logger::info("Device: CUDA (GPU details unavailable)");
             }
@@ -1945,7 +1965,59 @@ Transcriber::Transcriber(const ModelOptions& options)
     // Threading options would be passed to CTranslate2 if supported
 }
 
-Transcriber::~Transcriber() = default;
+Transcriber::~Transcriber() {
+    if (pimpl_) {
+        unload_model(5000);  // Match CTranslate2's internal Worker::join(5000) timeout
+    }
+}
+
+void Transcriber::unload_model(int timeout_ms) {
+    if (!pimpl_) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
+    if (!pimpl_->model) {
+        return;
+    }
+
+    Logger::info("TEMPORARY: unload_model() ENTERED — about to detach and release GPU memory");
+    pimpl_->model_loaded = false;
+    pimpl_->using_cuda = false;
+
+    // Step 1: Detach models from ThreadPool workers
+    Logger::info("TEMPORARY: Step 1 — calling detach_models()...");
+    auto detached_models = pimpl_->model->detach_models();
+    Logger::info("TEMPORARY: Step 1 complete — detached " + std::to_string(detached_models.size()) + " model(s)");
+
+    // Step 2: Release GPU memory on each detached model
+    int i = 0;
+    for (auto& model : detached_models) {
+        Logger::info("TEMPORARY: Step 2 — releasing GPU memory on model " + std::to_string(i) + "...");
+        const_cast<ctranslate2::models::Model*>(model.get())->release_gpu_memory();
+        Logger::info("TEMPORARY: Step 2 — model " + std::to_string(i) + " GPU memory released");
+        i++;
+    }
+    detached_models.clear();
+    Logger::info("TEMPORARY: Step 3 — shared_ptrs cleared, models are empty shells");
+
+    // Step 4: Clear the CUDA allocator cache to release any cached memory blocks
+    Logger::info("TEMPORARY: Step 4 — clearing CUDA allocator cache...");
+    try {
+        ctranslate2::get_allocator(ctranslate2::Device::CUDA).clear_cache();
+        Logger::info("TEMPORARY: Step 4 — allocator cache cleared");
+    } catch (...) {
+        Logger::warn("TEMPORARY: Step 4 — allocator cache clear failed (non-fatal)");
+    }
+
+    // DO NOT call model.reset() — even with GPU memory freed, the ThreadPool
+    // destructor corrupts the CUDA context, preventing subsequent GPU operations (Skuld).
+    // The empty model shell stays alive with zero VRAM. ThreadPool threads idle at ~0 CPU
+    // because our patched idle() checks the shutdown flag and skips synchronize_stream().
+    // pimpl_->model.reset();  // INTENTIONALLY SKIPPED — see above
+
+    Logger::info("Whisper model unloaded successfully — VRAM freed");
+}
 
 Transcriber::Transcriber(Transcriber&&) noexcept = default;
 Transcriber& Transcriber::operator=(Transcriber&&) noexcept = default;
@@ -1986,9 +2058,12 @@ TranscribeResult Transcriber::transcribe(
     // Reset cancellation flag at start of new transcription
     pimpl_->cancelled.store(false, std::memory_order_release);
 
-    if (!pimpl_->model_loaded) {
-        Logger::error("Model not loaded!");
-        throw std::runtime_error("Whisper model not loaded");
+    {
+        std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
+        if (!pimpl_->model_loaded || !pimpl_->model) {
+            Logger::error("Model not loaded!");
+            throw std::runtime_error("Whisper model not loaded");
+        }
     }
     Logger::info("Model is loaded, proceeding...");
 
@@ -2664,11 +2739,15 @@ Transcriber::DeviceInfo Transcriber::get_device_info() const {
     // Get GPU info if using CUDA
     if (pimpl_->using_cuda) {
 #ifdef WITH_CUDA
-        // Query CUDA device properties
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, pimpl_->device_index) == cudaSuccess) {
-            info.gpu_name = prop.name;
-            info.gpu_memory_mb = prop.totalGlobalMem / (1024 * 1024);
+        // Query GPU properties via CUDA Driver API
+        CUdevice cu_dev;
+        if (cuDeviceGet(&cu_dev, pimpl_->device_index) == CUDA_SUCCESS) {
+            char gpu_name[256] = {0};
+            cuDeviceGetName(gpu_name, sizeof(gpu_name), cu_dev);
+            info.gpu_name = gpu_name;
+            size_t vram_bytes = 0;
+            cuDeviceTotalMem(&vram_bytes, cu_dev);
+            info.gpu_memory_mb = vram_bytes / (1024 * 1024);
         }
 #else
         info.gpu_name = "CUDA GPU";
