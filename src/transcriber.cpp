@@ -2118,6 +2118,18 @@ TranscribeResult Transcriber::transcribe(
         std::vector<float> processed_samples;
         std::vector<SpeechSegment> speech_segments;
 
+        // Timing markers — diagnostic for transcribe-prep bottleneck
+        // hunting. Each step's wall time gets logged so we can target the
+        // slowest one. Once perf is settled these can stay (cheap) or be
+        // removed.
+        auto perf_t0 = std::chrono::steady_clock::now();
+        auto perf_log = [&perf_t0](const char* step) {
+            auto now = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - perf_t0).count();
+            Logger::info(std::string("[perf] ") + step + ": " + std::to_string(ms) + " ms");
+            perf_t0 = now;
+        };
+
         bool apply_vad = options.vad_filter && options.vad_type != VADType::None;
         Logger::info("VAD: filter=" + std::string(options.vad_filter ? "ON" : "OFF") +
                      ", type=" + std::to_string(static_cast<int>(options.vad_type)) +
@@ -2171,6 +2183,11 @@ TranscribeResult Transcriber::transcribe(
                         break;
                     }
 
+                    if (progress_callback) {
+                        progress_callback(track_id, total_tracks, 0.06f,
+                            "Detecting speech (Silero VAD)...");
+                    }
+
                     try {
                         SileroVADOptions silero_opts;
                         silero_opts.model_path = options.silero_model_path;
@@ -2180,6 +2197,14 @@ TranscribeResult Transcriber::transcribe(
                         silero_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms > 200 ? 100 : options.vad_min_silence_duration_ms;
                         silero_opts.speech_pad_ms = options.vad_speech_pad_ms;
                         silero_opts.max_speech_duration_s = options.vad_max_speech_duration_s;
+                        // Silero stays on CPU. Tested briefly with use_gpu=true on
+                        // CUDA 13 + ORT 1.23.2 GPU EP and the first-time CUDA
+                        // initialization either took >2 minutes or genuinely hung.
+                        // Silero on CPU is ~1.6s for a 10-min track — not a real
+                        // bottleneck. The mel-spectrogram step (10+s) is. The
+                        // CUDA EP DLLs still ship so future ONNX modules can use
+                        // GPU when their model warrants the init cost.
+                        silero_opts.use_gpu = false;
 
                         SileroVAD silero(silero_opts);
                         processed_samples = silero.filter_silence(clipped_samples, 16000, speech_segments);
@@ -2229,14 +2254,20 @@ TranscribeResult Transcriber::transcribe(
             processed_samples = clipped_samples;
             Logger::info("VAD disabled, using all " + std::to_string(processed_samples.size()) + " samples");
         }
+        perf_log("VAD");
 
         // Convert to mel-spectrogram
+        if (progress_callback) {
+            progress_callback(track_id, total_tracks, 0.07f,
+                "Computing mel-spectrogram...");
+        }
         Logger::info("Converting to mel-spectrogram from " + std::to_string(processed_samples.size()) + " samples");
         auto mel_features = pimpl_->compute_mel(processed_samples);
 
         int n_frames = mel_features.size();
         Logger::info("Mel-spectrogram: " + std::to_string(n_frames) + " frames x " +
                      std::to_string(pimpl_->mel_converter.getMelBins()) + " mels");
+        perf_log("mel-spectrogram");
 
         result.duration = original_duration;  // Report original duration, not filtered
 
@@ -2245,6 +2276,10 @@ TranscribeResult Transcriber::transcribe(
 
         // Perform language detection if requested
         if (options.language == "auto" && pimpl_->model->is_multilingual()) {
+            if (progress_callback) {
+                progress_callback(track_id, total_tracks, 0.08f,
+                    "Detecting language...");
+            }
             std::cout << "[Muninn] Detecting language from audio...\n";
 
             // Use first 30s of mel features for language detection
@@ -2270,6 +2305,7 @@ TranscribeResult Transcriber::transcribe(
             result.language = options.language;
             result.language_probability = 1.0f;
         }
+        perf_log("language detection");
 
         // Track repeated segments across chunks to detect hallucinations like "Thank you" repeated
         std::map<std::string, int> segment_text_counts;
@@ -2490,9 +2526,58 @@ TranscribeResult Transcriber::transcribe(
     combined_result.language = options.language;
     combined_result.language_probability = 1.0f;
 
-    // Process each track
+    // Phase A: parallel audio extraction.
+    //
+    // Each enabled track gets its own AudioExtractor instance running in a
+    // separate thread so the file-decode work overlaps. By the time
+    // transcribe(samples) runs sequentially per track below, every track's
+    // samples are already on hand. Extraction was ~5s/track sequential;
+    // overlapped it's ~5s total for any number of tracks (modulo disk I/O).
+    //
+    // Per-thread extractors are necessary because AudioExtractor keeps
+    // FFmpeg state (format ctx + codec ctx) that isn't safe across threads.
+    // Opening the same file three times is cheap — the OS file cache makes
+    // the second/third open near-instant.
+    struct ExtractedTrack {
+        int  track_index = -1;
+        std::vector<float> samples;
+        bool ok = false;
+        std::string error;
+    };
+
+    auto run_extract = [&audio_path](int track) -> ExtractedTrack {
+        ExtractedTrack et;
+        et.track_index = track;
+        AudioExtractor ex;
+        if (!ex.open(audio_path)) {
+            et.error = "open failed: " + ex.get_last_error();
+            return et;
+        }
+        if (!ex.extract_track(track, et.samples)) {
+            et.error = "extract_track failed: " + ex.get_last_error();
+            return et;
+        }
+        et.ok = true;
+        return et;
+    };
+
+    std::vector<int> enabled_tracks;
+    enabled_tracks.reserve(track_count);
+    for (int t = 0; t < track_count; ++t) {
+        if (options.skip_tracks.count(t) == 0) enabled_tracks.push_back(t);
+    }
+
+    std::vector<std::future<ExtractedTrack>> extract_futures;
+    extract_futures.reserve(enabled_tracks.size());
+    for (int track : enabled_tracks) {
+        extract_futures.push_back(std::async(std::launch::async, run_extract, track));
+    }
+
+    // Process each track. Sequentially walk the extracted samples and call
+    // transcribe(samples) for each — the inner function still does VAD +
+    // mel + inference per track in order. Phase B below splits that further.
+    size_t fut_idx = 0;
     for (int track = 0; track < track_count; ++track) {
-        // Check if track should be skipped (user-specified)
         if (options.skip_tracks.count(track) > 0) {
             Logger::debug("Skipping Track " + std::to_string(track) + " (user-specified)");
             continue;
@@ -2520,16 +2605,19 @@ TranscribeResult Transcriber::transcribe(
             }
         }
 
-        // Report progress - Extracting audio (2%)
+        // Report progress - Extracting audio (2%) — informational; the actual
+        // work was kicked off in parallel above. This .get() blocks only if
+        // this track's extract is still in flight (rare for tracks > 0).
         if (progress_callback) {
             progress_callback(track, track_count, 0.02f, "Extracting audio track " + std::to_string(track + 1));
         }
 
-        std::vector<float> samples;
-        if (!extractor.extract_track(track, samples)) {
-            Logger::warn("Failed to extract track " + std::to_string(track) + ": " + extractor.get_last_error());
+        ExtractedTrack et = extract_futures[fut_idx++].get();
+        if (!et.ok) {
+            Logger::warn("Failed to extract track " + std::to_string(track) + ": " + et.error);
             continue;
         }
+        std::vector<float>& samples = et.samples;
 
         Logger::info("Track " + std::to_string(track) + ": " + std::to_string(samples.size()) + " samples (" +
                      std::to_string(samples.size() / 16000.0f) + "s)");
