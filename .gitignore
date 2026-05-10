@@ -1,5 +1,6 @@
 # Build directories
 build/
+build_cuda13/
 cmake-build-*/
 out/
 
@@ -109,6 +110,10 @@ test*.json
 debug*.txt
 *.srt
 *.transcript.txt
+translation_*.txt
+utf8_test_output.txt
+# Mangled paths from earlier path-quoting bugs (safe to delete)
+D:Vibe_Projects*
 
 # Archived planning docs (kept in docs/archive/)
 docs/archive/
