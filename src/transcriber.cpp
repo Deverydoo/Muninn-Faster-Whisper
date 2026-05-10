@@ -1551,29 +1551,108 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         auto future_results = model->generate(features, prompts, whisper_options);
         Logger::info("CTranslate2 batch returned " + std::to_string(future_results.size()) + " futures");
 
-        // Process results for each batch item
-        Logger::info("Processing " + std::to_string(batch_size) + " batch results...");
+        // ───────────────────────────────────────────────────────────────────
+        // Pass 1: collect all generation results + filtered text-tokens.
+        //   This unblocks all decode futures up front so the GPU stays busy
+        //   while we prepare the alignment inputs (instead of round-tripping
+        //   per chunk).
+        // ───────────────────────────────────────────────────────────────────
+        std::vector<ctranslate2::models::WhisperGenerationResult> gen_results(batch_size);
+        std::vector<bool> gen_ok(batch_size, false);
+        std::vector<std::vector<size_t>> all_text_tokens(batch_size);
+        std::vector<size_t> all_num_frames(batch_size);
+        bool any_alignable = false;
+
         for (size_t b = 0; b < batch_size; ++b) {
-          try {
-            Logger::info("Getting future " + std::to_string(b) + "...");
-            auto result = future_results[b].get();
-            Logger::info("Batch item " + std::to_string(b) + ": sequences=" + std::to_string(result.sequences.size()) +
-                         ", no_speech_prob=" + std::to_string(result.no_speech_prob));
+            try {
+                gen_results[b] = future_results[b].get();
+                gen_ok[b] = true;
+                all_num_frames[b] = static_cast<size_t>(batch_mel_features[b].size());
 
-            // Log raw token info
-            if (!result.sequences.empty()) {
-                Logger::info("Batch " + std::to_string(b) + " has " + std::to_string(result.sequences[0].size()) + " tokens in sequence[0]");
-                if (!result.sequences[0].empty()) {
-                    std::string first_tokens = "First 10 tokens: ";
-                    for (size_t t = 0; t < std::min(size_t(10), result.sequences[0].size()); t++) {
-                        first_tokens += "[" + result.sequences[0][t] + "] ";
+                Logger::info("Batch item " + std::to_string(b) + ": sequences=" +
+                             std::to_string(gen_results[b].sequences.size()) +
+                             ", no_speech_prob=" + std::to_string(gen_results[b].no_speech_prob));
+
+                if (options.word_timestamps && tokens_initialized
+                    && !gen_results[b].sequences_ids.empty()
+                    && !gen_results[b].sequences_ids[0].empty()) {
+                    for (size_t tok_id : gen_results[b].sequences_ids[0]) {
+                        if (tok_id >= timestamp_begin) continue;
+                        if (tok_id == sot_id || tok_id == eot_id || tok_id == no_timestamps_id) continue;
+                        if (tok_id >= 50259 && tok_id < timestamp_begin) continue;
+                        all_text_tokens[b].push_back(tok_id);
                     }
-                    Logger::info(first_tokens);
+                    if (!all_text_tokens[b].empty()) any_alignable = true;
                 }
-            } else {
-                Logger::warn("Batch " + std::to_string(b) + " has EMPTY sequences!");
+            } catch (const std::exception& e) {
+                Logger::error("Batch item " + std::to_string(b) + " generate EXCEPTION: " + std::string(e.what()));
             }
+        }
 
+        // ───────────────────────────────────────────────────────────────────
+        // One batched align() call against the same `features` tensor — replaces
+        // the per-chunk loop that rebuilt a fresh single-item StorageView and
+        // serialized .get() per iteration. CTranslate2's align() takes
+        // vector<vector<size_t>> text_tokens per batch item natively.
+        // ───────────────────────────────────────────────────────────────────
+        std::vector<std::vector<std::vector<float>>> alignment_data_per_b(batch_size);
+        if (any_alignable) {
+            try {
+                std::vector<size_t> start_sequence = {sot_id};
+                ctranslate2::dim_t median_filter_width = 7;
+                auto align_futures = model->align(features, start_sequence,
+                                                   all_text_tokens, all_num_frames,
+                                                   median_filter_width);
+
+                for (size_t b = 0; b < batch_size; ++b) {
+                    if (all_text_tokens[b].empty()) continue;
+                    try {
+                        auto align_result = align_futures[b].get();
+
+                        const int chunk_n_frames = static_cast<int>(all_num_frames[b]);
+                        const size_t n_tokens = all_text_tokens[b].size();
+                        std::vector<int64_t> token_start_frames(n_tokens, -1);
+                        std::vector<int64_t> token_end_frames(n_tokens, -1);
+
+                        const int64_t max_frame = static_cast<int64_t>(chunk_n_frames) - 1;
+                        for (const auto& [token_idx, frame_idx] : align_result.alignments) {
+                            if (token_idx >= 0 && static_cast<size_t>(token_idx) < n_tokens) {
+                                int64_t clamped = std::max(int64_t(0), std::min(frame_idx, max_frame));
+                                if (token_start_frames[token_idx] < 0) token_start_frames[token_idx] = clamped;
+                                token_end_frames[token_idx] = clamped;
+                            }
+                        }
+
+                        alignment_data_per_b[b].reserve(n_tokens);
+                        for (size_t i = 0; i < n_tokens; ++i) {
+                            int64_t start_f = token_start_frames[i];
+                            int64_t end_f = token_end_frames[i];
+                            if (start_f < 0) start_f = 0;
+                            if (end_f < 0) end_f = start_f;
+                            float prob = (i < align_result.text_token_probs.size())
+                                ? align_result.text_token_probs[i] : 1.0f;
+                            alignment_data_per_b[b].push_back({
+                                static_cast<float>(start_f),
+                                static_cast<float>(end_f),
+                                prob
+                            });
+                        }
+                    } catch (const std::exception&) {
+                        alignment_data_per_b[b].clear();  // per-chunk align failure is non-fatal
+                    }
+                }
+            } catch (const std::exception& e) {
+                Logger::warn("Batched align failed, falling back to no word timestamps: " + std::string(e.what()));
+            }
+        }
+
+        // ───────────────────────────────────────────────────────────────────
+        // Pass 2: build per-chunk segments using gen_results[b] + alignment_data_per_b[b]
+        // ───────────────────────────────────────────────────────────────────
+        for (size_t b = 0; b < batch_size; ++b) {
+          if (!gen_ok[b]) continue;
+          try {
+            auto& result = gen_results[b];
             int n_frames = batch_mel_features[b].size();
             float chunk_duration = n_frames * 0.01f;
             float chunk_start_time = chunk_start_times[b];
@@ -1588,100 +1667,13 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
 
             // Extract text with timestamps
             if (!result.sequences.empty()) {
-                // Get token IDs for alignment correlation
                 std::vector<size_t> token_ids;
                 if (!result.sequences_ids.empty()) {
                     token_ids = result.sequences_ids[0];
                 }
 
-                // Get alignment data using CTranslate2's align() for word timestamps
-                std::vector<std::vector<float>> alignment_data;
-
-                if (options.word_timestamps && tokens_initialized && !token_ids.empty()) {
-                    try {
-                        // Filter text tokens (exclude timestamps and special tokens)
-                        std::vector<size_t> text_tokens;
-                        for (size_t tok_id : token_ids) {
-                            if (tok_id >= timestamp_begin) continue;
-                            if (tok_id == sot_id || tok_id == eot_id || tok_id == no_timestamps_id) continue;
-                            if (tok_id >= 50259 && tok_id < timestamp_begin) continue;
-                            text_tokens.push_back(tok_id);
-                        }
-
-                        if (!text_tokens.empty()) {
-                            // Build features for this single chunk from the batch
-                            // Note: We need to extract just this chunk's features
-                            const auto& mel_features = batch_mel_features[b];
-                            int chunk_n_frames = mel_features.size();
-                            int chunk_n_mels = mel_features[0].size();
-
-                            std::vector<float> chunk_flat;
-                            chunk_flat.reserve(chunk_n_mels * chunk_n_frames);
-                            for (int mel = 0; mel < chunk_n_mels; mel++) {
-                                for (int frame = 0; frame < chunk_n_frames; frame++) {
-                                    chunk_flat.push_back(mel_features[frame][mel]);
-                                }
-                            }
-
-                            ctranslate2::StorageView chunk_features(
-                                ctranslate2::Shape{1, static_cast<ctranslate2::dim_t>(chunk_n_mels),
-                                                   static_cast<ctranslate2::dim_t>(chunk_n_frames)},
-                                chunk_flat
-                            );
-
-                            std::vector<size_t> start_sequence = {sot_id};
-                            std::vector<size_t> num_frames_vec = {static_cast<size_t>(chunk_n_frames)};
-                            ctranslate2::dim_t median_filter_width = 7;
-
-                            auto align_futures = model->align(
-                                chunk_features, start_sequence, {text_tokens},
-                                num_frames_vec, median_filter_width
-                            );
-
-                            if (!align_futures.empty()) {
-                                auto align_result = align_futures[0].get();
-
-                                // Alignments are DTW path entries: (token_index, frame_index)
-                                // Group by token to get frame ranges for each token
-                                std::vector<int64_t> token_start_frames(text_tokens.size(), -1);
-                                std::vector<int64_t> token_end_frames(text_tokens.size(), -1);
-
-                                const int64_t max_frame = static_cast<int64_t>(chunk_n_frames) - 1;
-                                for (const auto& [token_idx, frame_idx] : align_result.alignments) {
-                                    if (token_idx >= 0 && static_cast<size_t>(token_idx) < text_tokens.size()) {
-                                        // Clamp frame_idx to valid range [0, chunk_n_frames-1]
-                                        int64_t clamped_frame = std::max(int64_t(0), std::min(frame_idx, max_frame));
-                                        if (token_start_frames[token_idx] < 0) {
-                                            token_start_frames[token_idx] = clamped_frame;
-                                        }
-                                        token_end_frames[token_idx] = clamped_frame;
-                                    }
-                                }
-
-                                // Build alignment_data with [start_frame, end_frame, probability]
-                                alignment_data.reserve(text_tokens.size());
-                                for (size_t i = 0; i < text_tokens.size(); ++i) {
-                                    int64_t start_f = token_start_frames[i];
-                                    int64_t end_f = token_end_frames[i];
-                                    if (start_f < 0) start_f = 0;
-                                    if (end_f < 0) end_f = start_f;
-
-                                    float prob = (i < align_result.text_token_probs.size())
-                                        ? align_result.text_token_probs[i] : 1.0f;
-
-                                    alignment_data.push_back({
-                                        static_cast<float>(start_f),
-                                        static_cast<float>(end_f),
-                                        prob
-                                    });
-                                }
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        // Alignment failed - fall back to heuristic
-                        alignment_data.clear();
-                    }
-                }
+                // Alignment was computed in the batched pass above.
+                std::vector<std::vector<float>>& alignment_data = alignment_data_per_b[b];
 
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
@@ -2403,11 +2395,71 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
         constexpr int BATCH_SIZE = 4;  // Process 4 chunks in parallel on GPU
 
         if (n_frames > MAX_FRAMES) {
-            Logger::info("Audio too long (" + std::to_string(n_frames) + " frames), splitting into " +
-                         std::to_string((n_frames + MAX_FRAMES - 1) / MAX_FRAMES) + " chunks");
+            // ── VAD-aware chunking ────────────────────────────────────────────
+            // Fixed 30s chunk boundaries cut sentences mid-word, which hurts
+            // both transcription accuracy (Whisper hates partial context) and
+            // word timestamp alignment. When VAD has produced speech_segments,
+            // we pack segments greedily up to MAX_FRAMES so every chunk
+            // boundary lands at a silence in the original audio. This is what
+            // faster-whisper-python does internally and is the single biggest
+            // accuracy lever we can pull on this pipeline.
+            std::vector<std::pair<int, int>> chunk_ranges;  // [start_frame, end_frame) in filtered mel
+            const bool vad_aware = !speech_segments.empty();
 
-            // Calculate number of chunks needed
-            int num_chunks = (n_frames + MAX_FRAMES - 1) / MAX_FRAMES;
+            if (vad_aware) {
+                int chunk_start = 0;
+                int filtered_pos = 0;
+                for (const auto& seg : speech_segments) {
+                    // Filtered-timeline frames this segment will consume
+                    // (mel hop = 10ms, so 1 sec = 100 frames).
+                    int seg_frames = static_cast<int>(std::round((seg.end - seg.start) * 100.0f));
+                    if (seg_frames <= 0) continue;
+
+                    // Would adding this segment push the current chunk past 30s?
+                    if (filtered_pos > chunk_start &&
+                        (filtered_pos - chunk_start + seg_frames) > MAX_FRAMES) {
+                        chunk_ranges.emplace_back(chunk_start, filtered_pos);
+                        chunk_start = filtered_pos;
+                    }
+
+                    filtered_pos += seg_frames;
+
+                    // Defense against a single segment longer than 30s
+                    // (vad_max_speech_duration_s should prevent this, but if
+                    // it slips through we hard-split mid-segment).
+                    while (filtered_pos - chunk_start > MAX_FRAMES) {
+                        chunk_ranges.emplace_back(chunk_start, chunk_start + MAX_FRAMES);
+                        chunk_start += MAX_FRAMES;
+                    }
+                }
+                if (filtered_pos > chunk_start) {
+                    chunk_ranges.emplace_back(chunk_start, filtered_pos);
+                }
+
+                // Rounding can overshoot the actual mel frame count by 1-2.
+                for (auto& r : chunk_ranges) {
+                    r.first  = std::min(r.first,  n_frames);
+                    r.second = std::min(r.second, n_frames);
+                }
+                chunk_ranges.erase(
+                    std::remove_if(chunk_ranges.begin(), chunk_ranges.end(),
+                        [](const auto& r) { return r.second <= r.first; }),
+                    chunk_ranges.end());
+
+                Logger::info("VAD-aware chunking: " + std::to_string(speech_segments.size()) +
+                             " speech segments → " + std::to_string(chunk_ranges.size()) +
+                             " chunks (boundaries on silence)");
+            } else {
+                // VAD disabled / no speech segments — fall back to fixed
+                // 30s windows, same as the previous behavior.
+                for (int s = 0; s < n_frames; s += MAX_FRAMES) {
+                    chunk_ranges.emplace_back(s, std::min(s + MAX_FRAMES, n_frames));
+                }
+                Logger::info("Fixed-window chunking: " + std::to_string(chunk_ranges.size()) +
+                             " chunks (VAD disabled)");
+            }
+
+            int num_chunks = static_cast<int>(chunk_ranges.size());
             std::cout << "[Muninn] Processing " << num_chunks << " chunk(s) with batch size " << BATCH_SIZE << "\n";
 
             // Prepare all chunks upfront
@@ -2415,8 +2467,8 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
             std::vector<float> all_chunk_start_times;
 
             for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-                int start_frame = chunk_idx * MAX_FRAMES;
-                int end_frame = std::min(start_frame + MAX_FRAMES, n_frames);
+                int start_frame = chunk_ranges[chunk_idx].first;
+                int end_frame = chunk_ranges[chunk_idx].second;
                 float chunk_start_time = start_frame * 0.01f;
 
                 all_chunk_features.emplace_back(
