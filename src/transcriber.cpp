@@ -1543,8 +1543,10 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         whisper_options.return_scores = true;
         whisper_options.return_no_speech_prob = true;
         whisper_options.max_initial_timestamp_index = 50;
-        whisper_options.suppress_blank = true;
-        whisper_options.suppress_tokens = {-1};
+        // #6: respect caller-supplied suppression options (was hardcoded,
+        // diverged from transcribe_chunk's behavior for short audio).
+        whisper_options.suppress_blank = options.suppress_blank;
+        whisper_options.suppress_tokens = options.suppress_tokens;
 
         // Run batched Whisper generation
         Logger::info("Calling CTranslate2 batch generate() with batch_size=" + std::to_string(batch_size));
@@ -1988,8 +1990,16 @@ Transcriber::Transcriber(
 Transcriber::Transcriber(const ModelOptions& options)
     : Transcriber(options.model_path, options.device_string(), options.compute_type_string())
 {
-    // Additional configuration from ModelOptions can be applied here
-    // Threading options would be passed to CTranslate2 if supported
+    // ModelOptions::intra_threads / inter_threads aren't forwarded to
+    // CTranslate2's ReplicaPoolConfig. Rationale: on CUDA (our default and
+    // the only supported high-performance path) a single replica is the
+    // correct configuration — extra replicas duplicate VRAM with no
+    // throughput gain unless multiple GPUs are present. On CPU fallback the
+    // CTranslate2 defaults (auto-detect intra_threads = std::hardware_concurrency,
+    // 1 inter_thread) are already reasonable. If multi-GPU or tuned CPU
+    // becomes a real need, plumbing those fields requires changing the
+    // delegated 3-arg constructor's signature; do that change explicitly
+    // when the use case arrives.
 }
 
 Transcriber::~Transcriber() {
@@ -2893,6 +2903,13 @@ TranscribeResult Transcriber::transcribe(
         } catch (...) {
             Logger::error("Track " + std::to_string(track) + " transcription UNKNOWN EXCEPTION");
         }
+
+        // #8: release allocator cache between tracks so VRAM doesn't hold
+        // the peak from one chunk's activation buffer across the whole
+        // multi-track run. Cheap, model stays loaded, only frees temporaries.
+        try {
+            pimpl_->model->clear_cache();
+        } catch (...) { /* non-fatal */ }
     }
 
     // If we broke out early with a prep still in flight, wait for it so we
@@ -3066,13 +3083,18 @@ bool Transcriber::is_cancelled() const {
 }
 
 void Transcriber::clear_cache() {
-    // Clear internal caches to free GPU memory
-    // The model remains loaded, but temporary buffers are freed
+    // Calls ReplicaPool::clear_cache() which iterates each worker's allocator
+    // and releases its cached blocks. The model itself stays loaded; only
+    // temporary buffers (activation cache, cuBLAS workspaces) are freed.
+    // Useful between tracks on long multi-track jobs so VRAM doesn't
+    // balloon to the worst chunk's peak across the whole run.
+    std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
     if (pimpl_ && pimpl_->model) {
-        // CTranslate2 doesn't expose a direct cache clear, but we can
-        // trigger garbage collection by resetting any internal state
-        // For now, this is a no-op placeholder that satisfies the ABI
-        // Future: Could call ctranslate2 allocator clear_cache if exposed
+        try {
+            pimpl_->model->clear_cache();
+        } catch (const std::exception& e) {
+            Logger::warn("clear_cache failed (non-fatal): " + std::string(e.what()));
+        }
     }
 }
 
