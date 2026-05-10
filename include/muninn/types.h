@@ -226,6 +226,13 @@ struct TranscribeOptions {
     int batch_size = 4;                    // Batch size for parallel GPU processing
     int max_length = 448;                  // Maximum tokens per segment
 
+    // Phase C pipeline: overlap CPU prep (VAD + mel) of upcoming track with
+    // GPU inference of current track. Off by default — the parallel-extract
+    // path (Phase A) is always on; this flag adds the prep-ahead stage on top.
+    // Toggle off to revert to sequential per-track prep+infer if a regression
+    // is suspected.
+    bool concurrent_pipeline = false;
+
     // ═══════════════════════════════════════════════════════════
     // Prompt / Context
     // ═══════════════════════════════════════════════════════════

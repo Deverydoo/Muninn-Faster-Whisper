@@ -230,6 +230,41 @@ public:
         float no_speech_prob,
         const TranscribeOptions& options
     );
+
+    // Phase B: CPU-only prep work that can run on a worker thread for an
+    // upcoming track while the main thread is doing GPU inference for the
+    // current one. Holds everything the GPU-side path needs to start
+    // language detection / chunked transcription.
+    struct PreparedFeatures {
+        std::vector<std::vector<float>> mel_features;     // [n_frames][n_mels]
+        std::vector<SpeechSegment>      speech_segments;  // VAD timeline (empty if VAD disabled)
+        int    n_frames = 0;
+        float  clip_offset = 0.0f;       // seconds added to all segment timestamps post-inference
+        float  original_duration = 0.0f; // pre-VAD audio duration (after clip)
+        bool   no_speech = false;        // true if VAD removed everything → skip inference
+    };
+
+    // Run clip + VAD + mel-spectrogram. CPU-only; safe to call from a worker
+    // thread. Throws on hard failures (e.g. mel compute error).
+    PreparedFeatures prepare_features_for_track(
+        const std::vector<float>& audio_samples,
+        int sample_rate,
+        const TranscribeOptions& options,
+        int track_id,
+        int total_tracks,
+        ProgressCallback progress_callback
+    );
+
+    // GPU-side: language detection + chunked decoding from already-prepared
+    // mel features. Caller must have already validated model_loaded and
+    // reset the cancel flag for the overall run.
+    TranscribeResult transcribe_from_prepared(
+        PreparedFeatures prepared,
+        const TranscribeOptions& options,
+        int track_id,
+        int total_tracks,
+        ProgressCallback progress_callback
+    );
 };
 
 /**
@@ -2044,6 +2079,202 @@ AudioInfo Transcriber::get_audio_info(const std::string& audio_path) {
     return info;
 }
 
+// Phase B: CPU-only feature prep. Pulled out of Transcriber::transcribe so it
+// can run on a worker thread for an upcoming track while the GPU is still
+// chewing through the previous one (Phase C concurrent_pipeline). Everything
+// in here is local- or free-state — no GPU, no shared mutables — so it's
+// safe to call concurrently from multiple threads provided each call uses
+// its own audio_samples buffer. The MelSpectrogram member only reads from
+// its precomputed window/filterbank, so concurrent reads are fine.
+Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_track(
+    const std::vector<float>& audio_samples,
+    int sample_rate,
+    const TranscribeOptions& options,
+    int track_id,
+    int total_tracks,
+    ProgressCallback progress_callback
+) {
+    PreparedFeatures prepared;
+
+    if (sample_rate != 16000) {
+        throw std::runtime_error("Only 16kHz audio is currently supported. Resampling not yet implemented.");
+    }
+
+    float original_duration = audio_samples.size() / 16000.0f;
+    std::cout << "[Muninn] Audio: " << audio_samples.size() << " samples, duration: "
+              << original_duration << "s\n";
+
+    // Apply clip timestamps if specified
+    std::vector<float> clipped_samples;
+    float clip_offset = 0.0f;
+    if (options.clip_start > 0.0f || (options.clip_end >= 0.0f && options.clip_end < original_duration)) {
+        float clip_start = std::max(0.0f, options.clip_start);
+        float clip_end = (options.clip_end < 0.0f) ? original_duration : std::min(original_duration, options.clip_end);
+
+        if (clip_start < clip_end) {
+            size_t start_sample = static_cast<size_t>(clip_start * 16000.0f);
+            size_t end_sample = static_cast<size_t>(clip_end * 16000.0f);
+            end_sample = std::min(end_sample, audio_samples.size());
+
+            clipped_samples.assign(audio_samples.begin() + start_sample, audio_samples.begin() + end_sample);
+            clip_offset = clip_start;
+
+            std::cout << "[Muninn] Clipping audio: " << clip_start << "s - " << clip_end << "s ("
+                      << clipped_samples.size() << " samples)\n";
+        } else {
+            clipped_samples = audio_samples;
+        }
+    } else {
+        clipped_samples = audio_samples;
+    }
+
+    original_duration = clipped_samples.size() / 16000.0f;
+
+    // VAD
+    std::vector<float> processed_samples;
+    std::vector<SpeechSegment> speech_segments;
+
+    auto perf_t0 = std::chrono::steady_clock::now();
+    auto perf_log = [&perf_t0, track_id](const char* step) {
+        auto now = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - perf_t0).count();
+        Logger::info(std::string("[perf] track ") + std::to_string(track_id) +
+                     " " + step + ": " + std::to_string(ms) + " ms");
+        perf_t0 = now;
+    };
+
+    bool apply_vad = options.vad_filter && options.vad_type != VADType::None;
+    Logger::info("VAD: filter=" + std::string(options.vad_filter ? "ON" : "OFF") +
+                 ", type=" + std::to_string(static_cast<int>(options.vad_type)) +
+                 ", will_apply=" + std::string(apply_vad ? "YES" : "NO"));
+
+    if (apply_vad) {
+        VADType effective_vad_type = options.vad_type;
+        if (options.vad_type == VADType::Auto) {
+            effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks);
+        }
+
+        auto apply_energy_vad = [&]() {
+            std::cout << "[Muninn] Applying Energy VAD filter...\n";
+            VADOptions vad_opts;
+            vad_opts.threshold = options.vad_threshold;
+            vad_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
+            vad_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms;
+            vad_opts.speech_pad_ms = options.vad_speech_pad_ms;
+            VAD vad(vad_opts);
+            processed_samples = vad.filter_silence(clipped_samples, 16000, speech_segments);
+            std::cout << "[Muninn] Energy VAD: " << speech_segments.size() << " speech segments, "
+                      << (processed_samples.size() / 16000.0f) << "s of speech\n";
+        };
+
+        bool use_energy_vad = false;
+
+        switch (effective_vad_type) {
+            case VADType::Auto:
+                effective_vad_type = VADType::Energy;
+                [[fallthrough]];
+
+            case VADType::Silero: {
+                std::cout << "[Muninn] Applying Silero VAD filter...\n";
+
+                if (!is_silero_vad_available()) {
+                    std::cerr << "[Muninn] Silero VAD not available, falling back to Energy VAD\n";
+                    use_energy_vad = true;
+                    break;
+                }
+                if (options.silero_model_path.empty()) {
+                    std::cerr << "[Muninn] Silero model path not specified, falling back to Energy VAD\n";
+                    use_energy_vad = true;
+                    break;
+                }
+
+                if (progress_callback) {
+                    progress_callback(track_id, total_tracks, 0.06f, "Detecting speech (Silero VAD)...");
+                }
+
+                try {
+                    SileroVADOptions silero_opts;
+                    silero_opts.model_path = options.silero_model_path;
+                    silero_opts.threshold = options.vad_threshold > 0.1f ? options.vad_threshold : 0.25f;
+                    silero_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
+                    silero_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms > 200 ? 100 : options.vad_min_silence_duration_ms;
+                    silero_opts.speech_pad_ms = options.vad_speech_pad_ms;
+                    silero_opts.max_speech_duration_s = options.vad_max_speech_duration_s;
+                    // Silero stays on CPU — see comment in the original transcribe(samples).
+                    silero_opts.use_gpu = false;
+
+                    SileroVAD silero(silero_opts);
+                    processed_samples = silero.filter_silence(clipped_samples, 16000, speech_segments);
+
+                    if (processed_samples.empty()) {
+                        Logger::warn("No speech detected (Silero VAD) - returning empty prep");
+                        prepared.original_duration = original_duration;
+                        prepared.clip_offset = clip_offset;
+                        prepared.no_speech = true;
+                        return prepared;
+                    }
+
+                    std::cout << "[Muninn] Silero VAD: " << speech_segments.size() << " speech segments, "
+                              << (processed_samples.size() / 16000.0f) << "s of speech\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "[Muninn] Silero VAD failed: " << e.what() << ", falling back to Energy VAD\n";
+                    use_energy_vad = true;
+                }
+                break;
+            }
+
+            case VADType::WebRTC:
+                std::cerr << "[Muninn] WebRTC VAD not yet implemented, falling back to Energy VAD\n";
+                use_energy_vad = true;
+                break;
+
+            case VADType::Energy:
+                use_energy_vad = true;
+                break;
+
+            case VADType::None:
+            default:
+                processed_samples = clipped_samples;
+                break;
+        }
+
+        if (use_energy_vad) {
+            apply_energy_vad();
+            if (processed_samples.empty()) {
+                Logger::warn("No speech detected (Energy VAD) - returning empty prep");
+                prepared.original_duration = original_duration;
+                prepared.clip_offset = clip_offset;
+                prepared.no_speech = true;
+                return prepared;
+            }
+        }
+    } else {
+        processed_samples = clipped_samples;
+        Logger::info("VAD disabled, using all " + std::to_string(processed_samples.size()) + " samples");
+    }
+    perf_log("VAD");
+
+    // mel-spectrogram (CPU-bound, ~10s for 20-min track)
+    if (progress_callback) {
+        progress_callback(track_id, total_tracks, 0.07f, "Computing mel-spectrogram...");
+    }
+    Logger::info("Converting to mel-spectrogram from " + std::to_string(processed_samples.size()) + " samples");
+    auto mel_features = compute_mel(processed_samples);
+
+    int n_frames = static_cast<int>(mel_features.size());
+    Logger::info("Mel-spectrogram: " + std::to_string(n_frames) + " frames x " +
+                 std::to_string(mel_converter.getMelBins()) + " mels");
+    perf_log("mel-spectrogram");
+
+    prepared.mel_features     = std::move(mel_features);
+    prepared.speech_segments  = std::move(speech_segments);
+    prepared.n_frames         = n_frames;
+    prepared.clip_offset      = clip_offset;
+    prepared.original_duration = original_duration;
+    prepared.no_speech        = false;
+    return prepared;
+}
+
 TranscribeResult Transcriber::transcribe(
     const std::vector<float>& audio_samples,
     int sample_rate,
@@ -2052,7 +2283,6 @@ TranscribeResult Transcriber::transcribe(
     int total_tracks,
     ProgressCallback progress_callback
 ) {
-    TranscribeResult result;
     Logger::info("=== transcribe(samples) ENTERED: " + std::to_string(audio_samples.size()) + " samples ===");
 
     // Reset cancellation flag at start of new transcription
@@ -2067,9 +2297,41 @@ TranscribeResult Transcriber::transcribe(
     }
     Logger::info("Model is loaded, proceeding...");
 
-    // Helper lambda to check cancellation
+    try {
+        // Phase B: CPU prep (clip + VAD + mel) lives in
+        // Impl::prepare_features_for_track so it can run on a worker thread
+        // for the next track while this one is on the GPU.
+        auto prepared = pimpl_->prepare_features_for_track(
+            audio_samples, sample_rate, options,
+            track_id, total_tracks, progress_callback);
+
+        if (prepared.no_speech) {
+            TranscribeResult empty_result;
+            empty_result.duration = prepared.original_duration;
+            empty_result.language = options.language;
+            return empty_result;
+        }
+
+        return pimpl_->transcribe_from_prepared(
+            std::move(prepared), options,
+            track_id, total_tracks, progress_callback);
+    } catch (const std::exception& e) {
+        std::cerr << "[Muninn] Transcription failed: " << e.what() << "\n";
+        throw;
+    }
+}
+
+TranscribeResult Transcriber::Impl::transcribe_from_prepared(
+    PreparedFeatures prepared,
+    const TranscribeOptions& options,
+    int track_id,
+    int total_tracks,
+    ProgressCallback progress_callback
+) {
+    TranscribeResult result;
+
     auto check_cancelled = [this, &result]() -> bool {
-        if (pimpl_->cancelled.load(std::memory_order_acquire)) {
+        if (cancelled.load(std::memory_order_acquire)) {
             std::cout << "[Muninn] Transcription cancelled\n";
             result.was_cancelled = true;
             return true;
@@ -2077,205 +2339,31 @@ TranscribeResult Transcriber::transcribe(
         return false;
     };
 
-    try {
-        // TODO: Resample if sample_rate != 16000
-        if (sample_rate != 16000) {
-            throw std::runtime_error("Only 16kHz audio is currently supported. Resampling not yet implemented.");
-        }
+    // Bind prep outputs to the names the inference code below expects.
+    const auto& mel_features      = prepared.mel_features;
+    const auto& speech_segments   = prepared.speech_segments;
+    const int   n_frames          = prepared.n_frames;
+    const float clip_offset       = prepared.clip_offset;
+    const float original_duration = prepared.original_duration;
 
-        float original_duration = audio_samples.size() / 16000.0f;
-        std::cout << "[Muninn] Audio: " << audio_samples.size() << " samples, duration: "
-                  << original_duration << "s\n";
+    result.duration = original_duration;  // Report original duration, not filtered
 
-        // Apply clip timestamps if specified
-        std::vector<float> clipped_samples;
-        float clip_offset = 0.0f;  // Time offset to add back to results
-        if (options.clip_start > 0.0f || (options.clip_end >= 0.0f && options.clip_end < original_duration)) {
-            float clip_start = std::max(0.0f, options.clip_start);
-            float clip_end = (options.clip_end < 0.0f) ? original_duration : std::min(original_duration, options.clip_end);
+    // Create mutable copy of options for language detection
+    TranscribeOptions effective_options = options;
 
-            if (clip_start < clip_end) {
-                size_t start_sample = static_cast<size_t>(clip_start * 16000.0f);
-                size_t end_sample = static_cast<size_t>(clip_end * 16000.0f);
-                end_sample = std::min(end_sample, audio_samples.size());
-
-                clipped_samples.assign(audio_samples.begin() + start_sample, audio_samples.begin() + end_sample);
-                clip_offset = clip_start;
-
-                std::cout << "[Muninn] Clipping audio: " << clip_start << "s - " << clip_end << "s ("
-                          << clipped_samples.size() << " samples)\n";
-            } else {
-                clipped_samples = audio_samples;
-            }
-        } else {
-            clipped_samples = audio_samples;
-        }
-
-        // Update original_duration for clipped audio
-        original_duration = clipped_samples.size() / 16000.0f;
-
-        // Apply VAD filtering based on selected type
-        std::vector<float> processed_samples;
-        std::vector<SpeechSegment> speech_segments;
-
-        // Timing markers — diagnostic for transcribe-prep bottleneck
-        // hunting. Each step's wall time gets logged so we can target the
-        // slowest one. Once perf is settled these can stay (cheap) or be
-        // removed.
+        // Local perf timer for the inference half (prep timings live in
+        // prepare_features_for_track).
         auto perf_t0 = std::chrono::steady_clock::now();
-        auto perf_log = [&perf_t0](const char* step) {
+        auto perf_log = [&perf_t0, track_id](const char* step) {
             auto now = std::chrono::steady_clock::now();
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - perf_t0).count();
-            Logger::info(std::string("[perf] ") + step + ": " + std::to_string(ms) + " ms");
+            Logger::info(std::string("[perf] track ") + std::to_string(track_id) +
+                         " " + step + ": " + std::to_string(ms) + " ms");
             perf_t0 = now;
         };
 
-        bool apply_vad = options.vad_filter && options.vad_type != VADType::None;
-        Logger::info("VAD: filter=" + std::string(options.vad_filter ? "ON" : "OFF") +
-                     ", type=" + std::to_string(static_cast<int>(options.vad_type)) +
-                     ", will_apply=" + std::string(apply_vad ? "YES" : "NO"));
-
-        if (apply_vad) {
-            // Auto-detect VAD type if requested
-            VADType effective_vad_type = options.vad_type;
-            if (options.vad_type == VADType::Auto) {
-                effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks);
-            }
-
-            // Helper lambda for Energy VAD (used as fallback from Silero)
-            auto apply_energy_vad = [&]() {
-                std::cout << "[Muninn] Applying Energy VAD filter...\n";
-
-                VADOptions vad_opts;
-                vad_opts.threshold = options.vad_threshold;
-                vad_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
-                vad_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms;
-                vad_opts.speech_pad_ms = options.vad_speech_pad_ms;
-
-                VAD vad(vad_opts);
-                processed_samples = vad.filter_silence(clipped_samples, 16000, speech_segments);
-
-                std::cout << "[Muninn] Energy VAD: " << speech_segments.size() << " speech segments, "
-                          << (processed_samples.size() / 16000.0f) << "s of speech\n";
-            };
-
-            // Flag to track if we need energy VAD fallback
-            bool use_energy_vad = false;
-
-            switch (effective_vad_type) {
-                case VADType::Auto:
-                    // Should not reach here (already resolved above), fall through to Energy
-                    effective_vad_type = VADType::Energy;
-                    [[fallthrough]];
-
-                case VADType::Silero: {
-                    std::cout << "[Muninn] Applying Silero VAD filter...\n";
-
-                    if (!is_silero_vad_available()) {
-                        std::cerr << "[Muninn] Silero VAD not available, falling back to Energy VAD\n";
-                        use_energy_vad = true;
-                        break;
-                    }
-
-                    if (options.silero_model_path.empty()) {
-                        std::cerr << "[Muninn] Silero model path not specified, falling back to Energy VAD\n";
-                        use_energy_vad = true;
-                        break;
-                    }
-
-                    if (progress_callback) {
-                        progress_callback(track_id, total_tracks, 0.06f,
-                            "Detecting speech (Silero VAD)...");
-                    }
-
-                    try {
-                        SileroVADOptions silero_opts;
-                        silero_opts.model_path = options.silero_model_path;
-                        // Silero VAD threshold (0.25 is lenient, 0.5 is aggressive)
-                        silero_opts.threshold = options.vad_threshold > 0.1f ? options.vad_threshold : 0.25f;
-                        silero_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
-                        silero_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms > 200 ? 100 : options.vad_min_silence_duration_ms;
-                        silero_opts.speech_pad_ms = options.vad_speech_pad_ms;
-                        silero_opts.max_speech_duration_s = options.vad_max_speech_duration_s;
-                        // Silero stays on CPU. Tested briefly with use_gpu=true on
-                        // CUDA 13 + ORT 1.23.2 GPU EP and the first-time CUDA
-                        // initialization either took >2 minutes or genuinely hung.
-                        // Silero on CPU is ~1.6s for a 10-min track — not a real
-                        // bottleneck. The mel-spectrogram step (10+s) is. The
-                        // CUDA EP DLLs still ship so future ONNX modules can use
-                        // GPU when their model warrants the init cost.
-                        silero_opts.use_gpu = false;
-
-                        SileroVAD silero(silero_opts);
-                        processed_samples = silero.filter_silence(clipped_samples, 16000, speech_segments);
-
-                        if (processed_samples.empty()) {
-                            Logger::warn("No speech detected (Silero VAD) - returning empty result");
-                            result.duration = original_duration;
-                            result.language = options.language;
-                            return result;
-                        }
-
-                        std::cout << "[Muninn] Silero VAD: " << speech_segments.size() << " speech segments, "
-                                  << (processed_samples.size() / 16000.0f) << "s of speech\n";
-                    } catch (const std::exception& e) {
-                        std::cerr << "[Muninn] Silero VAD failed: " << e.what() << ", falling back to Energy VAD\n";
-                        use_energy_vad = true;
-                    }
-                    break;
-                }
-
-                case VADType::WebRTC:
-                    std::cerr << "[Muninn] WebRTC VAD not yet implemented, falling back to Energy VAD\n";
-                    use_energy_vad = true;
-                    break;
-
-                case VADType::Energy:
-                    use_energy_vad = true;
-                    break;
-
-                case VADType::None:
-                default:
-                    processed_samples = clipped_samples;
-                    break;
-            }
-
-            // Apply energy VAD if needed (fallback or direct selection)
-            if (use_energy_vad) {
-                apply_energy_vad();
-                if (processed_samples.empty()) {
-                    Logger::warn("No speech detected (Energy VAD) - returning empty result");
-                    result.duration = original_duration;
-                    result.language = options.language;
-                    return result;
-                }
-            }
-        } else {
-            processed_samples = clipped_samples;
-            Logger::info("VAD disabled, using all " + std::to_string(processed_samples.size()) + " samples");
-        }
-        perf_log("VAD");
-
-        // Convert to mel-spectrogram
-        if (progress_callback) {
-            progress_callback(track_id, total_tracks, 0.07f,
-                "Computing mel-spectrogram...");
-        }
-        Logger::info("Converting to mel-spectrogram from " + std::to_string(processed_samples.size()) + " samples");
-        auto mel_features = pimpl_->compute_mel(processed_samples);
-
-        int n_frames = mel_features.size();
-        Logger::info("Mel-spectrogram: " + std::to_string(n_frames) + " frames x " +
-                     std::to_string(pimpl_->mel_converter.getMelBins()) + " mels");
-        perf_log("mel-spectrogram");
-
-        result.duration = original_duration;  // Report original duration, not filtered
-
-        // Create mutable copy of options for language detection
-        TranscribeOptions effective_options = options;
-
         // Perform language detection if requested
-        if (options.language == "auto" && pimpl_->model->is_multilingual()) {
+        if (options.language == "auto" && model->is_multilingual()) {
             if (progress_callback) {
                 progress_callback(track_id, total_tracks, 0.08f,
                     "Detecting language...");
@@ -2290,7 +2378,7 @@ TranscribeResult Transcriber::transcribe(
             );
 
             try {
-                auto [detected_lang, lang_prob] = pimpl_->detect_language(detect_mel);
+                auto [detected_lang, lang_prob] = detect_language(detect_mel);
                 effective_options.language = detected_lang;
                 result.language = detected_lang;
                 result.language_probability = lang_prob;
@@ -2371,7 +2459,7 @@ TranscribeResult Transcriber::transcribe(
                 );
 
                 // Batch transcribe
-                auto batch_results = pimpl_->transcribe_batch(batch_features, batch_start_times, effective_options);
+                auto batch_results = transcribe_batch(batch_features, batch_start_times, effective_options);
 
                 // Process results and filter hallucinations
                 for (int i = 0; i < current_batch_size; ++i) {
@@ -2447,7 +2535,7 @@ TranscribeResult Transcriber::transcribe(
 
             // Use initial prompt as previous text for context conditioning
             std::string prev_text = effective_options.initial_prompt;
-            result.segments = pimpl_->transcribe_chunk(mel_features, 0.0f, effective_options, prev_text);
+            result.segments = transcribe_chunk(mel_features, 0.0f, effective_options, prev_text);
 
             // Report progress - Transcription complete (90%)
             if (progress_callback) {
@@ -2490,11 +2578,6 @@ TranscribeResult Transcriber::transcribe(
         }
 
         // Language is already set above during language detection or from options
-
-    } catch (const std::exception& e) {
-        std::cerr << "[Muninn] Transcription failed: " << e.what() << "\n";
-        throw;
-    }
 
     return result;
 }
@@ -2573,15 +2656,65 @@ TranscribeResult Transcriber::transcribe(
         extract_futures.push_back(std::async(std::launch::async, run_extract, track));
     }
 
-    // Process each track. Sequentially walk the extracted samples and call
-    // transcribe(samples) for each — the inner function still does VAD +
-    // mel + inference per track in order. Phase B below splits that further.
-    size_t fut_idx = 0;
-    for (int track = 0; track < track_count; ++track) {
-        if (options.skip_tracks.count(track) > 0) {
-            Logger::debug("Skipping Track " + std::to_string(track) + " (user-specified)");
-            continue;
+    // Reset cancellation + verify model is loaded once for the whole run.
+    // The single-track entry transcribe(samples) does this itself, but we
+    // bypass it here to call prepare/infer directly when pipelined.
+    pimpl_->cancelled.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
+        if (!pimpl_->model_loaded || !pimpl_->model) {
+            throw std::runtime_error("Whisper model not loaded");
         }
+    }
+
+    // Phase C: prep-ahead pipeline. While track N is on the GPU, the next
+    // track's CPU prep (VAD + mel) runs on a worker so by the time GPU
+    // inference for N finishes, N+1's mel features are sitting in memory
+    // ready to go. With concurrent_pipeline OFF (default) we still benefit
+    // from Phase A's parallel extraction but prep happens synchronously
+    // just before each track's inference.
+    const bool pipelined = options.concurrent_pipeline && enabled_tracks.size() > 1;
+    if (pipelined) {
+        Logger::info("[pipeline] concurrent_pipeline=ON for " +
+                     std::to_string(enabled_tracks.size()) + " tracks");
+    }
+
+    auto launch_prep = [this, &options, &extract_futures,
+                       &enabled_tracks, track_count](size_t i)
+        -> std::future<Impl::PreparedFeatures>
+    {
+        return std::async(std::launch::async,
+            [this, i, &extract_futures, &enabled_tracks, &options,
+             track_count]() -> Impl::PreparedFeatures
+        {
+            int track = enabled_tracks[i];
+            auto et = extract_futures[i].get();
+            if (!et.ok) {
+                Logger::warn("Failed to extract track " + std::to_string(track) + ": " + et.error);
+                Impl::PreparedFeatures pf;
+                pf.no_speech = true;  // signals "skip this track"
+                return pf;
+            }
+            Logger::info("Track " + std::to_string(track) + ": " +
+                         std::to_string(et.samples.size()) + " samples (" +
+                         std::to_string(et.samples.size() / 16000.0f) + "s)");
+            // Pass nullptr for progress_callback: prep is running on a
+            // worker thread and the callback is not guaranteed to be safe
+            // to invoke from arbitrary threads (it usually just emits a
+            // queued Qt signal, but better to be conservative). The main
+            // loop emits per-track start/finish progress for the GUI.
+            return pimpl_->prepare_features_for_track(
+                et.samples, 16000, options, track, track_count, nullptr);
+        });
+    };
+
+    std::future<Impl::PreparedFeatures> next_prep;
+    if (pipelined) {
+        next_prep = launch_prep(0);
+    }
+
+    for (size_t i = 0; i < enabled_tracks.size(); ++i) {
+        int track = enabled_tracks[i];
 
         Logger::info("Processing Track " + std::to_string(track) + "/" + std::to_string(track_count));
 
@@ -2605,34 +2738,50 @@ TranscribeResult Transcriber::transcribe(
             }
         }
 
-        // Report progress - Extracting audio (2%) — informational; the actual
-        // work was kicked off in parallel above. This .get() blocks only if
-        // this track's extract is still in flight (rare for tracks > 0).
         if (progress_callback) {
             progress_callback(track, track_count, 0.02f, "Extracting audio track " + std::to_string(track + 1));
         }
 
-        ExtractedTrack et = extract_futures[fut_idx++].get();
-        if (!et.ok) {
-            Logger::warn("Failed to extract track " + std::to_string(track) + ": " + et.error);
+        // Get prepared features. Pipelined: block on the prep already in
+        // flight, then immediately kick off the next one. Non-pipelined:
+        // .get() the extract future and prep inline.
+        Impl::PreparedFeatures prepared;
+        try {
+            if (pipelined) {
+                prepared = next_prep.get();
+                if (i + 1 < enabled_tracks.size()) {
+                    next_prep = launch_prep(i + 1);
+                }
+            } else {
+                ExtractedTrack et = extract_futures[i].get();
+                if (!et.ok) {
+                    Logger::warn("Failed to extract track " + std::to_string(track) + ": " + et.error);
+                    continue;
+                }
+                Logger::info("Track " + std::to_string(track) + ": " +
+                             std::to_string(et.samples.size()) + " samples (" +
+                             std::to_string(et.samples.size() / 16000.0f) + "s)");
+                if (progress_callback) {
+                    progress_callback(track, track_count, 0.05f, "Audio extracted, preparing transcription...");
+                }
+                prepared = pimpl_->prepare_features_for_track(
+                    et.samples, 16000, options, track, track_count, progress_callback);
+            }
+        } catch (const std::exception& e) {
+            Logger::error("Track " + std::to_string(track) + " prep EXCEPTION: " + std::string(e.what()));
             continue;
         }
-        std::vector<float>& samples = et.samples;
 
-        Logger::info("Track " + std::to_string(track) + ": " + std::to_string(samples.size()) + " samples (" +
-                     std::to_string(samples.size() / 16000.0f) + "s)");
-
-        // Report progress - Audio extracted (5%)
-        if (progress_callback) {
-            progress_callback(track, track_count, 0.05f, "Audio extracted, preparing transcription...");
-        }
-
-        // Transcribe this track - inner function reports progress from 10% to 90%
-        Logger::info("Calling transcribe() for track " + std::to_string(track) + " with " +
-                     std::to_string(samples.size()) + " samples, vad_filter=" +
-                     std::string(options.vad_filter ? "ON" : "OFF"));
         try {
-            auto track_result = transcribe(samples, 16000, options, track, track_count, progress_callback);
+            TranscribeResult track_result;
+            if (prepared.no_speech) {
+                Logger::info("Track " + std::to_string(track) + ": no speech, skipping inference");
+                track_result.duration = prepared.original_duration;
+                track_result.language = options.language;
+            } else {
+                track_result = pimpl_->transcribe_from_prepared(
+                    std::move(prepared), options, track, track_count, progress_callback);
+            }
             Logger::info("transcribe() returned " + std::to_string(track_result.segments.size()) + " segments");
 
             // Report progress - Transcription complete, processing results (95%)
@@ -2665,7 +2814,6 @@ TranscribeResult Transcriber::transcribe(
                 break;
             }
 
-
             // Update combined result language from first track's detected language
             // This is critical for translation - when language is "auto", Whisper detects
             // the actual language (e.g., "en", "ja", "ko") and we need to preserve that
@@ -2693,6 +2841,12 @@ TranscribeResult Transcriber::transcribe(
         } catch (...) {
             Logger::error("Track " + std::to_string(track) + " transcription UNKNOWN EXCEPTION");
         }
+    }
+
+    // If we broke out early with a prep still in flight, wait for it so we
+    // don't tear down extract_futures while a worker is still using them.
+    if (next_prep.valid()) {
+        try { (void)next_prep.get(); } catch (...) { /* swallow */ }
     }
 
     extractor.close();
