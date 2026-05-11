@@ -90,10 +90,67 @@ endif()
 # =======================
 # FFmpeg for Internal Audio Decoder
 # =======================
-# Option 1: Direct path (FFMPEG_DIR) - for builds without vcpkg
-# Option 2: vcpkg via pkg-config (original method)
-if(FFMPEG_DIR)
-    message(STATUS "Using FFmpeg from: ${FFMPEG_DIR}")
+# Three ways to find FFmpeg, in priority order:
+#   Option 1: FFMPEG_DIR + FFMPEG_STATIC=ON
+#       Static MSVC build (lib<name>.lib naming). Used by Loki Studio's
+#       "Muninn Pattern" — FFmpeg gets baked into muninn.dll so no
+#       av*/sw*.dll need to ship at runtime. Adds the Windows system
+#       libs FFmpeg's static link requires (bcrypt, crypt32, ws2_32, …).
+#       This is the production build path as of v1.2.0.
+#   Option 2: FFMPEG_DIR alone (no STATIC flag)
+#       Dynamic FFmpeg with import libs (avformat.lib, not libavformat.lib).
+#       Legacy path — muninn.dll ends up dynamically linked.
+#   Option 3: neither set
+#       pkg-config + vcpkg fallback.
+if(FFMPEG_DIR AND FFMPEG_STATIC)
+    message(STATUS "Using STATIC FFmpeg from: ${FFMPEG_DIR}")
+    set(FFMPEG_INCLUDE_DIRS "${FFMPEG_DIR}/include")
+
+    # zlib is pulled in transitively by avformat (matroska/http/id3v2) and
+    # avcodec (png/exr/flashsv encoders) — needs to be on the link line
+    # whenever we statically link those. Default lookup is vcpkg's
+    # x64-windows-static-md triplet, same place Loki Studio's other Norse
+    # modules find their static deps.
+    if(NOT VCPKG_STATIC_DIR)
+        set(VCPKG_STATIC_DIR "C:/vcpkg/installed/x64-windows-static-md"
+            CACHE PATH "vcpkg x64-windows-static-md prefix (zlib + transitive static deps)")
+    endif()
+    set(ZLIB_STATIC_LIB "${VCPKG_STATIC_DIR}/lib/zlib.lib")
+    if(NOT EXISTS "${ZLIB_STATIC_LIB}")
+        message(FATAL_ERROR
+            "Static zlib not found at ${ZLIB_STATIC_LIB}\n"
+            "Required by static FFmpeg. Install via:\n"
+            "    ${VCPKG_STATIC_DIR}/../../vcpkg install zlib:x64-windows-static-md")
+    endif()
+
+    # Link order matters: higher-level libs reference lower-level ones,
+    # so they come first. avformat → avcodec → swr/sws → avutil → zlib.
+    set(FFMPEG_LIBRARIES
+        "${FFMPEG_DIR}/lib/libavformat.lib"
+        "${FFMPEG_DIR}/lib/libavcodec.lib"
+        "${FFMPEG_DIR}/lib/libswresample.lib"
+        "${FFMPEG_DIR}/lib/libswscale.lib"
+        "${FFMPEG_DIR}/lib/libavutil.lib"
+        "${ZLIB_STATIC_LIB}"
+        # Windows system libs FFmpeg's static link needs (collected from
+        # the per-lib .pc files; all ship with the Windows SDK).
+        bcrypt
+        crypt32
+        mfuuid
+        ncrypt
+        ole32
+        secur32
+        strmiids
+        user32
+        ws2_32
+    )
+    add_library(PkgConfig::FFMPEG INTERFACE IMPORTED)
+    set_target_properties(PkgConfig::FFMPEG PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIRS}"
+        INTERFACE_LINK_LIBRARIES "${FFMPEG_LIBRARIES}"
+    )
+elseif(FFMPEG_DIR)
+    message(STATUS "Using DYNAMIC FFmpeg from: ${FFMPEG_DIR} (muninn.dll will need av*.dll at runtime)")
     set(FFMPEG_INCLUDE_DIRS "${FFMPEG_DIR}/include")
     set(FFMPEG_LIBRARIES
         "${FFMPEG_DIR}/lib/avformat.lib"
@@ -101,7 +158,6 @@ if(FFMPEG_DIR)
         "${FFMPEG_DIR}/lib/avutil.lib"
         "${FFMPEG_DIR}/lib/swresample.lib"
     )
-    # Create imported target to match pkg-config behavior
     add_library(PkgConfig::FFMPEG INTERFACE IMPORTED)
     set_target_properties(PkgConfig::FFMPEG PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIRS}"
