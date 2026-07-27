@@ -18,9 +18,36 @@
 #include <onnxruntime_cxx_api.h>
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
+#ifdef _WIN32
+// windows.h defines min/max macros that break std::min/std::max below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace muninn {
+
+namespace {
+
+#ifdef _WIN32
+std::wstring utf8_to_wide(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring wide(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), len);
+    return wide;
+}
+#endif
+
+} // namespace
 
 class TenVAD::Impl {
 public:
@@ -61,8 +88,23 @@ public:
 
         // Load model
         #ifdef _WIN32
-        std::wstring model_path_w(options.model_path.begin(), options.model_path.end());
-        session_ = std::make_unique<Ort::Session>(env_, model_path_w.c_str(), session_options);
+        // Paths arrive as UTF-8; the old char-by-char widening corrupted any
+        // non-ASCII byte and the model simply failed to load.
+        std::wstring model_path_w = utf8_to_wide(options.model_path);
+        try {
+            session_ = std::make_unique<Ort::Session>(env_, model_path_w.c_str(), session_options);
+        } catch (const std::exception& e) {
+            if (!using_gpu) throw;
+            // Provider appended but the session could not be built with it.
+            // Retry on CPU rather than fail the whole transcription.
+            std::cout << "[TenVAD] CUDA session failed (" << e.what() << ") - retrying on CPU\n";
+            Ort::SessionOptions cpu_options;
+            cpu_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            cpu_options.SetIntraOpNumThreads(1);
+            cpu_options.SetInterOpNumThreads(1);
+            session_ = std::make_unique<Ort::Session>(env_, model_path_w.c_str(), cpu_options);
+            using_gpu = false;
+        }
         #else
         session_ = std::make_unique<Ort::Session>(env_, options.model_path.c_str(), session_options);
         #endif
@@ -72,10 +114,10 @@ public:
 
         // Get input info
         size_t num_inputs = session_->GetInputCount();
+        input_names_.reserve(num_inputs);
         for (size_t i = 0; i < num_inputs; ++i) {
             auto name = session_->GetInputNameAllocated(i, allocator);
             input_names_.push_back(std::string(name.get()));
-            input_names_ptrs_.push_back(input_names_.back().c_str());
 
             auto shape_info = session_->GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
             auto shape = shape_info.GetShape();
@@ -91,10 +133,10 @@ public:
 
         // Get output info
         size_t num_outputs = session_->GetOutputCount();
+        output_names_.reserve(num_outputs);
         for (size_t i = 0; i < num_outputs; ++i) {
             auto name = session_->GetOutputNameAllocated(i, allocator);
             output_names_.push_back(std::string(name.get()));
-            output_names_ptrs_.push_back(output_names_.back().c_str());
 
             auto shape_info = session_->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
             auto shape = shape_info.GetShape();
@@ -107,6 +149,16 @@ public:
             }
             std::cout << "]\n";
         }
+
+        // Build the char* views only after both name vectors have stopped
+        // growing. Taking .c_str() as we pushed handed ONNX Runtime pointers
+        // into short strings that moved on the next reallocation — small names
+        // like "input" live inside the std::string object itself, so the
+        // address changed and Run() read freed memory.
+        input_names_ptrs_.reserve(input_names_.size());
+        for (const auto& n : input_names_) input_names_ptrs_.push_back(n.c_str());
+        output_names_ptrs_.reserve(output_names_.size());
+        for (const auto& n : output_names_) output_names_ptrs_.push_back(n.c_str());
 
         ready_ = true;
         using_gpu_ = using_gpu;
@@ -121,25 +173,26 @@ public:
         // Reset is a no-op, but we keep this for API compatibility
     }
 
-    float predict(const std::vector<float>& chunk) {
+    // Called once per VAD window across the whole track, so the buffers and
+    // shapes it needs are allocated once and reused instead of per call.
+    float predict(const float* chunk, size_t chunk_size) {
         if (!ready_ || input_names_.empty() || output_names_.empty()) {
             return 0.0f;
         }
 
-        // Prepare input tensor
-        std::vector<int64_t> input_shape = {1, static_cast<int64_t>(chunk.size())};
+        if (input_data_.size() != chunk_size) {
+            input_data_.assign(chunk_size, 0.0f);
+            input_shape_ = {1, static_cast<int64_t>(chunk_size)};
+        }
+        std::copy(chunk, chunk + chunk_size, input_data_.begin());
 
-        Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
-            OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-
-        // Create input tensors
-        std::vector<Ort::Value> input_tensors;
-
-        // Audio input
-        std::vector<float> input_data = chunk;  // Copy for non-const access
-        input_tensors.push_back(Ort::Value::CreateTensor<float>(
-            memory_info, input_data.data(), input_data.size(),
-            input_shape.data(), input_shape.size()));
+        // The tensor is a view over input_data_, so it is rebuilt each call
+        // while the buffer behind it stays put.
+        std::array<Ort::Value, 1> input_tensors = {
+            Ort::Value::CreateTensor<float>(
+                memory_info_, input_data_.data(), input_data_.size(),
+                input_shape_.data(), input_shape_.size()),
+        };
 
         // Run inference
         auto output_tensors = session_->Run(
@@ -186,8 +239,7 @@ public:
 
         // Process audio in chunks
         for (size_t i = 0; i + window_size <= samples.size(); i += window_size) {
-            std::vector<float> chunk(samples.begin() + i, samples.begin() + i + window_size);
-            float speech_prob = predict(chunk);
+            float speech_prob = predict(samples.data() + i, static_cast<size_t>(window_size));
 
             int current_pos = static_cast<int>(i);
 
@@ -251,6 +303,11 @@ public:
             seg.end = std::min(audio_duration, seg.end + pad_sec);
         }
 
+        // Padding is applied outwards after the boundaries were chosen, so
+        // neighbours can end up overlapping — and filter_silence() would then
+        // hand Whisper the shared audio twice, producing repeated words.
+        segments = merge_overlapping_segments(std::move(segments));
+
         // Apply audio preamble: always include first N ms of audio
         // This handles VAD warm-up issues and speech that starts immediately
         float preamble_sec = options_.audio_preamble_ms / 1000.0f;
@@ -291,6 +348,12 @@ private:
     std::vector<const char*> input_names_ptrs_;
     std::vector<std::string> output_names_;
     std::vector<const char*> output_names_ptrs_;
+
+    // Reused across every predict() call
+    Ort::MemoryInfo memory_info_ = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    std::vector<float> input_data_;
+    std::vector<int64_t> input_shape_;
 };
 
 // TenVAD public interface implementation
@@ -351,26 +414,24 @@ std::vector<float> TenVAD::filter_silence(
     // Extract speech portions
     std::vector<float> filtered;
     float total_duration = static_cast<float>(samples.size()) / sample_rate;
-    float speech_duration = 0.0f;
 
     for (const auto& seg : segments) {
-        int start_sample = static_cast<int>(seg.start * sample_rate);
-        int end_sample = static_cast<int>(seg.end * sample_rate);
-
-        start_sample = std::max(0, start_sample);
-        end_sample = std::min(static_cast<int>(samples.size()), end_sample);
+        int start_sample = std::max(0, static_cast<int>(seg.start * sample_rate));
+        int end_sample = std::min(static_cast<int>(samples.size()),
+                                  static_cast<int>(seg.end * sample_rate));
+        if (end_sample <= start_sample) continue;
 
         filtered.insert(filtered.end(),
                        samples.begin() + start_sample,
                        samples.begin() + end_sample);
-
-        speech_duration += seg.end - seg.start;
     }
 
-    silence_removed_ = total_duration - speech_duration;
+    // Measure what was actually kept rather than summing segment durations,
+    // which ignored clamping and could report negative silence.
+    silence_removed_ = total_duration - static_cast<float>(filtered.size()) / sample_rate;
 
     std::cout << "[TenVAD] Removed " << silence_removed_ << "s silence ("
-              << static_cast<int>(silence_removed_ / total_duration * 100) << "%)\n";
+              << static_cast<int>(silence_removed_ / std::max(total_duration, 1e-6f) * 100) << "%)\n";
 
     return filtered;
 }

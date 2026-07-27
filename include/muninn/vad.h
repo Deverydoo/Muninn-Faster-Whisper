@@ -92,6 +92,21 @@ private:
 };
 
 /**
+ * @brief Sort speech segments and merge any that touch or overlap
+ *
+ * Every detector pads its segments outwards after deciding the boundaries, and
+ * padding can easily reach further than the gap it is padding into (Silero's
+ * defaults pad 300 ms each side across a gap that need only be 100 ms; its
+ * max-duration force-split leaves no gap at all). Overlapping segments make
+ * filter_silence() copy the same audio twice, so Whisper hears — and
+ * transcribes — the same words twice.
+ *
+ * @param segments Segments in any order; overlaps allowed
+ * @return Disjoint segments sorted by start time
+ */
+std::vector<SpeechSegment> merge_overlapping_segments(std::vector<SpeechSegment> segments);
+
+/**
  * @brief Audio characteristics for VAD selection
  */
 struct AudioCharacteristics {

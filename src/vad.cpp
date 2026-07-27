@@ -163,6 +163,10 @@ std::vector<SpeechSegment> VAD::post_process_segments(
         }
     }
 
+    // Padding is applied outwards after the gaps were measured, so it can push
+    // neighbours into each other. Overlapping segments get extracted twice.
+    result = merge_overlapping_segments(std::move(result));
+
     // Apply audio preamble: always include first N ms of audio
     // This handles speech that starts immediately
     float preamble_sec = options_.audio_preamble_ms / 1000.0f;
@@ -218,31 +222,50 @@ std::vector<float> VAD::filter_silence(
     // Extract speech portions
     std::vector<float> filtered;
     float total_duration = static_cast<float>(samples.size()) / sample_rate;
-    float speech_duration = 0.0f;
 
     for (const auto& seg : segments) {
-        int start_sample = static_cast<int>(seg.start * sample_rate);
-        int end_sample = static_cast<int>(seg.end * sample_rate);
-
         // Clamp to valid range
-        start_sample = std::max(0, start_sample);
-        end_sample = std::min(static_cast<int>(samples.size()), end_sample);
+        int start_sample = std::max(0, static_cast<int>(seg.start * sample_rate));
+        int end_sample = std::min(static_cast<int>(samples.size()),
+                                  static_cast<int>(seg.end * sample_rate));
+        if (end_sample <= start_sample) continue;
 
         // Copy samples
         filtered.insert(filtered.end(),
                        samples.begin() + start_sample,
                        samples.begin() + end_sample);
-
-        speech_duration += seg.end - seg.start;
     }
 
-    silence_removed_ = total_duration - speech_duration;
+    // Measure what was actually kept rather than summing segment durations,
+    // which ignored clamping and could report negative silence.
+    silence_removed_ = total_duration - static_cast<float>(filtered.size()) / sample_rate;
 
     std::cout << "[VAD] Detected " << segments.size() << " speech segment(s)\n";
     std::cout << "[VAD] Removed " << silence_removed_ << "s of silence ("
-              << static_cast<int>(silence_removed_ / total_duration * 100) << "%)\n";
+              << static_cast<int>(silence_removed_ / std::max(total_duration, 1e-6f) * 100) << "%)\n";
 
     return filtered;
+}
+
+std::vector<SpeechSegment> merge_overlapping_segments(std::vector<SpeechSegment> segments) {
+    if (segments.size() < 2) return segments;
+
+    std::sort(segments.begin(), segments.end(),
+              [](const SpeechSegment& a, const SpeechSegment& b) { return a.start < b.start; });
+
+    std::vector<SpeechSegment> merged;
+    merged.reserve(segments.size());
+    merged.push_back(segments[0]);
+
+    for (size_t i = 1; i < segments.size(); ++i) {
+        if (segments[i].start <= merged.back().end) {
+            merged.back().end = std::max(merged.back().end, segments[i].end);
+        } else {
+            merged.push_back(segments[i]);
+        }
+    }
+
+    return merged;
 }
 
 // ═══════════════════════════════════════════════════════════

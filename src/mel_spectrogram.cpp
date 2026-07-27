@@ -1,6 +1,14 @@
 #include "muninn/mel_spectrogram.h"
+#include "muninn/logging.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <string>
+
+extern "C" {
+#include <libavutil/tx.h>
+#include <libavutil/mem.h>
+}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -19,6 +27,7 @@ MelSpectrogram::MelSpectrogram(int sample_rate, int n_fft, int n_mels, int hop_l
 
     // Create mel filterbank
     mel_filters_ = createMelFilters(sample_rate, n_fft, n_mels);
+    buildSparseMelFilters();
 }
 
 std::vector<float> MelSpectrogram::createHannWindow(int size)
@@ -112,67 +121,148 @@ std::vector<std::vector<float>> MelSpectrogram::createMelFilters(int sample_rate
     return filters;
 }
 
-void MelSpectrogram::computeSTFT(const std::vector<float>& samples,
-                                 std::vector<std::vector<std::complex<float>>>& stft_output)
+void MelSpectrogram::buildSparseMelFilters()
 {
-    int n_frames = (samples.size() - n_fft_) / hop_length_ + 1;
-    int n_freqs = n_fft_ / 2 + 1;
+    const int n_freqs = n_fft_ / 2 + 1;
+    mel_bin_start_.assign(n_mels_, 0);
+    mel_bin_weights_.assign(n_mels_, {});
 
-    stft_output.resize(n_frames, std::vector<std::complex<float>>(n_freqs));
+    for (int m = 0; m < n_mels_; m++) {
+        const std::vector<float>& row = mel_filters_[m];
 
-    // Simple DFT (not optimized FFT, but sufficient for proof-of-concept)
-    // TODO: Replace with proper FFT library (e.g., FFTW, KissFFT) for production
-    for (int frame = 0; frame < n_frames; frame++) {
-        int offset = frame * hop_length_;
-
-        // Apply window and compute DFT
-        for (int k = 0; k < n_freqs; k++) {
-            std::complex<float> sum(0.0f, 0.0f);
-
-            for (int n = 0; n < n_fft_; n++) {
-                if (offset + n < static_cast<int>(samples.size())) {
-                    float windowed_sample = samples[offset + n] * hann_window_[n];
-                    float angle = -2.0f * M_PI * k * n / n_fft_;
-                    sum += windowed_sample * std::complex<float>(std::cos(angle), std::sin(angle));
-                }
+        int first = n_freqs;
+        int last = -1;
+        for (int f = 0; f < n_freqs; f++) {
+            if (row[f] != 0.0f) {
+                if (first == n_freqs) first = f;
+                last = f;
             }
-
-            stft_output[frame][k] = sum;
         }
+
+        if (last < first) continue;  // empty band (can happen at very low n_mels)
+
+        mel_bin_start_[m] = first;
+        mel_bin_weights_[m].assign(row.begin() + first, row.begin() + last + 1);
+    }
+}
+
+void MelSpectrogram::dftFrame(const float* windowed, std::complex<float>* out) const
+{
+    const int n_freqs = n_fft_ / 2 + 1;
+
+    for (int k = 0; k < n_freqs; k++) {
+        float re = 0.0f;
+        float im = 0.0f;
+        for (int n = 0; n < n_fft_; n++) {
+            const float angle = -2.0f * static_cast<float>(M_PI) * k * n / n_fft_;
+            re += windowed[n] * std::cos(angle);
+            im += windowed[n] * std::sin(angle);
+        }
+        out[k] = std::complex<float>(re, im);
     }
 }
 
 int MelSpectrogram::compute(const std::vector<float>& samples, std::vector<std::vector<float>>& mel_output)
 {
-    // Compute STFT
-    std::vector<std::vector<std::complex<float>>> stft;
-    computeSTFT(samples, stft);
+    const int n_freqs = n_fft_ / 2 + 1;
 
-    int n_frames = stft.size();
-    if (n_frames == 0) {
+    // samples.size() is unsigned: a clip shorter than one window used to wrap
+    // around to a nonsense frame count instead of producing nothing.
+    if (n_fft_ <= 0 || hop_length_ <= 0 || samples.size() < static_cast<size_t>(n_fft_)) {
+        mel_output.clear();
         return 0;
     }
 
-    int n_freqs = stft[0].size();
+    const int n_frames = static_cast<int>((samples.size() - n_fft_) / hop_length_) + 1;
 
-    // Compute magnitude spectrogram
-    std::vector<std::vector<float>> magnitude(n_frames, std::vector<float>(n_freqs));
-    for (int frame = 0; frame < n_frames; frame++) {
-        for (int freq = 0; freq < n_freqs; freq++) {
-            float mag = std::abs(stft[frame][freq]);
-            magnitude[frame][freq] = mag * mag;  // Power spectrum
-        }
+    // FFmpeg's transform, already linked for audio decode. RDFT needs a length
+    // divisible by 4 and Whisper's 400-point window qualifies (400 = 4 x 100).
+    // Built per call rather than cached so copies of this object never share a
+    // context: it holds scratch state and is not reentrant.
+    AVTXContext* tx_ctx = nullptr;
+    av_tx_fn tx_fn = nullptr;
+    float tx_scale = 1.0f;  // match the unnormalised reference DFT
+    int tx_err = av_tx_init(&tx_ctx, &tx_fn, AV_TX_FLOAT_RDFT, 0, n_fft_, &tx_scale, 0);
+    bool use_fft = (tx_err >= 0 && tx_ctx && tx_fn);
+
+    // av_tx wants its own aligned buffers; the output holds n_fft_/2+1 complex
+    // values but we over-allocate to n_fft_ so no codelet can run off the end.
+    float* in_buf = static_cast<float*>(av_malloc(sizeof(float) * n_fft_));
+    AVComplexFloat* out_buf = static_cast<AVComplexFloat*>(av_malloc(sizeof(AVComplexFloat) * n_fft_));
+    if (!in_buf || !out_buf) {
+        av_free(in_buf);
+        av_free(out_buf);
+        if (tx_ctx) av_tx_uninit(&tx_ctx);
+        mel_output.clear();
+        return 0;
     }
 
-    // Apply mel filterbank
-    mel_output.resize(n_frames, std::vector<float>(n_mels_));
+    // Prove the fast path agrees with the reference before trusting it. This
+    // catches a wrong sign convention or output packing on any FFmpeg build,
+    // and costs one frame's worth of naive DFT (~80k ops) per call.
+    if (use_fft) {
+        for (int n = 0; n < n_fft_; n++) {
+            in_buf[n] = std::sin(0.017f * n) + 0.5f * std::cos(0.11f * n + 0.3f);
+        }
+        std::vector<std::complex<float>> reference(n_freqs);
+        std::vector<float> probe(in_buf, in_buf + n_fft_);
+        dftFrame(probe.data(), reference.data());
+
+        tx_fn(tx_ctx, out_buf, in_buf, sizeof(float));
+
+        float max_delta = 0.0f;
+        for (int k = 0; k < n_freqs; k++) {
+            max_delta = std::max(max_delta, std::abs(out_buf[k].re - reference[k].real()));
+            max_delta = std::max(max_delta, std::abs(out_buf[k].im - reference[k].imag()));
+        }
+
+        // Tolerance is relative to the transform's own magnitude scale: a
+        // 400-point DFT of a unit-amplitude signal has peaks in the hundreds,
+        // so float32 rounding alone accounts for a few thousandths.
+        if (max_delta > 0.05f) {
+            Logger::warn("mel-spectrogram: FFT self-check failed (max delta " +
+                         std::to_string(max_delta) + "), falling back to reference DFT");
+            use_fft = false;
+        }
+    } else {
+        Logger::warn("mel-spectrogram: av_tx_init failed for n_fft=" + std::to_string(n_fft_) +
+                     ", falling back to reference DFT");
+    }
+
+    // Fused STFT -> power -> mel: one frame at a time. Materialising the full
+    // complex spectrogram first cost ~1.5 KB per frame (around 380 MB on a
+    // 40-minute track) for data that is consumed immediately.
+    mel_output.assign(n_frames, std::vector<float>(n_mels_));
+    std::vector<float> power(n_freqs);
+    std::vector<std::complex<float>> fallback(n_freqs);
 
     for (int frame = 0; frame < n_frames; frame++) {
-        for (int mel = 0; mel < n_mels_; mel++) {
-            float mel_value = 0.0f;
+        const float* src = samples.data() + static_cast<size_t>(frame) * hop_length_;
+        for (int n = 0; n < n_fft_; n++) {
+            in_buf[n] = src[n] * hann_window_[n];
+        }
 
-            for (int freq = 0; freq < n_freqs; freq++) {
-                mel_value += mel_filters_[mel][freq] * magnitude[frame][freq];
+        if (use_fft) {
+            tx_fn(tx_ctx, out_buf, in_buf, sizeof(float));
+            for (int k = 0; k < n_freqs; k++) {
+                power[k] = out_buf[k].re * out_buf[k].re + out_buf[k].im * out_buf[k].im;
+            }
+        } else {
+            dftFrame(in_buf, fallback.data());
+            for (int k = 0; k < n_freqs; k++) {
+                power[k] = fallback[k].real() * fallback[k].real() +
+                           fallback[k].imag() * fallback[k].imag();
+            }
+        }
+
+        std::vector<float>& row = mel_output[frame];
+        for (int mel = 0; mel < n_mels_; mel++) {
+            const std::vector<float>& weights = mel_bin_weights_[mel];
+            const float* p = power.data() + mel_bin_start_[mel];
+
+            float mel_value = 0.0f;
+            for (size_t i = 0; i < weights.size(); i++) {
+                mel_value += weights[i] * p[i];
             }
 
             // Log compression (Whisper-style)
@@ -182,9 +272,13 @@ int MelSpectrogram::compute(const std::vector<float>& samples, std::vector<std::
             log_mel = std::max(log_mel, max_log - 8.0f);
             log_mel = (log_mel + 4.0f) / 4.0f;
 
-            mel_output[frame][mel] = log_mel;
+            row[mel] = log_mel;
         }
     }
+
+    av_free(in_buf);
+    av_free(out_buf);
+    if (tx_ctx) av_tx_uninit(&tx_ctx);
 
     return n_frames;
 }

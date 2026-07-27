@@ -48,9 +48,15 @@ public:
     int getMelBins() const { return n_mels_; }
 
 private:
-    // Compute Short-Time Fourier Transform
-    void computeSTFT(const std::vector<float>& samples,
-                     std::vector<std::vector<std::complex<float>>>& stft_output);
+    // Reference DFT of a single already-windowed frame. Slow by design: this is
+    // the ground truth the FFT path is checked against at startup, and the
+    // fallback if FFmpeg's transform can't be initialised for this frame size.
+    void dftFrame(const float* windowed, std::complex<float>* out) const;
+
+    // Collapse the dense triangular filterbank into per-band [start, weights)
+    // runs. Each mel band touches only a handful of the 201 frequency bins, so
+    // the dense 128x201 matrix-vector product is ~98% multiplications by zero.
+    void buildSparseMelFilters();
 
     // Create Hann window
     std::vector<float> createHannWindow(int size);
@@ -70,6 +76,11 @@ private:
     int hop_length_;
     std::vector<float> hann_window_;
     std::vector<std::vector<float>> mel_filters_;
+
+    // Sparse form of mel_filters_: band m covers frequency bins
+    // [mel_bin_start_[m], mel_bin_start_[m] + mel_bin_weights_[m].size())
+    std::vector<int> mel_bin_start_;
+    std::vector<std::vector<float>> mel_bin_weights_;
 };
 
 } // namespace muninn

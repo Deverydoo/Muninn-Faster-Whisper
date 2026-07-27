@@ -1,4 +1,18 @@
 # Rebuild Muninn DLL against CTranslate2 CUDA 13 build
+#
+# READ THIS FIRST IF YOU CHANGED MUNINN SOURCE FOR LOKI STUDIO:
+# Loki Studio does NOT deploy the muninn.dll this script produces. Its
+# CMakeLists post-build step copies from build_static/Release/Release/, so
+# building only build_cuda13/ leaves Loki running the previous DLL — and the
+# next Loki build will silently overwrite anything you hand-copied into
+# build/Release. To get source changes into Loki:
+#
+#   cmake --build D:\Vibe_Projects\Muninn-Faster-Whisper\build_static --config Release --parallel
+#   cmake --build D:\Vibe_Projects\Loki-Studio\loki_studio-cpp\build --config Release
+#
+# build_static/ is already configured with the same static-FFmpeg + CUDA 13
+# CTranslate2 settings this script uses. This script remains useful for the
+# CUDA 13 test apps and for pairing checks against the CT2 build.
 $ErrorActionPreference = "Stop"
 
 $MUNINN_DIR = "D:\Vibe_Projects\Muninn-Faster-Whisper"
@@ -31,8 +45,16 @@ Write-Host "Configuring..." -ForegroundColor Yellow
 # Override CTRANSLATE2_LIB directly to avoid finding the old CUDA 12 lib
 $CT2_BUILD_CMAKE = $CT2_BUILD -replace '\\','/'
 
-# Use FFmpeg from Loki Studio's cpp_modules (no vcpkg dependency)
-$FFMPEG_DIR = "D:/Vibe_Projects/Loki-Studio/cpp_modules/ffmpeg"
+# Use FFmpeg from Loki Studio's cpp_modules (no vcpkg dependency).
+#
+# This MUST be the static install (lib/libav*.lib) with FFMPEG_STATIC=ON — the
+# Muninn Pattern links FFmpeg inside muninn.dll so it stays isolated from Qt's
+# dynamically-loaded CRT. Pointing at cpp_modules/ffmpeg without the flag takes
+# the dynamic path instead: the build still succeeds, but produces a ~1.4 MB
+# muninn.dll that imports avcodec-62.dll / avutil-60.dll at runtime rather than
+# the ~19 MB self-contained one that ships. Verify with:
+#   dumpbin /DEPENDENTS muninn.dll   -> must list NO av*.dll
+$FFMPEG_DIR = "D:/Vibe_Projects/Loki-Studio/cpp_modules/ffmpeg-8.0-dev/install_msvc"
 
 cmake $MUNINN_DIR -G "Visual Studio 17 2022" -A x64 `
     -DCMAKE_BUILD_TYPE=Release `
@@ -40,7 +62,8 @@ cmake $MUNINN_DIR -G "Visual Studio 17 2022" -A x64 `
     -DCUDAToolkit_ROOT="$CUDA_PATH_CMAKE" `
     -DCTRANSLATE2_LIB="$CT2_BUILD_CMAKE/Release/ctranslate2.lib" `
     -DCTranslate2_DIR="$($MUNINN_DIR -replace '\\','/')/third_party/CTranslate2" `
-    -DFFMPEG_DIR="$FFMPEG_DIR"
+    -DFFMPEG_DIR="$FFMPEG_DIR" `
+    -DFFMPEG_STATIC=ON
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: CMake configuration failed" -ForegroundColor Red

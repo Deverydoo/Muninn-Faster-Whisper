@@ -6,9 +6,36 @@
 #include <onnxruntime_cxx_api.h>
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
+#ifdef _WIN32
+// windows.h defines min/max macros that break std::min/std::max below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace muninn {
+
+namespace {
+
+#ifdef _WIN32
+std::wstring utf8_to_wide(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring wide(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), len);
+    return wide;
+}
+#endif
+
+} // namespace
 
 class SileroVAD::Impl {
 public:
@@ -49,8 +76,26 @@ public:
 
         // Load model
         #ifdef _WIN32
-        std::wstring model_path_w(options.model_path.begin(), options.model_path.end());
-        session_ = std::make_unique<Ort::Session>(env_, model_path_w.c_str(), session_options);
+        // The old char-by-char widening mangled any non-ASCII byte, so the
+        // model failed to load for anyone whose path contained an accented
+        // character. Paths reach us as UTF-8.
+        std::wstring model_path_w = utf8_to_wide(options.model_path);
+        try {
+            session_ = std::make_unique<Ort::Session>(env_, model_path_w.c_str(), session_options);
+        } catch (const std::exception& e) {
+            if (!using_gpu) throw;
+            // The CUDA provider appended cleanly but the session could not be
+            // built with it (missing onnxruntime CUDA DLLs, driver too old).
+            // A VAD that refuses to load takes the whole transcription down, so
+            // retry on CPU rather than propagate.
+            std::cout << "[SileroVAD] CUDA session failed (" << e.what() << ") - retrying on CPU\n";
+            Ort::SessionOptions cpu_options;
+            cpu_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            cpu_options.SetIntraOpNumThreads(1);
+            cpu_options.SetInterOpNumThreads(1);
+            session_ = std::make_unique<Ort::Session>(env_, model_path_w.c_str(), cpu_options);
+            using_gpu = false;
+        }
         #else
         session_ = std::make_unique<Ort::Session>(env_, options.model_path.c_str(), session_options);
         #endif
@@ -73,60 +118,48 @@ public:
         context_.assign(context_size_, 0.0f);
     }
 
-    float predict(const std::vector<float>& chunk) {
-        // Build augmented input: context (64 samples) + current chunk (512 samples) = 576 samples
-        std::vector<float> input_data;
-        input_data.reserve(context_size_ + chunk.size());
-        input_data.insert(input_data.end(), context_.begin(), context_.end());
-        input_data.insert(input_data.end(), chunk.begin(), chunk.end());
+    // Runs once per 32 ms of audio — about 75,000 times on a 40-minute track —
+    // so every buffer, shape and MemoryInfo it needs is allocated once and
+    // reused rather than rebuilt per call.
+    float predict(const float* chunk, size_t chunk_size) {
+        // Augmented input: context (64 samples) + current chunk (512) = 576
+        if (input_data_.size() != context_size_ + chunk_size) {
+            input_data_.assign(context_size_ + chunk_size, 0.0f);
+            input_shape_ = {1, static_cast<int64_t>(input_data_.size())};
+        }
+        std::copy(context_.begin(), context_.end(), input_data_.begin());
+        std::copy(chunk, chunk + chunk_size, input_data_.begin() + context_size_);
 
-        // Update context with last 64 samples from input for next iteration
-        size_t context_start = input_data.size() - context_size_;
-        std::copy(input_data.begin() + context_start, input_data.end(), context_.begin());
+        // Carry the last 64 samples into the next window
+        std::copy(input_data_.end() - context_size_, input_data_.end(), context_.begin());
 
-        // Prepare input tensor
-        std::vector<int64_t> input_shape = {1, static_cast<int64_t>(input_data.size())};
-
-        Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
-            OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-
-        // Create input tensors
-        std::vector<Ort::Value> input_tensors;
-
-        // Input audio (context + chunk)
-        input_tensors.push_back(Ort::Value::CreateTensor<float>(
-            memory_info, input_data.data(), input_data.size(),
-            input_shape.data(), input_shape.size()));
-
-        // State tensor [2, 1, 128]
-        std::vector<int64_t> state_shape = {2, 1, 128};
-        input_tensors.push_back(Ort::Value::CreateTensor<float>(
-            memory_info, state_.data(), state_.size(),
-            state_shape.data(), state_shape.size()));
-
-        // Sample rate
-        std::vector<int64_t> sr_data = {options_.sample_rate};
-        std::vector<int64_t> sr_shape = {1};
-        input_tensors.push_back(Ort::Value::CreateTensor<int64_t>(
-            memory_info, sr_data.data(), sr_data.size(),
-            sr_shape.data(), sr_shape.size()));
+        // Tensors are views over our buffers, so they must be rebuilt each call,
+        // but the buffers and shapes behind them are stable.
+        std::array<Ort::Value, 3> input_tensors = {
+            Ort::Value::CreateTensor<float>(
+                memory_info_, input_data_.data(), input_data_.size(),
+                input_shape_.data(), input_shape_.size()),
+            Ort::Value::CreateTensor<float>(
+                memory_info_, state_.data(), state_.size(),
+                state_shape_.data(), state_shape_.size()),
+            Ort::Value::CreateTensor<int64_t>(
+                memory_info_, sr_data_.data(), sr_data_.size(),
+                sr_shape_.data(), sr_shape_.size()),
+        };
 
         // Input/output names (order: input, state, sr -> output, stateN)
-        const char* input_names[] = {"input", "state", "sr"};
-        const char* output_names[] = {"output", "stateN"};
+        static const char* input_names[] = {"input", "state", "sr"};
+        static const char* output_names[] = {"output", "stateN"};
 
-        // Run inference
         auto output_tensors = session_->Run(
             Ort::RunOptions{nullptr},
             input_names, input_tensors.data(), input_tensors.size(),
             output_names, 2);
 
-        // Get speech probability
-        float* output_data = output_tensors[0].GetTensorMutableData<float>();
-        float speech_prob = output_data[0];
+        float speech_prob = output_tensors[0].GetTensorMutableData<float>()[0];
 
         // Update state for next iteration
-        float* stateN_data = output_tensors[1].GetTensorMutableData<float>();
+        const float* stateN_data = output_tensors[1].GetTensorMutableData<float>();
         std::copy(stateN_data, stateN_data + state_.size(), state_.begin());
 
         return speech_prob;
@@ -168,8 +201,7 @@ public:
 
         // Process audio in chunks
         for (size_t i = 0; i + window_size <= samples.size(); i += window_size) {
-            std::vector<float> chunk(samples.begin() + i, samples.begin() + i + window_size);
-            float speech_prob = predict(chunk);
+            float speech_prob = predict(samples.data() + i, static_cast<size_t>(window_size));
 
             int current_pos = static_cast<int>(i);
 
@@ -237,6 +269,13 @@ public:
             seg.end = std::min(audio_duration, seg.end + pad_sec);
         }
 
+        // The defaults pad 300 ms each side but only require a 100 ms gap to
+        // split, and the max_speech_duration force-split leaves no gap at all —
+        // so neighbours routinely end up overlapping. filter_silence() would
+        // then copy the shared audio twice and Whisper would transcribe those
+        // words twice, which reads as stuttering or looping in the transcript.
+        segments = merge_overlapping_segments(std::move(segments));
+
         // Apply audio preamble: always include first N ms of audio
         // This handles VAD warm-up issues and speech that starts immediately
         float preamble_sec = options_.audio_preamble_ms / 1000.0f;
@@ -278,6 +317,15 @@ private:
     // Context buffer for previous audio samples
     static constexpr size_t context_size_ = 64;
     std::vector<float> context_;
+
+    // Reused across every predict() call
+    Ort::MemoryInfo memory_info_ = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    std::vector<float> input_data_;
+    std::vector<int64_t> input_shape_;
+    std::vector<int64_t> state_shape_{2, 1, 128};
+    std::vector<int64_t> sr_data_{options_.sample_rate};
+    std::vector<int64_t> sr_shape_{1};
 };
 
 // SileroVAD public interface implementation
@@ -338,26 +386,25 @@ std::vector<float> SileroVAD::filter_silence(
     // Extract speech portions
     std::vector<float> filtered;
     float total_duration = static_cast<float>(samples.size()) / sample_rate;
-    float speech_duration = 0.0f;
 
     for (const auto& seg : segments) {
-        int start_sample = static_cast<int>(seg.start * sample_rate);
-        int end_sample = static_cast<int>(seg.end * sample_rate);
-
-        start_sample = std::max(0, start_sample);
-        end_sample = std::min(static_cast<int>(samples.size()), end_sample);
+        int start_sample = std::max(0, static_cast<int>(seg.start * sample_rate));
+        int end_sample = std::min(static_cast<int>(samples.size()),
+                                  static_cast<int>(seg.end * sample_rate));
+        if (end_sample <= start_sample) continue;
 
         filtered.insert(filtered.end(),
                        samples.begin() + start_sample,
                        samples.begin() + end_sample);
-
-        speech_duration += seg.end - seg.start;
     }
 
-    silence_removed_ = total_duration - speech_duration;
+    // Measure what was actually kept. Summing the segment durations instead
+    // double-counted overlaps and ignored clamping, which could report a
+    // negative amount of silence removed.
+    silence_removed_ = total_duration - static_cast<float>(filtered.size()) / sample_rate;
 
     std::cout << "[SileroVAD] Removed " << silence_removed_ << "s silence ("
-              << static_cast<int>(silence_removed_ / total_duration * 100) << "%)\n";
+              << static_cast<int>(silence_removed_ / std::max(total_duration, 1e-6f) * 100) << "%)\n";
 
     return filtered;
 }

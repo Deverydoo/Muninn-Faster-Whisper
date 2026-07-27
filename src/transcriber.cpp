@@ -959,8 +959,18 @@ bool Transcriber::Impl::is_hallucination(
             max_repeat_count = std::max(max_repeat_count, repeat_count);
         }
 
-        // If >50% of words are repetitions, likely hallucination
-        if (max_repeat_count >= static_cast<int>(words.size()) / 2) {
+        // If MORE THAN half the words are one word repeated back-to-back,
+        // it's a hallucination loop ("go go go", "A A A A").
+        //
+        // This was `>=  words.size() / 2` and deleted every three-word segment
+        // ever produced: max_repeat_count is 1 at minimum (a word always
+        // "repeats" itself once), and integer division makes 3/2 == 1, so the
+        // test read `1 >= 1` — always true. Measured on one 40-minute video:
+        // 61 of 63 segments killed by this filter had max_repeat_count == 1,
+        // i.e. no repetition whatsoever ("I don't care.", "Where is it?",
+        // "with Conan Exiles"). Strict `>` restores the documented intent and
+        // still catches genuine loops (3 identical words gives 3 > 1).
+        if (max_repeat_count * 2 > static_cast<int>(words.size())) {
             std::cerr << "[Muninn] Skipping repetitive hallucination: '"
                       << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
                       << "' (repeat: " << max_repeat_count << "/" << words.size() << " words)\n";
@@ -2018,33 +2028,28 @@ void Transcriber::unload_model(int timeout_ms) {
         return;
     }
 
-    Logger::info("TEMPORARY: unload_model() ENTERED — about to detach and release GPU memory");
+    // These were "TEMPORARY:" info lines from tracking down the VRAM leak; they
+    // shipped and filled the user-facing log with step-by-step noise on every
+    // unload. Kept as debug so the trace is still there when it's needed.
+    Logger::debug("Whisper unload: detaching models");
     pimpl_->model_loaded = false;
     pimpl_->using_cuda = false;
 
     // Step 1: Detach models from ThreadPool workers
-    Logger::info("TEMPORARY: Step 1 — calling detach_models()...");
     auto detached_models = pimpl_->model->detach_models();
-    Logger::info("TEMPORARY: Step 1 complete — detached " + std::to_string(detached_models.size()) + " model(s)");
+    Logger::debug("Whisper unload: detached " + std::to_string(detached_models.size()) + " model(s)");
 
     // Step 2: Release GPU memory on each detached model
-    int i = 0;
     for (auto& model : detached_models) {
-        Logger::info("TEMPORARY: Step 2 — releasing GPU memory on model " + std::to_string(i) + "...");
         const_cast<ctranslate2::models::Model*>(model.get())->release_gpu_memory();
-        Logger::info("TEMPORARY: Step 2 — model " + std::to_string(i) + " GPU memory released");
-        i++;
     }
     detached_models.clear();
-    Logger::info("TEMPORARY: Step 3 — shared_ptrs cleared, models are empty shells");
 
-    // Step 4: Clear the CUDA allocator cache to release any cached memory blocks
-    Logger::info("TEMPORARY: Step 4 — clearing CUDA allocator cache...");
+    // Step 3: Clear the CUDA allocator cache to release any cached memory blocks
     try {
         ctranslate2::get_allocator(ctranslate2::Device::CUDA).clear_cache();
-        Logger::info("TEMPORARY: Step 4 — allocator cache cleared");
     } catch (...) {
-        Logger::warn("TEMPORARY: Step 4 — allocator cache clear failed (non-fatal)");
+        Logger::debug("Whisper unload: allocator cache clear failed (non-fatal)");
     }
 
     // DO NOT call model.reset() — even with GPU memory freed, the ThreadPool

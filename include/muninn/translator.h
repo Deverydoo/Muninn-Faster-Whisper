@@ -30,6 +30,12 @@ struct TranslationOptions {
     int max_length = 256;           // Maximum output tokens per segment
     float repetition_penalty = 1.0f; // Repetition penalty
     int no_repeat_ngram_size = 3;   // Prevent 3-gram repetitions (prevents hallucination loops)
+
+    // How many sentences CTranslate2 decodes together on the GPU. A batch runs
+    // until its longest member finishes, so throughput depends on grouping
+    // similar-length sentences — which CTranslate2 does for us, but only across
+    // the sentences it is handed at once. Lower this if VRAM is tight.
+    int max_batch_size = 32;
 };
 
 /**

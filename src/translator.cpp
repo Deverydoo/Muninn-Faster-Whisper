@@ -428,36 +428,35 @@ void Translator::unload_model(int timeout_ms) {
         return;
     }
 
-    Logger::info("TEMPORARY: NLLB unload_model() ENTERED");
+    // These were "TEMPORARY:" info lines from tracking down the VRAM leak; they
+    // shipped and filled the user-facing log with step-by-step noise on every
+    // unload. Kept as debug so the trace is still there when it's needed.
+    Logger::debug("NLLB unload: detaching models");
     pimpl_->loaded = false;
 
-    Logger::info("TEMPORARY: Step 1 — calling detach_models()...");
     auto detached_models = pimpl_->model->detach_models();
-    Logger::info("TEMPORARY: Step 1 complete — detached " + std::to_string(detached_models.size()) + " model(s)");
+    Logger::debug("NLLB unload: detached " + std::to_string(detached_models.size()) + " model(s)");
 
-    int i = 0;
     for (auto& model : detached_models) {
-        Logger::info("TEMPORARY: Step 2 — releasing GPU memory on model " + std::to_string(i) + "...");
         const_cast<ctranslate2::models::Model*>(model.get())->release_gpu_memory();
-        Logger::info("TEMPORARY: Step 2 — model " + std::to_string(i) + " GPU memory released");
-        i++;
     }
     detached_models.clear();
-    Logger::info("TEMPORARY: Step 3 — shared_ptrs cleared");
 
-    // Step 4: Clear CUDA allocator cache
-    Logger::info("TEMPORARY: Step 4 — clearing CUDA allocator cache...");
     try {
         ctranslate2::get_allocator(ctranslate2::Device::CUDA).clear_cache();
-        Logger::info("TEMPORARY: Step 4 — allocator cache cleared");
     } catch (...) {
-        Logger::warn("TEMPORARY: Step 4 — allocator cache clear failed (non-fatal)");
+        Logger::debug("NLLB unload: allocator cache clear failed (non-fatal)");
     }
 
     // DO NOT call model.reset() — corrupts CUDA context for subsequent operations.
     // pimpl_->model.reset();  // INTENTIONALLY SKIPPED
+    //
+    // Consequence worth knowing: CTranslate2's ThreadPool lives inside the
+    // Translator, so its worker threads are only joined when this object is
+    // destroyed, not here. Unloading frees the VRAM but leaves the threads
+    // parked until the Translator itself goes away.
 
-    Logger::info("TEMPORARY: NLLB unload complete — VRAM freed");
+    Logger::info("NLLB translator unloaded (VRAM released)");
 }
 
 Translator::Translator(Translator&&) noexcept = default;
@@ -547,7 +546,22 @@ std::vector<std::string> Translator::translate_batch(
     std::cout.flush();
 
     // Step 2: Translate all sentences in batches
-    const size_t CHUNK_SIZE = 8;
+    //
+    // This used to hand CTranslate2 8 sentences per call, in timeline order.
+    // Two costs came out of that. A decoding batch runs until its *longest*
+    // member finishes, so one long sentence dragged seven short ones along with
+    // it; and CTranslate2 sorts by length and re-batches internally to avoid
+    // exactly that, but it can only sort across what it is given at once — with
+    // 8 arbitrary sentences there was nothing to sort.
+    //
+    // So hand it a large window and let it do the batching. Results come back
+    // in input order regardless of how it reorders internally (each example
+    // carries its original index), so the rejoin below is unaffected. The
+    // window still bounds how long a cancel takes to be noticed, which is why
+    // this is 128 rather than "all of them": sorting gains flatten out well
+    // before that, and a bigger window only makes Cancel feel unresponsive.
+    const size_t CHUNK_SIZE = 128;
+    const size_t max_batch_size = static_cast<size_t>(std::max(1, options.max_batch_size));
     std::vector<std::string> translated_sentences;
     translated_sentences.reserve(all_sentences.size());
 
@@ -587,11 +601,15 @@ std::vector<std::string> Translator::translate_batch(
                 target_prefixes.push_back({"</s>", tgt_nllb});
             }
 
-            // Translate this chunk
+            // Translate this chunk. max_batch_size lets CTranslate2 length-sort
+            // and split into GPU-sized batches itself; passing 0 (the old
+            // behaviour) makes it decode the whole window as one padded batch.
             auto results = pimpl_->model->translate_batch(
                 tokenized_inputs,
                 target_prefixes,
-                ct_options
+                ct_options,
+                max_batch_size,
+                ctranslate2::BatchType::Examples
             );
 
             // Detokenize and clean results
