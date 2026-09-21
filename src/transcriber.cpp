@@ -4,6 +4,7 @@
 #include "muninn/audio_extractor.h"
 #include "muninn/vad.h"
 #include "muninn/silero_vad.h"
+#include "muninn/ten_vad.h"
 #include "muninn/diarization.h"
 #include <ctranslate2/models/whisper.h>
 #include <ctranslate2/utils.h>
@@ -2178,8 +2179,12 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
 
         switch (effective_vad_type) {
             case VADType::Auto:
-                effective_vad_type = VADType::Energy;
-                [[fallthrough]];
+                // Normally unreachable: Auto is resolved by auto_detect_vad_type
+                // above. Reachable only if that returns Auto, and this used to
+                // fall through into the Silero case — assigning Energy and then
+                // running the neural path anyway. Handled as energy explicitly.
+                use_energy_vad = true;
+                break;
 
             case VADType::Silero: {
                 std::cout << "[Muninn] Applying Silero VAD filter...\n";
@@ -2225,6 +2230,67 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                               << (processed_samples.size() / 16000.0f) << "s of speech\n";
                 } catch (const std::exception& e) {
                     std::cerr << "[Muninn] Silero VAD failed: " << e.what() << ", falling back to Energy VAD\n";
+                    use_energy_vad = true;
+                }
+                break;
+            }
+
+            case VADType::TEN: {
+                // TEN had no case here at all, so it fell to `default:` and the
+                // samples passed through untouched — selecting the lightweight
+                // neural detector silently meant no VAD whatsoever. Measured
+                // across six windows of Japanese, Korean, Chinese, English and
+                // Russian video, its output was character-for-character
+                // identical to vad_filter=false. ten_vad.cpp has been complete
+                // and compiled the whole time; nothing ever called it.
+                std::cout << "[Muninn] Applying TEN VAD filter...\n";
+
+                if (!is_ten_vad_available()) {
+                    std::cerr << "[Muninn] TEN VAD not available, falling back to Energy VAD\n";
+                    use_energy_vad = true;
+                    break;
+                }
+                if (options.ten_vad_model_path.empty()) {
+                    std::cerr << "[Muninn] TEN model path not specified, falling back to Energy VAD\n";
+                    use_energy_vad = true;
+                    break;
+                }
+
+                if (progress_callback) {
+                    progress_callback(track_id, total_tracks, 0.06f, "Detecting speech (TEN VAD)...");
+                }
+
+                try {
+                    TenVADOptions ten_opts;
+                    ten_opts.model_path = options.ten_vad_model_path;
+                    // Same guard as Silero: vad_threshold is a probability for
+                    // the neural detectors, and a value small enough to be an
+                    // energy RMS floor is not one the caller meant for this.
+                    ten_opts.threshold = options.vad_threshold > 0.1f ? options.vad_threshold : 0.5f;
+                    ten_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
+                    ten_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms > 200 ? 100 : options.vad_min_silence_duration_ms;
+                    ten_opts.speech_pad_ms = options.vad_speech_pad_ms;
+                    ten_opts.max_speech_duration_s = options.vad_max_speech_duration_s;
+                    ten_opts.audio_preamble_ms = options.vad_audio_preamble_ms;
+                    // CPU, for the same reason as Silero: the model is ~308 KB
+                    // and the GPU is busy with the decode this VAD feeds.
+                    ten_opts.use_gpu = false;
+
+                    TenVAD ten(ten_opts);
+                    processed_samples = ten.filter_silence(clipped_samples, 16000, speech_segments);
+
+                    if (processed_samples.empty()) {
+                        Logger::warn("No speech detected (TEN VAD) - returning empty prep");
+                        prepared.original_duration = original_duration;
+                        prepared.clip_offset = clip_offset;
+                        prepared.no_speech = true;
+                        return prepared;
+                    }
+
+                    std::cout << "[Muninn] TEN VAD: " << speech_segments.size() << " speech segments, "
+                              << (processed_samples.size() / 16000.0f) << "s of speech\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "[Muninn] TEN VAD failed: " << e.what() << ", falling back to Energy VAD\n";
                     use_energy_vad = true;
                 }
                 break;
