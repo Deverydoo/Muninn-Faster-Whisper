@@ -222,7 +222,9 @@ endif()
 # ONNX Runtime for Silero VAD
 # =======================
 if(WITH_SILERO_VAD)
-    set(ONNXRUNTIME_DIR "${CMAKE_SOURCE_DIR}/third_party/onnx/onnxruntime-win-x64-gpu-1.23.2" CACHE PATH "Path to ONNX Runtime")
+    # The CPU package: Silero and TEN VAD run on the CPU (use_gpu = false), and
+    # the GPU package's CUDA provider was 334 MB shipped for nothing.
+    set(ONNXRUNTIME_DIR "${CMAKE_SOURCE_DIR}/third_party/onnx/onnxruntime-win-x64-1.31.0" CACHE PATH "Path to ONNX Runtime")
 
     find_library(ONNXRUNTIME_LIB
         NAMES onnxruntime
