@@ -342,17 +342,9 @@ if(SENTENCEPIECE_ENABLED)
     target_include_directories(muninn PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
 endif()
 
-# Find dav1d library (AV1 codec, required by FFmpeg)
-find_library(DAV1D_LIB
-    NAMES dav1d
-    PATHS "C:/vcpkg/installed/x64-windows-static/lib"
-    NO_DEFAULT_PATH
-)
-if(DAV1D_LIB)
-    message(STATUS "Found dav1d: ${DAV1D_LIB}")
-else()
-    message(WARNING "dav1d not found - AV1 video decoding may fail")
-endif()
+# dav1d comes in with the static FFmpeg libraries above, from the /MD
+# triplet. (A lookup here searched the /MT triplet, which would have mixed
+# runtimes in muninn.dll had it ever found anything.)
 
 # Link libraries
 target_link_libraries(muninn
@@ -360,9 +352,6 @@ target_link_libraries(muninn
         ${CTRANSLATE2_LIB}
         PkgConfig::FFMPEG
 )
-if(DAV1D_LIB)
-    target_link_libraries(muninn PRIVATE ${DAV1D_LIB})
-endif()
 
 if(SILERO_VAD_ENABLED)
     target_link_libraries(muninn PRIVATE ${ONNXRUNTIME_LIB})
