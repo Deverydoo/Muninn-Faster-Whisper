@@ -996,6 +996,30 @@ bool Transcriber::Impl::is_hallucination(
         return true;
     }
 
+    // 1b. The initial prompt repeated back. Given audio with no speech in it,
+    //     Whisper conditioned on a prompt often "transcribes" the prompt: a
+    //     game-audio track came back as "Icarus, Tusker." at 2% confidence.
+    //     Only when the words are also unsure, so someone actually saying a
+    //     word from the prompt keeps it.
+    float mean_word_prob = 0.0f;
+    for (const auto& w : segment.words) mean_word_prob += w.probability;
+    if (!segment.words.empty()) mean_word_prob /= static_cast<float>(segment.words.size());
+    if (!options.initial_prompt.empty() && !segment.words.empty() && mean_word_prob < 0.5f) {
+        auto norm = [](const std::string& t) {
+            std::string out;
+            for (unsigned char c : t) {
+                if (std::isalnum(c)) out += static_cast<char>(std::tolower(c));
+                else if (c >= 0x80) out += static_cast<char>(c);
+            }
+            return out;
+        };
+        const std::string seg_norm = norm(segment.text);
+        if (!seg_norm.empty() && norm(options.initial_prompt).find(seg_norm) != std::string::npos) {
+            Logger::warn("FILTERED: repeats the initial prompt: " + segment.text);
+            return true;
+        }
+    }
+
     // 2. (Removed, October 2026: a filter that dropped every segment of 3
     //    characters or fewer - "Ow!", "No.", "Go!". faster-whisper has none,
     //    and short reactions are real speech in gaming commentary.)
@@ -1202,6 +1226,23 @@ float calculate_speech_overlap(
     }
 
     return std::min(1.0f, overlap_duration / seg_duration);
+}
+
+/**
+ * @brief Pull a remapped segment's edges in to its words
+ *
+ * A segment whose start or end timestamp falls on the join of two VAD speech
+ * regions is remapped to the edge of the wrong region: "Wall crap." came back
+ * as 10.3-32.2 s with its words at 30.8-31.8 s, and a caption would have sat
+ * on screen for 20 s of silence first. Only edges more than a second from the
+ * words move; ordinary timing is left as Whisper gave it.
+ */
+void tighten_to_words(Segment& seg) {
+    if (seg.words.empty()) return;
+    const float first = seg.words.front().start;
+    const float last = seg.words.back().end;
+    if (first - seg.start > 1.0f) seg.start = first;
+    if (seg.end - last > 1.0f) seg.end = last;
 }
 
 /**
@@ -2911,6 +2952,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                         word.start = remap_timestamp_to_original(word.start, speech_segments);
                         word.end = remap_timestamp_to_original(word.end, speech_segments);
                     }
+                    tighten_to_words(seg);
                 }
 
                 // Filter segments in silent regions (hallucination silence threshold)
@@ -2948,6 +2990,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                         word.start = remap_timestamp_to_original(word.start, speech_segments);
                         word.end = remap_timestamp_to_original(word.end, speech_segments);
                     }
+                    tighten_to_words(seg);
                 }
 
                 // Filter segments in silent regions (hallucination silence threshold)
