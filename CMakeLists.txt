@@ -137,14 +137,17 @@ if(FFMPEG_DIR AND FFMPEG_STATIC)
 
     # Link order matters: higher-level libs reference lower-level ones,
     # so they come first. avformat → avcodec → swr/sws → avutil → zlib.
-    set(FFMPEG_LIBRARIES
-        "${FFMPEG_DIR}/lib/libavformat.lib"
-        "${FFMPEG_DIR}/lib/libavcodec.lib"
-        "${FFMPEG_DIR}/lib/libswresample.lib"
-        "${FFMPEG_DIR}/lib/libswscale.lib"
-        "${FFMPEG_DIR}/lib/libavutil.lib"
-        "${ZLIB_STATIC_LIB}"
-    )
+    # FFmpeg 8 names its MSVC static archives libavformat.lib, FFmpeg 9
+    # avformat.lib: take whichever this tree has.
+    set(FFMPEG_LIBRARIES)
+    foreach(_ff avformat avcodec swresample swscale avutil)
+        if(EXISTS "${FFMPEG_DIR}/lib/${_ff}.lib")
+            list(APPEND FFMPEG_LIBRARIES "${FFMPEG_DIR}/lib/${_ff}.lib")
+        else()
+            list(APPEND FFMPEG_LIBRARIES "${FFMPEG_DIR}/lib/lib${_ff}.lib")
+        endif()
+    endforeach()
+    list(APPEND FFMPEG_LIBRARIES "${ZLIB_STATIC_LIB}")
     # FFmpeg 8.0.3+ is built with libdav1d (AV1 decode); older trees without it
     # don't need the library.
     if(EXISTS "${FFMPEG_DIR}/lib/pkgconfig/libavcodec.pc")
