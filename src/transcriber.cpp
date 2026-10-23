@@ -22,6 +22,12 @@
 #include <mutex>
 #include <unordered_map>
 #include <set>
+#if __has_include(<zlib.h>)
+#include <zlib.h>   // compression ratio, as faster-whisper measures it
+#define MUNINN_HAVE_ZLIB 1
+#else
+#define MUNINN_HAVE_ZLIB 0
+#endif
 #ifdef WITH_CUDA
 #include <cuda.h>  // Driver API - avoids runtime version conflicts with onnxruntime
 #endif
@@ -90,6 +96,10 @@ public:
     size_t eot_id = 0;           // End of text
     size_t no_timestamps_id = 0; // No timestamps token
     size_t timestamp_begin = 0;  // First timestamp token ID
+    size_t startofprev_id = 0;   // <|startofprev|>, opens the previous-text prompt
+    // The model's vocabulary, for prompts given as token ids (null if unavailable).
+    const ctranslate2::Vocabulary* vocabulary = nullptr;
+    std::unordered_map<std::string, size_t> token_to_id;
     bool tokens_initialized = false;
 
     // Cancellation support - atomic for thread-safe access from UI thread
@@ -128,6 +138,31 @@ public:
             eot_id = 50256;           // <|endoftext|>
             no_timestamps_id = 50362; // <|notimestamps|>
             timestamp_begin = 50363;  // First timestamp token
+        }
+
+        // Prefer the vocabulary's own ids over the table above, which is
+        // wrong for 100-language models (large-v3, turbo).
+        try {
+            const auto& base = model->get_first_replica().model();
+            if (auto wm = std::dynamic_pointer_cast<const ctranslate2::models::WhisperModel>(base)) {
+                vocabulary = &wm->get_vocabulary();
+                for (size_t i = 0; i < vocabulary->size(); ++i) {
+                    token_to_id.emplace(vocabulary->to_token(i), i);
+                }
+                auto id_of = [&](const char* t, size_t fallback) {
+                    auto it = token_to_id.find(t);
+                    return it == token_to_id.end() ? fallback : it->second;
+                };
+                sot_id = id_of("<|startoftranscript|>", sot_id);
+                eot_id = id_of("<|endoftext|>", eot_id);
+                no_timestamps_id = id_of("<|notimestamps|>", no_timestamps_id);
+                timestamp_begin = id_of("<|0.00|>", timestamp_begin);
+                startofprev_id = id_of("<|startofprev|>", 0);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[Muninn] Vocabulary unavailable, using built-in token ids: " << e.what() << "\n";
+            vocabulary = nullptr;
+            token_to_id.clear();
         }
 
         tokens_initialized = true;
@@ -203,15 +238,24 @@ public:
     }
 
     // Transcribe a single chunk (≤30 seconds)
-    // previous_text: Optional text from previous segment for context conditioning
+    // previous_tokens: token ids of earlier output, for conditioning on previous text
     // previous_temperature: Temperature used for previous segment (for prompt reset logic)
+    // out_tokens: receives the token ids this chunk produced (for the next one's context)
     std::vector<Segment> transcribe_chunk(
         const std::vector<std::vector<float>>& mel_features,
         float chunk_start_time,
         const TranscribeOptions& options,
-        const std::string& previous_text = "",
-        float previous_temperature = 0.0f
+        const std::vector<size_t>& previous_tokens = {},
+        float previous_temperature = 0.0f,
+        float* out_temperature = nullptr,
+        std::vector<size_t>* out_tokens = nullptr
     );
+
+    // Text to token ids: GPT-2 byte-level characters, then the longest
+    // vocabulary entry at each position. Not always the canonical BPE split,
+    // but every token is real and they decode to the same text, which is all a
+    // prompt needs. Empty if the vocabulary is unavailable.
+    std::vector<size_t> encode_text(const std::string& text) const;
 
     // Batch transcribe multiple chunks at once (GPU parallel)
     std::vector<std::vector<Segment>> transcribe_batch(
@@ -905,6 +949,29 @@ std::vector<Segment> extract_timestamped_segments(
     return segments;
 }
 
+// faster-whisper's compression ratio: UTF-8 bytes over zlib-compressed bytes.
+// Repetitive text compresses well, so a loop scores high (threshold 2.4).
+// Muninn used tokens/characters (~0.25 for English), which never got near 2.4.
+static float compression_ratio_of(const std::string& text) {
+    if (text.empty()) return 0.0f;
+#if MUNINN_HAVE_ZLIB
+    uLongf size = compressBound(static_cast<uLong>(text.size()));
+    std::vector<Bytef> packed(size);
+    if (compress2(packed.data(), &size, reinterpret_cast<const Bytef*>(text.data()),
+                  static_cast<uLong>(text.size()), Z_DEFAULT_COMPRESSION) != Z_OK || size == 0) {
+        return 0.0f;
+    }
+    return static_cast<float>(text.size()) / static_cast<float>(size);
+#else
+    // No zlib in this build: approximate with distinct 4-grams (a loop repeats them).
+    if (text.size() < 8) return 1.0f;
+    std::set<std::string> grams;
+    for (size_t i = 0; i + 4 <= text.size(); ++i) grams.insert(text.substr(i, 4));
+    return static_cast<float>(text.size() - 3) / static_cast<float>(std::max<size_t>(1, grams.size()));
+#endif
+}
+
+
 bool Transcriber::Impl::is_hallucination(
     const Segment& segment,
     size_t num_tokens,
@@ -929,14 +996,12 @@ bool Transcriber::Impl::is_hallucination(
         return true;
     }
 
-    // 2. Skip suspiciously short segments
-    if (segment.text.length() <= 3) {
-        Logger::warn("FILTERED: short segment <=3 chars: '" + segment.text + "'");
-        return true;
-    }
+    // 2. (Removed, October 2026: a filter that dropped every segment of 3
+    //    characters or fewer - "Ow!", "No.", "Go!". faster-whisper has none,
+    //    and short reactions are real speech in gaming commentary.)
 
     // 3. Skip very low token count with poor confidence
-    if (num_tokens <= 2 && avg_logprob < -0.5f) {
+    if (num_tokens <= 2 && avg_logprob < options.log_prob_threshold) {
         Logger::warn("FILTERED: low-token (tokens=" + std::to_string(num_tokens) + ", logprob=" + std::to_string(avg_logprob) + ")");
         return true;
     }
@@ -1060,8 +1125,13 @@ bool Transcriber::Impl::is_hallucination(
             std::set<uint32_t> unique_chars(codepoints.begin(), codepoints.end());
             float unique_ratio = static_cast<float>(unique_chars.size()) / static_cast<float>(codepoints.size());
 
-            // If less than 10% unique characters in a string of 10+ chars, it's suspicious
-            if (codepoints.size() >= 10 && unique_ratio < 0.10f) {
+            // If less than 10% unique characters in a string of 10+ chars, it's suspicious.
+            // Only for unspaced (CJK-style) text: any long English segment has ~40
+            // distinct characters, so past ~400 characters it always fell under 10%
+            // and real speech was dropped (October 2026 accuracy harness).
+            const bool spaced = std::count(segment.text.begin(), segment.text.end(), ' ') * 20 >
+                                static_cast<long long>(codepoints.size());
+            if (!spaced && codepoints.size() >= 10 && unique_ratio < 0.10f) {
                 std::cerr << "[Muninn] Skipping low-diversity hallucination: '"
                           << segment.text.substr(0, std::min(size_t(60), segment.text.length()))
                           << "...' (unique ratio: " << (unique_ratio * 100.0f) << "%)\n";
@@ -1070,11 +1140,12 @@ bool Transcriber::Impl::is_hallucination(
         }
     }
 
-    // 6. Compression ratio check (like faster-whisper)
-    float compression_ratio = static_cast<float>(num_tokens) /
-                             static_cast<float>(std::max(1, static_cast<int>(segment.text.length())));
+    // 6. Compression ratio check (like faster-whisper). Muninn's own checks
+    //    compare with log_prob_threshold: their old -0.5 was tuned against the
+    //    avg_logprob that was len x too close to 0.
+    float compression_ratio = compression_ratio_of(segment.text);
 
-    if (compression_ratio > options.compression_ratio_threshold && avg_logprob < -0.5f) {
+    if (compression_ratio > options.compression_ratio_threshold && avg_logprob < options.log_prob_threshold) {
         std::cerr << "[Muninn] Skipping high-compression hallucination: '"
                   << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
                   << "' (ratio: " << compression_ratio << ", logprob: " << avg_logprob << ")\n";
@@ -1154,12 +1225,28 @@ void filter_silence_hallucinations(
 
     auto it = segments.begin();
     while (it != segments.end()) {
-        float overlap = calculate_speech_overlap(it->start, it->end, speech_segments);
+        // Measured word by word, each word counting once, when there are word
+        // timestamps. A segment decoded across the join of two VAD speech
+        // regions is remapped to span the silence between them, which Whisper
+        // never heard, and the one word that straddles the join is remapped to
+        // span it too: by duration the segment looked 6% speech and 17 real
+        // words were dropped. By word it is 16 of 17.
+        float overlap;
+        if (!it->words.empty()) {
+            float in_speech = 0.0f;
+            for (const auto& w : it->words) {
+                in_speech += calculate_speech_overlap(w.start, w.end, speech_segments);
+            }
+            overlap = in_speech / static_cast<float>(it->words.size());
+        } else {
+            overlap = calculate_speech_overlap(it->start, it->end, speech_segments);
+        }
 
         if (overlap < threshold) {
             std::cerr << "[Muninn] Skipping silence hallucination: '"
                       << it->text.substr(0, std::min(size_t(50), it->text.length()))
-                      << "' (speech overlap: " << (overlap * 100.0f) << "%)\n";
+                      << "' (speech overlap: " << (overlap * 100.0f) << "%, "
+                      << it->words.size() << " words)\n";
             it = segments.erase(it);
         } else {
             ++it;
@@ -1167,12 +1254,60 @@ void filter_silence_hallucinations(
     }
 }
 
+std::vector<size_t> Transcriber::Impl::encode_text(const std::string& text) const {
+    std::vector<size_t> ids;
+    if (token_to_id.empty() || text.empty()) return ids;
+
+    // GPT-2's byte-to-unicode table: printable bytes map to themselves, the
+    // rest to U+0100 upwards, so every byte is one visible character.
+    auto byte_char = [](unsigned char b) -> std::string {
+        unsigned cp;
+        if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) {
+            cp = b;
+        } else {
+            int n = 0;
+            for (unsigned x = 0; x < b; ++x) {
+                if (!((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174))) ++n;
+            }
+            cp = 256 + n;
+        }
+        std::string out;
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        return out;
+    };
+    std::vector<std::string> chars;
+    chars.reserve(text.size());
+    for (unsigned char b : text) chars.push_back(byte_char(b));
+
+    size_t i = 0;
+    while (i < chars.size()) {
+        size_t best_len = 0, best_id = 0;
+        std::string piece;
+        for (size_t j = i; j < chars.size() && j - i < 32; ++j) {
+            piece += chars[j];
+            auto it = token_to_id.find(piece);
+            if (it != token_to_id.end()) { best_len = j - i + 1; best_id = it->second; }
+        }
+        if (best_len == 0) { ++i; continue; }   // every single byte is in the vocabulary; defensive
+        ids.push_back(best_id);
+        i += best_len;
+    }
+    return ids;
+}
+
 std::vector<Segment> Transcriber::Impl::transcribe_chunk(
     const std::vector<std::vector<float>>& mel_features,
     float chunk_start_time,
     const TranscribeOptions& options,
-    const std::string& previous_text,
-    float previous_temperature
+    const std::vector<size_t>& previous_tokens,
+    float previous_temperature,
+    float* out_temperature,
+    std::vector<size_t>* out_tokens
 ) {
     std::vector<Segment> segments;
 
@@ -1183,65 +1318,69 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
         // Flatten mel_features to 1D array for StorageView
         // Whisper expects shape [batch, n_mels, n_frames] in row-major order
-        // Our mel_features is [n_frames][n_mels], so we need to transpose it
+        // Our mel_features is [n_frames][n_mels], so we need to transpose it.
+        // Padded with zeros to 30 s (3000 frames), as faster-whisper's
+        // pad_or_trim does: Whisper only ever saw 30 s windows in training,
+        // and a short unpadded one makes it stop early or invent text.
+        const int padded_frames = std::max(n_frames, 3000);
         std::vector<float> flat_features;
-        flat_features.reserve(n_frames * n_mels);
+        flat_features.reserve(static_cast<size_t>(padded_frames) * n_mels);
 
         // Transpose: iterate mel-by-mel (outer), then frame-by-frame (inner)
         for (int mel = 0; mel < n_mels; mel++) {
             for (int frame = 0; frame < n_frames; frame++) {
                 flat_features.push_back(mel_features[frame][mel]);
             }
+            flat_features.insert(flat_features.end(), padded_frames - n_frames, 0.0f);
         }
 
-        // Create StorageView with shape [1, n_mels, n_frames]
+        // Create StorageView with shape [1, n_mels, padded_frames]
         ctranslate2::StorageView features(
-            ctranslate2::Shape{1, static_cast<ctranslate2::dim_t>(n_mels), static_cast<ctranslate2::dim_t>(n_frames)},
+            ctranslate2::Shape{1, static_cast<ctranslate2::dim_t>(n_mels), static_cast<ctranslate2::dim_t>(padded_frames)},
             flat_features
         );
 
-        // Prepare prompts with Whisper special tokens
-        // Format: [<|startoftranscript|>, <|en|>, <|transcribe|>, <|prev_text|>]
-        // NOTE: We enable timestamps - Whisper is designed for timestamped output!
+        // The prompt, in the order Whisper was trained on:
+        //   <|startofprev|> earlier text... <|startoftranscript|> <|en|> <|transcribe|>
+        // The earlier text goes in as token ids: CTranslate2 looks each prompt
+        // string up as ONE vocabulary entry, so a sentence passed as a string
+        // became a single unknown token (and it used to come after the task
+        // token, where Whisper reads it as already-transcribed speech).
         std::vector<std::string> prompt_tokens = {
             "<|startoftranscript|>",
             "<|" + options.language + "|>",  // Language token
             "<|" + options.task + "|>"       // Task token
         };
 
-        // Add previous text context if condition_on_previous is enabled
-        // BUT reset context if previous segment used high temperature (unreliable output)
-        std::string context_text = previous_text;
-        bool should_use_context = options.condition_on_previous && !context_text.empty();
-
-        // Prompt reset on high temperature - don't use previous context if it was unreliable
+        // Previous output, unless it came from a high-temperature (unreliable) decode.
+        bool should_use_context = options.condition_on_previous && !previous_tokens.empty();
         if (should_use_context && previous_temperature >= options.prompt_reset_on_temperature) {
             std::cout << "[Muninn] Resetting prompt context (prev temp=" << previous_temperature
                       << " >= threshold=" << options.prompt_reset_on_temperature << ")\n";
             should_use_context = false;
         }
 
-        if (should_use_context) {
-            // Whisper expects previous text as a "<|startofprev|>" block
-            // Trim to last ~224 tokens worth of text (~1000 chars) to avoid context overflow
-            if (context_text.length() > 1000) {
-                context_text = context_text.substr(context_text.length() - 1000);
-                // Find word boundary
-                size_t space_pos = context_text.find(' ');
-                if (space_pos != std::string::npos) {
-                    context_text = context_text.substr(space_pos + 1);
-                }
+        std::vector<size_t> context_ids;
+        if (vocabulary && startofprev_id) {
+            if (should_use_context) {
+                context_ids = previous_tokens;
+            } else if (!options.initial_prompt.empty()) {
+                // faster-whisper uses the initial prompt only until there is
+                // earlier output to condition on.
+                context_ids = encode_text(" " + options.initial_prompt);
             }
-            prompt_tokens.push_back("<|startofprev|>");
-            prompt_tokens.push_back(context_text);
-            prompt_tokens.push_back("<|startoftranscript|>");
+            // The last 223 tokens: half of Whisper's 448-token text context.
+            constexpr size_t MAX_PREV = 223;
+            if (context_ids.size() > MAX_PREV) {
+                context_ids.erase(context_ids.begin(), context_ids.end() - MAX_PREV);
+            }
         }
 
-        // Add initial prompt if specified
-        if (!options.initial_prompt.empty()) {
-            prompt_tokens.push_back("<|startofprev|>");
-            prompt_tokens.push_back(options.initial_prompt);
-            prompt_tokens.push_back("<|startoftranscript|>");
+        std::vector<size_t> prompt_ids;
+        if (!context_ids.empty()) {
+            prompt_ids.push_back(startofprev_id);
+            prompt_ids.insert(prompt_ids.end(), context_ids.begin(), context_ids.end());
+            for (const auto& t : prompt_tokens) prompt_ids.push_back(vocabulary->to_id(t));
         }
 
         std::vector<std::vector<std::string>> prompts = {prompt_tokens};
@@ -1252,6 +1391,15 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
             : options.temperature_fallback;
 
         float used_temperature = temperatures[0];
+
+        // Every attempt, so that when all of them fail the best can be kept.
+        struct Attempt {
+            ctranslate2::models::WhisperGenerationResult result;
+            float avg_logprob;
+            float compression_ratio;
+            float temperature;
+        };
+        std::vector<Attempt> attempts;
 
         for (size_t temp_idx = 0; temp_idx < temperatures.size(); ++temp_idx) {
             float current_temp = temperatures[temp_idx];
@@ -1276,7 +1424,9 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
             // Run Whisper generation
             Logger::info("Calling CTranslate2 generate() with beam_size=" + std::to_string(options.beam_size) +
                          ", temp=" + std::to_string(current_temp) + ", lang=" + options.language);
-            auto future_results = model->generate(features, prompts, whisper_options);
+            auto future_results = prompt_ids.empty()
+                ? model->generate(features, prompts, whisper_options)
+                : model->generate(features, std::vector<std::vector<size_t>>{prompt_ids}, whisper_options);
 
             if (future_results.empty()) {
                 Logger::error("No results from Whisper inference for chunk");
@@ -1295,19 +1445,31 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
             // Calculate average log probability
             float avg_logprob = 0.0f;
             if (result.has_scores() && !result.scores.empty() && !result.sequences_ids.empty()) {
+                // CTranslate2 returns the score normalised by length^length_penalty;
+                // multiply it back before averaging, as faster-whisper does. Without
+                // this the value sat len x too close to 0, so log_prob_threshold
+                // (and the temperature fallback it drives) almost never fired.
                 size_t seq_len = result.sequences_ids[0].size();
-                float cum_logprob = result.scores[0];
+                float cum_logprob = result.scores[0] *
+                    std::pow(static_cast<float>(seq_len), options.length_penalty);
                 avg_logprob = cum_logprob / static_cast<float>(seq_len + 1);
             }
 
             // Calculate compression ratio for fallback decision
             size_t num_tokens = result.sequences_ids.empty() ? 0 : result.sequences_ids[0].size();
             std::string full_text = extract_text(result.sequences[0]);
-            float compression_ratio = static_cast<float>(num_tokens) /
-                static_cast<float>(std::max(1, static_cast<int>(full_text.length())));
+            float compression_ratio = compression_ratio_of(full_text);
 
             // Check if we need to retry with higher temperature
             bool should_retry = needs_temperature_fallback(compression_ratio, avg_logprob, options);
+
+            // A window that is silence is not retried (faster-whisper does the
+            // same): sampling silence at higher temperatures only invents text.
+            if (should_retry && result.no_speech_prob > options.no_speech_threshold &&
+                avg_logprob < options.log_prob_threshold) {
+                should_retry = false;
+            }
+            attempts.push_back({result, avg_logprob, compression_ratio, current_temp});
 
             if (should_retry && temp_idx + 1 < temperatures.size()) {
                 std::cout << "[Muninn] Temperature fallback: T=" << current_temp
@@ -1317,8 +1479,38 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                 continue;  // Try next temperature
             }
 
-            // Use this result (either good enough or last attempt)
+            if (should_retry && attempts.size() > 1) {
+                // Every temperature failed. Keep the best attempt rather than the
+                // last (T=1.0 sampling is usually the worst), as faster-whisper
+                // does: highest avg_logprob among those under the compression
+                // threshold, else highest overall.
+                const Attempt* best = nullptr;
+                for (const auto& a : attempts) {
+                    if (a.compression_ratio <= options.compression_ratio_threshold &&
+                        (!best || a.avg_logprob > best->avg_logprob)) best = &a;
+                }
+                if (!best) {
+                    for (const auto& a : attempts) {
+                        if (!best || a.avg_logprob > best->avg_logprob) best = &a;
+                    }
+                }
+                result = best->result;
+                current_temp = best->temperature;
+                avg_logprob = best->avg_logprob;
+                compression_ratio = best->compression_ratio;
+                num_tokens = result.sequences_ids.empty() ? 0 : result.sequences_ids[0].size();
+                full_text = extract_text(result.sequences[0]);
+            }
+
+            // Use this result (good enough, or the best of all attempts)
             used_temperature = current_temp;
+            if (out_temperature) *out_temperature = used_temperature;
+            if (out_tokens && !result.sequences_ids.empty()) {
+                out_tokens->clear();
+                for (size_t id : result.sequences_ids[0]) {
+                    if (id != eot_id) out_tokens->push_back(id);
+                }
+            }
 
             // Extract text from sequences with proper timestamps
             if (!result.sequences.empty()) {
@@ -1673,8 +1865,13 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
             // Calculate average log probability
             float avg_logprob = 0.0f;
             if (result.has_scores() && !result.scores.empty() && !result.sequences_ids.empty()) {
+                // CTranslate2 returns the score normalised by length^length_penalty;
+                // multiply it back before averaging, as faster-whisper does. Without
+                // this the value sat len x too close to 0, so log_prob_threshold
+                // (and the temperature fallback it drives) almost never fired.
                 size_t seq_len = result.sequences_ids[0].size();
-                float cum_logprob = result.scores[0];
+                float cum_logprob = result.scores[0] *
+                    std::pow(static_cast<float>(seq_len), options.length_penalty);
                 avg_logprob = cum_logprob / static_cast<float>(seq_len + 1);
             }
 
@@ -2473,7 +2670,9 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
 
         // Whisper CTranslate2 has a maximum input length of 3000 frames (30 seconds)
         constexpr int MAX_FRAMES = 3000;
-        constexpr int BATCH_SIZE = 4;  // Process 4 chunks in parallel on GPU
+        // Chunks decoded together on the GPU. It used to be fixed at 4 whatever
+        // the caller asked for; capped so a large setting can't exhaust VRAM.
+        const int BATCH_SIZE = std::clamp(effective_options.batch_size, 1, 32);
 
         if (n_frames > MAX_FRAMES) {
             // ── VAD-aware chunking ────────────────────────────────────────────
@@ -2567,70 +2766,132 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 progress_callback(track_id, total_tracks, 0.10f, "Starting transcription...");
             }
 
-            for (int batch_start = 0; batch_start < num_chunks; batch_start += BATCH_SIZE) {
-                // Check for cancellation before each batch
-                if (check_cancelled()) {
-                    return result;
-                }
-
-                int batch_end = std::min(batch_start + BATCH_SIZE, num_chunks);
-                int current_batch_size = batch_end - batch_start;
-                int batch_num = batch_start / BATCH_SIZE + 1;
-
-                std::cout << "[Muninn] Processing batch " << batch_num
-                          << "/" << total_batches
-                          << " (chunks " << (batch_start + 1) << "-" << batch_end << ")\n";
-
-                // Extract batch
-                std::vector<std::vector<std::vector<float>>> batch_features(
-                    all_chunk_features.begin() + batch_start,
-                    all_chunk_features.begin() + batch_end
-                );
-                std::vector<float> batch_start_times(
-                    all_chunk_start_times.begin() + batch_start,
-                    all_chunk_start_times.begin() + batch_end
-                );
-
-                // Batch transcribe
-                auto batch_results = transcribe_batch(batch_features, batch_start_times, effective_options);
-
-                // Process results and filter hallucinations
-                for (int i = 0; i < current_batch_size; ++i) {
-                    for (auto& seg : batch_results[i]) {
-                        std::string normalized = seg.text;
-                        std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
-
-                        segment_text_counts[normalized]++;
-
-                        if (segment_text_counts[normalized] >= 3) {
-                            std::cerr << "[Muninn] Skipping cross-chunk hallucination (appears "
-                                      << segment_text_counts[normalized] << " times): '" << seg.text << "'\n";
-                            continue;
+            if (effective_options.sequential) {
+                // Accuracy mode, as faster-whisper decodes long audio: one seek
+                // position across the whole (VAD-joined) audio, a full 30 s
+                // window from it each time, and the seek moved to the last
+                // timestamp Whisper closed. Each window gets the temperature
+                // fallback and the earlier output as context. Slower than
+                // batching, and closer to the reference.
+                //
+                // Windows are always 30 s of real audio (the last one excepted),
+                // so the window-level checks work: a decode that loops on one
+                // phrase compresses too well and is retried hotter, and a decode
+                // that needed a high temperature drops the context it would
+                // otherwise pass on (faster-whisper's prompt_reset_on_temperature).
+                std::vector<size_t> prev_tokens;
+                float prev_temperature = 0.0f;
+                int seek = 0;
+                while (seek < n_frames) {
+                    if (check_cancelled()) {
+                        return result;
+                    }
+                    const int window_end = std::min(seek + MAX_FRAMES, n_frames);
+                    if (window_end - seek < 10) break;   // under 0.1 s left
+                    std::vector<std::vector<float>> window(mel_features.begin() + seek,
+                                                           mel_features.begin() + window_end);
+                    float used_temperature = 0.0f;
+                    std::vector<size_t> new_tokens;
+                    auto window_segments = transcribe_chunk(window, seek * 0.01f, effective_options,
+                                                            prev_tokens, prev_temperature,
+                                                            &used_temperature, &new_tokens);
+                    prev_temperature = used_temperature;
+                    if (used_temperature > effective_options.prompt_reset_on_temperature) {
+                        prev_tokens.clear();
+                    } else {
+                        prev_tokens.insert(prev_tokens.end(), new_tokens.begin(), new_tokens.end());
+                        if (prev_tokens.size() > 1000) {
+                            prev_tokens.erase(prev_tokens.begin(), prev_tokens.end() - 500);  // transcribe_chunk uses the last 223
                         }
-
+                    }
+                    for (auto& seg : window_segments) {
                         result.segments.push_back(seg);
                     }
-                }
 
-                // Report progress AFTER batch completes (scales from 10% to 90%)
-                // batch_num/total_batches gives 0.x to 1.0, scale to 10%-90% range
-                if (progress_callback) {
-                    float batch_progress = 0.10f + (static_cast<float>(batch_num) / total_batches) * 0.80f;
-                    bool should_continue = progress_callback(
-                        track_id, total_tracks, batch_progress,
-                        "Transcribed batch " + std::to_string(batch_num) + "/" + std::to_string(total_batches)
+                    // Next window starts where Whisper's last segment ended, unless
+                    // that is (nearly) the end of this window, or no progress.
+                    int next = window_end;
+                    if (!window_segments.empty() && window_end < n_frames) {
+                        const int last_end = static_cast<int>(std::lround(window_segments.back().end * 100.0f));
+                        if (last_end > seek + 100 && last_end < window_end - 50) next = last_end;
+                    }
+                    seek = next;
+
+                    if (progress_callback) {
+                        float chunk_progress = 0.10f + (static_cast<float>(seek) / n_frames) * 0.80f;
+                        if (!progress_callback(track_id, total_tracks, chunk_progress,
+                                "Transcribed " + std::to_string(seek / 100) + " of " +
+                                std::to_string(n_frames / 100) + " s")) {
+                            result.was_cancelled = true;
+                            return result;
+                        }
+                    }
+                }
+            } else {
+                for (int batch_start = 0; batch_start < num_chunks; batch_start += BATCH_SIZE) {
+                    // Check for cancellation before each batch
+                    if (check_cancelled()) {
+                        return result;
+                    }
+
+                    int batch_end = std::min(batch_start + BATCH_SIZE, num_chunks);
+                    int current_batch_size = batch_end - batch_start;
+                    int batch_num = batch_start / BATCH_SIZE + 1;
+
+                    std::cout << "[Muninn] Processing batch " << batch_num
+                              << "/" << total_batches
+                              << " (chunks " << (batch_start + 1) << "-" << batch_end << ")\n";
+
+                    // Extract batch
+                    std::vector<std::vector<std::vector<float>>> batch_features(
+                        all_chunk_features.begin() + batch_start,
+                        all_chunk_features.begin() + batch_end
                     );
-                    if (!should_continue) {
-                        std::cout << "[Muninn] Transcription cancelled by callback\n";
-                        result.was_cancelled = true;
+                    std::vector<float> batch_start_times(
+                        all_chunk_start_times.begin() + batch_start,
+                        all_chunk_start_times.begin() + batch_end
+                    );
+
+                    // Batch transcribe
+                    auto batch_results = transcribe_batch(batch_features, batch_start_times, effective_options);
+
+                    // Process results and filter hallucinations
+                    for (int i = 0; i < current_batch_size; ++i) {
+                        for (auto& seg : batch_results[i]) {
+                            std::string normalized = seg.text;
+                            std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
+
+                            // (Removed, October 2026: any text seen 3+ times in a track was
+                            // dropped, so every third "Let's go!" vanished. faster-whisper has
+                            // no such filter; loops are caught by the compression ratio and
+                            // temperature fallback instead, now that those are computed right.)
+                            (void)normalized;
+
+                            result.segments.push_back(seg);
+                        }
+                    }
+
+                    // Report progress AFTER batch completes (scales from 10% to 90%)
+                    // batch_num/total_batches gives 0.x to 1.0, scale to 10%-90% range
+                    if (progress_callback) {
+                        float batch_progress = 0.10f + (static_cast<float>(batch_num) / total_batches) * 0.80f;
+                        bool should_continue = progress_callback(
+                            track_id, total_tracks, batch_progress,
+                            "Transcribed batch " + std::to_string(batch_num) + "/" + std::to_string(total_batches)
+                        );
+                        if (!should_continue) {
+                            std::cout << "[Muninn] Transcription cancelled by callback\n";
+                            result.was_cancelled = true;
+                            return result;
+                        }
+                    }
+
+                    // Also check atomic cancel flag (for cancel() called from another thread)
+                    if (check_cancelled()) {
                         return result;
                     }
                 }
 
-                // Also check atomic cancel flag (for cancel() called from another thread)
-                if (check_cancelled()) {
-                    return result;
-                }
             }
 
             std::cout << "[Muninn] Completed batched transcription: " << result.segments.size() << " total segments\n";
@@ -2667,8 +2928,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
             }
 
             // Use initial prompt as previous text for context conditioning
-            std::string prev_text = effective_options.initial_prompt;
-            result.segments = transcribe_chunk(mel_features, 0.0f, effective_options, prev_text);
+            result.segments = transcribe_chunk(mel_features, 0.0f, effective_options);
 
             // Report progress - Transcription complete (90%)
             if (progress_callback) {

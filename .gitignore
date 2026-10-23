@@ -117,3 +117,6 @@ D:Vibe_Projects*
 
 # Archived planning docs (kept in docs/archive/)
 docs/archive/
+
+# Static build used by Loki Studio
+build_static/

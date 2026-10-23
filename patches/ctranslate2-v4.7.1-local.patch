@@ -1,0 +1,379 @@
+diff --git a/include/ctranslate2/models/model.h b/include/ctranslate2/models/model.h
+index 6f1d5c76..e41e2225 100644
+--- a/include/ctranslate2/models/model.h
++++ b/include/ctranslate2/models/model.h
+@@ -112,6 +112,12 @@ namespace ctranslate2 {
+         return ScopedDeviceSetter(_device, _device_index);
+       }
+ 
++      // Release all GPU memory held by model weights without destroying the object.
++      // This frees VRAM immediately via cudaFree on each tensor, then synchronizes.
++      // After calling this, the model is unusable but its ThreadPool is untouched.
++      // The destructor becomes a no-op since _variable_index is already empty.
++      void release_gpu_memory();
++
+       // If the model contains variables, they will be moved to the new device.
+       void set_device(const Device device, const int index = 0);
+ 
+diff --git a/include/ctranslate2/replica_pool.h b/include/ctranslate2/replica_pool.h
+index 8c8e15d8..fa74d17e 100644
+--- a/include/ctranslate2/replica_pool.h
++++ b/include/ctranslate2/replica_pool.h
+@@ -119,6 +119,10 @@ namespace ctranslate2 {
+       for (size_t i = 0; i < num_replicas(); ++i) {
+         auto& worker = static_cast<ReplicaWorker<Replica>&>(_thread_pool->get_worker(i));
+         models.emplace_back(worker.detach_model());
++        // Signal workers to stop idle synchronization — prevents CPU spinning
++        // after models are detached and GPU memory is released.
++        // Call through Worker base class (public virtual method).
++        static_cast<Worker&>(worker).prepare_shutdown();
+       }
+       return models;
+     }
+@@ -136,6 +140,21 @@ namespace ctranslate2 {
+       }
+     }
+ 
++    // Release all GPU memory held by model weights without destroying the pool.
++    // Detaches models from workers, frees their GPU tensors, then drops references.
++    // After this call the pool is unusable but can be safely destroyed without
++    // triggering CUDA teardown hangs (the ThreadPool destructor is unaffected).
++    void release_gpu_memory() {
++      auto models = detach_models();
++      for (auto& model : models) {
++        if (model) {
++          // const_cast is safe here — we own the only references after detach
++          const_cast<models::Model&>(*model).release_gpu_memory();
++        }
++      }
++      models.clear();  // Drop shared_ptrs, Models may be destroyed (no GPU work left)
++    }
++
+     // Clears the cache of each worker.
+     // This method is not thread-safe.
+     void clear_cache() const {
+@@ -309,6 +328,7 @@ namespace ctranslate2 {
+       , _device_index(model->device_index())
+       , _num_threads(num_threads)
+       , _allocator(nullptr)
++      , _shutting_down(false)
+     {
+       set_model(model);
+     }
+@@ -347,12 +367,40 @@ namespace ctranslate2 {
+     }
+ 
+     void idle() override {
++      // Use atomic load with acquire semantics to ensure we see the shutdown flag
++      // even if it was just set by another thread. This prevents the race condition
++      // where idle() starts executing just before finalize() sets _shutting_down.
++      if (_shutting_down.load(std::memory_order_acquire))
++        return;
++
+       // When no new jobs are immediately available, we synchronize the CUDA stream
+       // so that the CudaAsyncAllocator can release some memory.
++      // Note: This can block if there's pending GPU work, but that's expected
++      // during normal operation. The shutdown flag check above prevents this
++      // from blocking during destructor cleanup.
+       synchronize_stream(_device);
+     }
+ 
++    void prepare_shutdown() override {
++      // Set shutdown flag BEFORE queue.close() so that idle() won't enter
++      // synchronize_stream() while the queue is being closed. This prevents
++      // the deadlock where idle() blocks on CUDA sync while close() has
++      // already signaled workers to stop.
++      _shutting_down.store(true, std::memory_order_release);
++    }
++
+     void finalize() override {
++      // Mark as shutting down (may already be set by prepare_shutdown)
++      _shutting_down.store(true, std::memory_order_release);
++
++      // Don't call synchronize_stream during shutdown - it can block indefinitely
++      // on Windows when CUDA resources are being torn down. The replica reset
++      // will handle cleanup through CUDA's own destruction sequence.
++      //
++      // Note: We intentionally skip synchronization here. The CUDA driver will
++      // handle proper cleanup when the context is destroyed. Trying to synchronize
++      // at this point can deadlock if there are pending operations or if the
++      // CUDA context is in an inconsistent state.
+       _replica.reset();
+     }
+ 
+@@ -362,6 +410,7 @@ namespace ctranslate2 {
+     const size_t _num_threads;
+     Allocator* _allocator;
+     std::unique_ptr<Replica> _replica;
++    std::atomic<bool> _shutting_down;
+   };
+ 
+ }
+diff --git a/include/ctranslate2/thread_pool.h b/include/ctranslate2/thread_pool.h
+index 826b7e57..3032cc10 100644
+--- a/include/ctranslate2/thread_pool.h
++++ b/include/ctranslate2/thread_pool.h
+@@ -59,7 +59,16 @@ namespace ctranslate2 {
+     virtual ~Worker() = default;
+ 
+     void start(JobQueue& job_queue, int thread_affinity = -1);
+-    void join();
++
++    // Join the worker thread. If timeout_ms > 0 and the thread doesn't finish
++    // in time, the thread is detached to prevent indefinite blocking.
++    // This is critical on Windows where CUDA cleanup can hang during shutdown.
++    void join(int timeout_ms = 5000);
++
++    // Signal the worker to stop idle operations (e.g., synchronize_stream).
++    // Called BEFORE queue.close() to prevent the race where idle() blocks
++    // on CUDA synchronization while the queue is being closed.
++    virtual void prepare_shutdown() {}
+ 
+   protected:
+     // Called before the work loop.
+diff --git a/src/cpu/parallel.h b/src/cpu/parallel.h
+index 03fb9a44..f3253ec6 100644
+--- a/src/cpu/parallel.h
++++ b/src/cpu/parallel.h
+@@ -90,8 +90,14 @@ namespace ctranslate2 {
+       }
+ 
+       auto& thread_pool = get_thread_pool();
+-      // v5 API: `push_loop` → `detach_loop`, `wait_for_tasks` → `wait`.
+-      thread_pool.detach_loop(begin, end, f, num_blocks);
++      // v5 API rename: `push_loop` → `detach_blocks`, `wait_for_tasks` → `wait`.
++      // NOTE: v5 splits the old `push_loop` into TWO functions:
++      //   - `detach_loop`   calls f(i) once per index
++      //   - `detach_blocks` calls f(block_begin, block_end) once per block
++      // CTranslate2's parallel_for hands `f` a (begin, end) block range, so
++      // we need the block variant — `detach_loop` would attempt to call
++      // f(single_index) and fail to compile against block-style lambdas.
++      thread_pool.detach_blocks(begin, end, f, num_blocks);
+       thread_pool.wait();
+ 
+ #endif
+diff --git a/src/cuda/primitives.cu b/src/cuda/primitives.cu
+index 2f21585b..454867af 100644
+--- a/src/cuda/primitives.cu
++++ b/src/cuda/primitives.cu
+@@ -492,15 +492,19 @@ namespace ctranslate2 {
+                                       float* c, dim_t ldc,
+                                       const float*) {
+     // cuBLAS assumes column-major storage, so swap a and b accordingly.
+-    CUBLAS_CHECK(cublasSgemm(cuda::get_cublas_handle(),
+-                             transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N,
+-                             transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N,
+-                             n, m, k,
+-                             &alpha,
+-                             b, ldb,
+-                             a, lda,
+-                             &beta,
+-                             c, ldc));
++    // Using cublasGemmEx with CUBLAS_GEMM_DEFAULT_TENSOR_OP enables TF32 on Ampere+ GPUs
++    // for ~3x speedup with minimal accuracy loss.
++    CUBLAS_CHECK(cublasGemmEx(cuda::get_cublas_handle(),
++                              transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N,
++                              transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N,
++                              n, m, k,
++                              &alpha,
++                              b, CUDA_R_32F, ldb,
++                              a, CUDA_R_32F, lda,
++                              &beta,
++                              c, CUDA_R_32F, ldc,
++                              CUDA_R_32F,
++                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+   }
+ 
+   template<>
+@@ -605,16 +609,20 @@ namespace ctranslate2 {
+                                                     float* c, dim_t ldc, dim_t stridec,
+                                                     dim_t batch_size) {
+     // cuBLAS assumes column-major storage, so swap a and b accordingly.
+-    CUBLAS_CHECK(cublasSgemmStridedBatched(cuda::get_cublas_handle(),
+-                                           transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N,
+-                                           transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N,
+-                                           n, m, k,
+-                                           &alpha,
+-                                           b, ldb, strideb,
+-                                           a, lda, stridea,
+-                                           &beta,
+-                                           c, ldc, stridec,
+-                                           batch_size));
++    // Using cublasGemmStridedBatchedEx with CUBLAS_GEMM_DEFAULT_TENSOR_OP enables TF32
++    // on Ampere+ GPUs for ~3x speedup with minimal accuracy loss.
++    CUBLAS_CHECK(cublasGemmStridedBatchedEx(cuda::get_cublas_handle(),
++                                            transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N,
++                                            transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N,
++                                            n, m, k,
++                                            &alpha,
++                                            b, CUDA_R_32F, ldb, strideb,
++                                            a, CUDA_R_32F, lda, stridea,
++                                            &beta,
++                                            c, CUDA_R_32F, ldc, stridec,
++                                            batch_size,
++                                            CUDA_R_32F,
++                                            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+   }
+ 
+   template<>
+diff --git a/src/dtw.cc b/src/dtw.cc
+index 3c61541a..52c3548c 100644
+--- a/src/dtw.cc
++++ b/src/dtw.cc
+@@ -8,15 +8,30 @@ namespace ctranslate2 {
+   static std::vector<std::pair<dim_t, dim_t>> backtrace(std::vector<std::vector<int>> trace,
+                                                         dim_t i,
+                                                         dim_t j) {
+-    for (dim_t k = 0; k <= j; ++k)
++    // Bounds validation
++    if (trace.empty() || i < 0 || j < 0) {
++      return {};
++    }
++    const dim_t rows = static_cast<dim_t>(trace.size());
++    const dim_t cols = trace[0].empty() ? 0 : static_cast<dim_t>(trace[0].size());
++    if (i >= rows || j >= cols) {
++      throw std::runtime_error("backtrace indices out of bounds: i=" + std::to_string(i)
++                               + ", j=" + std::to_string(j) + ", rows=" + std::to_string(rows)
++                               + ", cols=" + std::to_string(cols));
++    }
++
++    for (dim_t k = 0; k <= j && k < cols; ++k)
+       trace[0][k] = 2;
+-    for (dim_t k = 0; k <= i; ++k)
++    for (dim_t k = 0; k <= i && k < rows; ++k)
+       trace[k][0] = 1;
+ 
+     std::vector<std::pair<dim_t, dim_t>> result;
+ 
+     while (i > 0 || j > 0) {
+-      result.emplace_back(i - 1, j - 1);
++      // Only emit valid (non-negative) alignment pairs
++      if (i > 0 && j > 0) {
++        result.emplace_back(i - 1, j - 1);
++      }
+ 
+       const int t = trace[i][j];
+ 
+diff --git a/src/models/model.cc b/src/models/model.cc
+index 1d8295b0..9f0bd2af 100644
+--- a/src/models/model.cc
++++ b/src/models/model.cc
+@@ -156,13 +156,18 @@ namespace ctranslate2 {
+       throw std::runtime_error("This model cannot be used as a sequence encoder");
+     }
+ 
+-    Model::~Model() {
++    void Model::release_gpu_memory() {
+       if (!_variable_index.empty()) {
+         _variable_index.clear();
+         synchronize_device(_device, _device_index);  // Wait for asynchronous deallocations.
+       }
+     }
+ 
++    Model::~Model() {
++      // If release_gpu_memory() was already called, this is a no-op.
++      release_gpu_memory();
++    }
++
+     size_t Model::current_spec_revision() const {
+       return 1;
+     }
+diff --git a/src/thread_pool.cc b/src/thread_pool.cc
+index d0aad775..35664519 100644
+--- a/src/thread_pool.cc
++++ b/src/thread_pool.cc
+@@ -2,6 +2,10 @@
+ 
+ #include "ctranslate2/utils.h"
+ 
++#include <chrono>
++#include <future>
++#include <iostream>
++
+ namespace ctranslate2 {
+ 
+   Job::~Job() {
+@@ -46,9 +50,18 @@ namespace ctranslate2 {
+   std::unique_ptr<Job> JobQueue::get(const std::function<void()>& before_wait) {
+     std::unique_lock<std::mutex> lock(_mutex);
+ 
+-    if (!can_get_job()) {
+-      if (before_wait)
++    while (!can_get_job()) {
++      // Only call before_wait() if we're not shutting down.
++      // This is critical because before_wait() may call cudaStreamSynchronize() which
++      // can block indefinitely if there's pending work, preventing clean shutdown.
++      if (before_wait && !_request_end) {
++        // Release lock before calling before_wait() to avoid blocking while holding mutex.
++        lock.unlock();
+         before_wait();
++        lock.lock();
++        // Re-check condition after re-acquiring lock - use continue to re-evaluate loop
++        continue;
++      }
+       _can_get_job.wait(lock, [this]{ return can_get_job(); });
+     }
+ 
+@@ -102,8 +115,46 @@ namespace ctranslate2 {
+       set_thread_affinity(_thread, thread_affinity);
+   }
+ 
+-  void Worker::join() {
+-    _thread.join();
++  void Worker::join(int timeout_ms) {
++    if (!_thread.joinable()) {
++      return;
++    }
++
++    if (timeout_ms <= 0) {
++      // No timeout - block indefinitely (original behavior)
++      _thread.join();
++      return;
++    }
++
++    // Use a future to implement timed join
++    // We spawn a helper thread that waits for the worker to finish
++    std::promise<void> join_promise;
++    std::future<void> join_future = join_promise.get_future();
++
++    std::thread join_helper([this, &join_promise]() {
++      if (_thread.joinable()) {
++        _thread.join();
++      }
++      join_promise.set_value();
++    });
++
++    // Wait with timeout
++    auto status = join_future.wait_for(std::chrono::milliseconds(timeout_ms));
++
++    if (status == std::future_status::ready) {
++      // Thread finished in time
++      join_helper.join();
++    } else {
++      // Timeout - detach both threads to prevent blocking
++      // This is safe because the worker thread will eventually finish
++      // and we're in destructor context anyway
++      std::cerr << "[CTranslate2] Warning: Worker thread join timed out after "
++                << timeout_ms << "ms, detaching to prevent hang\n";
++      join_helper.detach();
++      if (_thread.joinable()) {
++        _thread.detach();
++      }
++    }
+   }
+ 
+   void Worker::run(JobQueue& job_queue) {
+@@ -146,6 +197,13 @@ namespace ctranslate2 {
+   }
+ 
+   ThreadPool::~ThreadPool() {
++    // Signal all workers to stop idle synchronization BEFORE closing the queue.
++    // This prevents the race where a worker enters synchronize_stream() inside
++    // idle() (called from before_wait in get()) just before close() sets _request_end.
++    // Without this, synchronize_stream() can block indefinitely on CUDA teardown
++    // while the queue is already closed, causing a deadlock.
++    for (auto& worker : _workers)
++      worker->prepare_shutdown();
+     _queue.close();
+     for (auto& worker : _workers)
+       worker->join();

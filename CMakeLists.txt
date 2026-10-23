@@ -115,7 +115,14 @@ if(FFMPEG_DIR AND FFMPEG_STATIC)
         set(VCPKG_STATIC_DIR "C:/vcpkg/installed/x64-windows-static-md"
             CACHE PATH "vcpkg x64-windows-static-md prefix (zlib + transitive static deps)")
     endif()
-    set(ZLIB_STATIC_LIB "${VCPKG_STATIC_DIR}/lib/zlib.lib")
+    # zlib 1.3.2 in vcpkg names its static library zs.lib; older ports, zlib.lib.
+    if(EXISTS "${VCPKG_STATIC_DIR}/lib/zs.lib")
+        set(ZLIB_STATIC_LIB "${VCPKG_STATIC_DIR}/lib/zs.lib")
+    else()
+        set(ZLIB_STATIC_LIB "${VCPKG_STATIC_DIR}/lib/zlib.lib")
+    endif()
+    # zlib.h for the compression ratio (transcriber.cpp), from the same vcpkg prefix.
+    list(APPEND FFMPEG_INCLUDE_DIRS "${VCPKG_STATIC_DIR}/include")
     if(NOT EXISTS "${ZLIB_STATIC_LIB}")
         message(FATAL_ERROR
             "Static zlib not found at ${ZLIB_STATIC_LIB}\n"
@@ -132,6 +139,16 @@ if(FFMPEG_DIR AND FFMPEG_STATIC)
         "${FFMPEG_DIR}/lib/libswscale.lib"
         "${FFMPEG_DIR}/lib/libavutil.lib"
         "${ZLIB_STATIC_LIB}"
+    )
+    # FFmpeg 8.0.3+ is built with libdav1d (AV1 decode); older trees without it
+    # don't need the library.
+    if(EXISTS "${FFMPEG_DIR}/lib/pkgconfig/libavcodec.pc")
+        file(READ "${FFMPEG_DIR}/lib/pkgconfig/libavcodec.pc" _avcodec_pc)
+        if(_avcodec_pc MATCHES "dav1d")
+            list(APPEND FFMPEG_LIBRARIES "${VCPKG_STATIC_DIR}/lib/dav1d.lib")
+        endif()
+    endif()
+    list(APPEND FFMPEG_LIBRARIES
         # Windows system libs FFmpeg's static link needs (collected from
         # the per-lib .pc files; all ship with the Windows SDK).
         bcrypt
@@ -406,6 +423,11 @@ if(BUILD_TESTS)
     # VAD parameter tuning test (iterates through VAD configs for CJK optimization)
     add_executable(vad_tuning_app tests/vad_tuning_app.cpp)
     target_link_libraries(vad_tuning_app PRIVATE muninn)
+
+    # Accuracy harness: transcribe with Loki Studio settings, write JSON for
+    # tests/accuracy/compare.py to score against faster-whisper.
+    add_executable(muninn_accuracy tests/muninn_accuracy.cpp)
+    target_link_libraries(muninn_accuracy PRIVATE muninn)
 
     # Ensure test apps can find DLLs
     if(BUILD_SHARED_LIBS)

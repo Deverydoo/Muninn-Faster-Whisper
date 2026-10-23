@@ -1,0 +1,26 @@
+{
+ "label": "prompt2_seq",
+ "clips": [
+  {
+   "clip": "ricochet_a_intro",
+   "wer": 3.0,
+   "sub": 4,
+   "del": 17,
+   "ins": 3,
+   "reference": {
+    "segments": 46,
+    "words": 795,
+    "repeated_lines": 3,
+    "short_lines": 5
+   },
+   "muninn": {
+    "segments": 31,
+    "words": 781,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 11.2,
+   "reference_seconds": 16.0
+  }
+ ]
+}

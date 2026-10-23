@@ -1,0 +1,68 @@
+{
+ "label": "default_seq",
+ "clips": [
+  {
+   "clip": "ricochet_a_intro",
+   "wer": 1.9,
+   "sub": 3,
+   "del": 12,
+   "ins": 0,
+   "reference": {
+    "segments": 46,
+    "words": 795,
+    "repeated_lines": 3,
+    "short_lines": 5
+   },
+   "muninn": {
+    "segments": 40,
+    "words": 783,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 10.8,
+   "reference_seconds": 16.0
+  },
+  {
+   "clip": "ricochet_a_story",
+   "wer": 3.1,
+   "sub": 4,
+   "del": 15,
+   "ins": 5,
+   "reference": {
+    "segments": 23,
+    "words": 775,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn": {
+    "segments": 36,
+    "words": 765,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 11.9,
+   "reference_seconds": 20.1
+  },
+  {
+   "clip": "ricochet_d_deaths",
+   "wer": 23.5,
+   "sub": 7,
+   "del": 6,
+   "ins": 3,
+   "reference": {
+    "segments": 4,
+    "words": 68,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn": {
+    "segments": 4,
+    "words": 65,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 2.2,
+   "reference_seconds": 2.2
+  }
+ ]
+}

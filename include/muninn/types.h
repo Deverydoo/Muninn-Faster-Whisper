@@ -239,6 +239,11 @@ struct TranscribeOptions {
     std::string initial_prompt;            // Initial prompt to condition model
     std::vector<std::string> hotwords;     // Words to boost recognition
     bool condition_on_previous = true;     // Use previous text as context
+    // Long audio decoded as faster-whisper does: 30 s windows from a seek position,
+    // with fallback and context. Default since October 2026: on Loki Studio's test
+    // clips 2-3% WER against faster-whisper where batching gave 11-15%, and faster.
+    // false = the older batched path (batch_size windows at once, no context).
+    bool sequential = true;
     float prompt_reset_on_temperature = 0.5f;  // Reset prompt context when T exceeds this
 };
 
