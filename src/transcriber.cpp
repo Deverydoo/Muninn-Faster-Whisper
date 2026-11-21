@@ -2066,16 +2066,20 @@ Transcriber::Transcriber(
                 Logger::info("Compute capability: " + std::to_string(compute_major) + "." + std::to_string(compute_minor));
                 Logger::info("VRAM: " + std::to_string(vram_mb) + " MB");
 
-                // Minimum compute capability 6.0 (Pascal) required for stable CTranslate2
-                if (compute_major >= 6) {
+                // Compute capability 7.5 (Turing, RTX 20xx) or newer: CTranslate2
+                // is built for 7.5-9.0 and 12.0 with CUDA 13, which has no
+                // Pascal (6.x) or Volta (7.0). On those cards a kernel can fail
+                // mid-transcription, after the CPU fallback point; this check
+                // used to accept 6.0.
+                if (compute_major > 7 || (compute_major == 7 && compute_minor >= 5)) {
                     cuda_compatible = true;
-                    Logger::info("GPU is compatible (compute >= 6.0)");
+                    Logger::info("GPU is compatible (compute >= 7.5)");
                 } else {
                     cuda_compatible = false;
                     fallback_reason = "GPU compute capability " + std::to_string(compute_major) + "." +
-                                     std::to_string(compute_minor) + " is below required 6.0 (Pascal)";
+                                     std::to_string(compute_minor) + " is below required 7.5 (RTX 20 series)";
                     Logger::warn(fallback_reason);
-                    Logger::warn("Maxwell (5.x) and older GPUs are not supported for CUDA inference - forcing CPU mode");
+                    Logger::warn("GPUs older than the RTX 20 series are not supported for CUDA inference - forcing CPU mode");
                 }
 
                 // Also warn about low VRAM (< 2GB is risky even for tiny model)
