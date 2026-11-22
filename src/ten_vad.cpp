@@ -11,6 +11,7 @@
  */
 
 #include "muninn/ten_vad.h"
+#include "log_stream.h"
 #include <stdexcept>
 
 #ifdef MUNINN_USE_SILERO_VAD  // Reuse the same ONNX Runtime flag
@@ -74,8 +75,8 @@ public:
                 session_options.AppendExecutionProvider_CUDA(cuda_options);
                 using_gpu = true;
             } catch (const Ort::Exception& e) {
-                std::cout << "[TenVAD] CUDA not available: " << e.what() << "\n";
-                std::cout << "[TenVAD] Falling back to CPU\n";
+                muninn::mlog() << "[TenVAD] CUDA not available: " << e.what() << "\n";
+                muninn::mlog() << "[TenVAD] Falling back to CPU\n";
                 using_gpu = false;
             }
         }
@@ -97,7 +98,7 @@ public:
             if (!using_gpu) throw;
             // Provider appended but the session could not be built with it.
             // Retry on CPU rather than fail the whole transcription.
-            std::cout << "[TenVAD] CUDA session failed (" << e.what() << ") - retrying on CPU\n";
+            muninn::mlog() << "[TenVAD] CUDA session failed (" << e.what() << ") - retrying on CPU\n";
             Ort::SessionOptions cpu_options;
             cpu_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             cpu_options.SetIntraOpNumThreads(1);
@@ -122,13 +123,13 @@ public:
             auto shape_info = session_->GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
             auto shape = shape_info.GetShape();
 
-            std::cout << "[TenVAD] Input " << i << ": " << input_names_.back();
-            std::cout << " shape=[";
+            muninn::mlog() << "[TenVAD] Input " << i << ": " << input_names_.back();
+            muninn::mlog() << " shape=[";
             for (size_t j = 0; j < shape.size(); ++j) {
-                std::cout << shape[j];
-                if (j < shape.size() - 1) std::cout << ",";
+                muninn::mlog() << shape[j];
+                if (j < shape.size() - 1) muninn::mlog() << ",";
             }
-            std::cout << "]\n";
+            muninn::mlog() << "]\n";
         }
 
         // Get output info
@@ -141,13 +142,13 @@ public:
             auto shape_info = session_->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
             auto shape = shape_info.GetShape();
 
-            std::cout << "[TenVAD] Output " << i << ": " << output_names_.back();
-            std::cout << " shape=[";
+            muninn::mlog() << "[TenVAD] Output " << i << ": " << output_names_.back();
+            muninn::mlog() << " shape=[";
             for (size_t j = 0; j < shape.size(); ++j) {
-                std::cout << shape[j];
-                if (j < shape.size() - 1) std::cout << ",";
+                muninn::mlog() << shape[j];
+                if (j < shape.size() - 1) muninn::mlog() << ",";
             }
-            std::cout << "]\n";
+            muninn::mlog() << "]\n";
         }
 
         // Build the char* views only after both name vectors have stopped
@@ -162,7 +163,7 @@ public:
 
         ready_ = true;
         using_gpu_ = using_gpu;
-        std::cout << "[TenVAD] Model loaded (" << (using_gpu ? "CUDA" : "CPU") << "): "
+        muninn::mlog() << "[TenVAD] Model loaded (" << (using_gpu ? "CUDA" : "CPU") << "): "
                   << options.model_path << std::endl;
     }
 
@@ -219,7 +220,7 @@ public:
 
         // TEN VAD expects 16kHz
         if (sample_rate != 16000) {
-            std::cerr << "[TenVAD] Warning: Sample rate " << sample_rate
+            muninn::mlog_warn() << "[TenVAD] Warning: Sample rate " << sample_rate
                       << " not optimal, use 16000 for best results\n";
         }
 
@@ -317,22 +318,22 @@ public:
             if (segments.empty()) {
                 // No speech detected, but include preamble as a segment
                 segments.emplace_back(0.0f, preamble_end);
-                std::cout << "[TenVAD] No speech detected, adding preamble segment 0.0-" << preamble_end << "s\n";
+                muninn::mlog() << "[TenVAD] No speech detected, adding preamble segment 0.0-" << preamble_end << "s\n";
             } else if (segments[0].start > 0.0f) {
                 // First segment doesn't start at 0, extend it or insert preamble
                 if (segments[0].start <= preamble_end) {
                     // Extend first segment to include preamble
                     segments[0].start = 0.0f;
-                    std::cout << "[TenVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
+                    muninn::mlog() << "[TenVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
                 } else {
                     // Insert preamble as separate segment at the beginning
                     segments.insert(segments.begin(), SpeechSegment(0.0f, preamble_end));
-                    std::cout << "[TenVAD] Inserted preamble segment 0.0-" << preamble_end << "s\n";
+                    muninn::mlog() << "[TenVAD] Inserted preamble segment 0.0-" << preamble_end << "s\n";
                 }
             }
         }
 
-        std::cout << "[TenVAD] Detected " << segments.size() << " speech segments\n";
+        muninn::mlog() << "[TenVAD] Detected " << segments.size() << " speech segments\n";
         return segments;
     }
 
@@ -401,12 +402,12 @@ std::vector<float> TenVAD::filter_silence(
         }
 
         if (max_sample < 0.001f) {
-            std::cout << "[TenVAD] Track is silent - skipping\n";
+            muninn::mlog() << "[TenVAD] Track is silent - skipping\n";
             silence_removed_ = static_cast<float>(samples.size()) / sample_rate;
             return {};
         }
 
-        std::cout << "[TenVAD] No speech detected - returning original audio\n";
+        muninn::mlog() << "[TenVAD] No speech detected - returning original audio\n";
         silence_removed_ = 0.0f;
         return samples;
     }
@@ -430,7 +431,7 @@ std::vector<float> TenVAD::filter_silence(
     // which ignored clamping and could report negative silence.
     silence_removed_ = total_duration - static_cast<float>(filtered.size()) / sample_rate;
 
-    std::cout << "[TenVAD] Removed " << silence_removed_ << "s silence ("
+    muninn::mlog() << "[TenVAD] Removed " << silence_removed_ << "s silence ("
               << static_cast<int>(silence_removed_ / std::max(total_duration, 1e-6f) * 100) << "%)\n";
 
     return filtered;

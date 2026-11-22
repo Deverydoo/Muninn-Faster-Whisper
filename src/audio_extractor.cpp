@@ -1,4 +1,5 @@
 #include "muninn/audio_extractor.h"
+#include "log_stream.h"
 #include "audio/audio_decoder.h"
 #include <iostream>
 
@@ -35,7 +36,7 @@ bool AudioExtractor::open(const std::string& file_path)
         // Open file with Whisper sample rate (16kHz)
         if (!pimpl_->decoder.open(file_path, Impl::WHISPER_SAMPLE_RATE)) {
             last_error_ = "Failed to open audio file";
-            std::cerr << "[Muninn] " << last_error_ << ": " << file_path << "\n";
+            muninn::mlog_warn() << "[Muninn] " << last_error_ << ": " << file_path << "\n";
             pimpl_->is_open = false;
             return false;
         }
@@ -45,13 +46,13 @@ bool AudioExtractor::open(const std::string& file_path)
         pimpl_->duration_ms = pimpl_->decoder.get_duration_ms();
         pimpl_->is_open = true;
 
-        std::cout << "[Muninn] Opened file with " << pimpl_->stream_count
+        muninn::mlog() << "[Muninn] Opened file with " << pimpl_->stream_count
                   << " audio track(s), duration: " << (pimpl_->duration_ms / 1000.0f) << "s\n";
 
         return true;
     } catch (const std::exception& e) {
         last_error_ = std::string("Failed to open file: ") + e.what();
-        std::cerr << "[Muninn] " << last_error_ << "\n";
+        muninn::mlog_warn() << "[Muninn] " << last_error_ << "\n";
         pimpl_->is_open = false;
         return false;
     }
@@ -108,19 +109,19 @@ bool AudioExtractor::extract_track(int track_index, std::vector<float>& samples)
 
         if (extracted == 0 || tracks.find(track_index) == tracks.end() || tracks[track_index].empty()) {
             last_error_ = "Failed to extract audio from track " + std::to_string(track_index);
-            std::cerr << "[Muninn] " << last_error_ << "\n";
+            muninn::mlog_warn() << "[Muninn] " << last_error_ << "\n";
             return false;
         }
 
         samples = std::move(tracks[track_index]);
 
-        std::cout << "[Muninn] Track " << track_index << ": extracted " << samples.size()
+        muninn::mlog() << "[Muninn] Track " << track_index << ": extracted " << samples.size()
                   << " samples (" << (samples.size() / static_cast<float>(Impl::WHISPER_SAMPLE_RATE)) << "s at 16kHz)\n";
 
         return true;
     } catch (const std::exception& e) {
         last_error_ = std::string("Failed to extract audio: ") + e.what();
-        std::cerr << "[Muninn] " << last_error_ << "\n";
+        muninn::mlog_warn() << "[Muninn] " << last_error_ << "\n";
         return false;
     }
 }
@@ -138,7 +139,7 @@ bool AudioExtractor::extract_audio(const std::string& file_path,
 
         if (!temp_decoder.open(file_path, Impl::WHISPER_SAMPLE_RATE)) {
             last_error_ = "Failed to open audio file";
-            std::cerr << "[Muninn] " << last_error_ << ": " << file_path << "\n";
+            muninn::mlog_warn() << "[Muninn] " << last_error_ << ": " << file_path << "\n";
             return false;
         }
 
@@ -170,13 +171,13 @@ bool AudioExtractor::extract_audio(const std::string& file_path,
 
         samples = std::move(tracks[0]);
 
-        std::cout << "[Muninn] Extracted " << samples.size() << " samples ("
+        muninn::mlog() << "[Muninn] Extracted " << samples.size() << " samples ("
                   << (samples.size() / static_cast<float>(Impl::WHISPER_SAMPLE_RATE)) << "s at 16kHz)\n";
 
         return true;
     } catch (const std::exception& e) {
         last_error_ = std::string("Failed to extract audio: ") + e.what();
-        std::cerr << "[Muninn] " << last_error_ << "\n";
+        muninn::mlog_warn() << "[Muninn] " << last_error_ << "\n";
         return false;
     }
 }

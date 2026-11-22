@@ -1,4 +1,5 @@
 #include "audio_decoder.h"
+#include "../log_stream.h"
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -27,7 +28,7 @@ static std::string get_timestamp() {
 }
 
 // Macro for timestamped output
-#define TS_PRINT(msg) std::cout << "[" << get_timestamp() << "] " << msg << std::endl
+#define TS_PRINT(msg) muninn::mlog() << "[" << get_timestamp() << "] " << msg << std::endl
 
 AudioDecoder::AudioDecoder()
     : format_ctx_(nullptr)
@@ -56,13 +57,13 @@ bool AudioDecoder::open(const std::string& filename, int target_sample_rate) {
 
     // Open file
     if (avformat_open_input(&format_ctx_, filename.c_str(), nullptr, nullptr) < 0) {
-        std::cerr << "[Muninn Audio] Cannot open file: " << filename << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot open file: " << filename << std::endl;
         return false;
     }
 
     // Get stream info
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
-        std::cerr << "[Muninn Audio] Cannot find stream info" << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot find stream info" << std::endl;
         avformat_close_input(&format_ctx_);
         return false;
     }
@@ -100,20 +101,20 @@ bool AudioDecoder::init_stream(int stream_index) {
     // Find decoder
     const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!codec) {
-        std::cerr << "[Muninn Audio] Codec not found for stream " << stream_index << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Codec not found for stream " << stream_index << std::endl;
         return false;
     }
 
     // Allocate codec context
     AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
     if (!codec_ctx) {
-        std::cerr << "[Muninn Audio] Cannot allocate codec context" << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot allocate codec context" << std::endl;
         return false;
     }
 
     // Copy codec parameters
     if (avcodec_parameters_to_context(codec_ctx, stream->codecpar) < 0) {
-        std::cerr << "[Muninn Audio] Cannot copy codec parameters" << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot copy codec parameters" << std::endl;
         avcodec_free_context(&codec_ctx);
         return false;
     }
@@ -126,7 +127,7 @@ bool AudioDecoder::init_stream(int stream_index) {
 
     // Open codec with threading options
     if (avcodec_open2(codec_ctx, codec, &codec_opts) < 0) {
-        std::cerr << "[Muninn Audio] Cannot open codec" << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot open codec" << std::endl;
         av_dict_free(&codec_opts);
         avcodec_free_context(&codec_ctx);
         return false;
@@ -136,7 +137,7 @@ bool AudioDecoder::init_stream(int stream_index) {
     // Create resampler to convert to float samples
     SwrContext* swr_ctx = swr_alloc();
     if (!swr_ctx) {
-        std::cerr << "[Muninn Audio] Cannot allocate resampler" << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot allocate resampler" << std::endl;
         avcodec_free_context(&codec_ctx);
         return false;
     }
@@ -152,7 +153,7 @@ bool AudioDecoder::init_stream(int stream_index) {
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
     if (swr_init(swr_ctx) < 0) {
-        std::cerr << "[Muninn Audio] Cannot initialize resampler" << std::endl;
+        muninn::mlog_warn() << "[Muninn Audio] Cannot initialize resampler" << std::endl;
         swr_free(&swr_ctx);
         avcodec_free_context(&codec_ctx);
         return false;

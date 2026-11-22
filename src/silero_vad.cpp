@@ -1,4 +1,5 @@
 #include "muninn/silero_vad.h"
+#include "log_stream.h"
 #include <stdexcept>
 
 #ifdef MUNINN_USE_SILERO_VAD
@@ -62,8 +63,8 @@ public:
                 session_options.AppendExecutionProvider_CUDA(cuda_options);
                 using_gpu = true;
             } catch (const Ort::Exception& e) {
-                std::cout << "[SileroVAD] CUDA not available: " << e.what() << "\n";
-                std::cout << "[SileroVAD] Falling back to CPU\n";
+                muninn::mlog() << "[SileroVAD] CUDA not available: " << e.what() << "\n";
+                muninn::mlog() << "[SileroVAD] Falling back to CPU\n";
                 using_gpu = false;
             }
         }
@@ -88,7 +89,7 @@ public:
             // built with it (missing onnxruntime CUDA DLLs, driver too old).
             // A VAD that refuses to load takes the whole transcription down, so
             // retry on CPU rather than propagate.
-            std::cout << "[SileroVAD] CUDA session failed (" << e.what() << ") - retrying on CPU\n";
+            muninn::mlog() << "[SileroVAD] CUDA session failed (" << e.what() << ") - retrying on CPU\n";
             Ort::SessionOptions cpu_options;
             cpu_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             cpu_options.SetIntraOpNumThreads(1);
@@ -105,7 +106,7 @@ public:
 
         ready_ = true;
         using_gpu_ = using_gpu;
-        std::cout << "[SileroVAD] Model loaded (" << (using_gpu ? "CUDA" : "CPU") << "): "
+        muninn::mlog() << "[SileroVAD] Model loaded (" << (using_gpu ? "CUDA" : "CPU") << "): "
                   << options.model_path << std::endl;
     }
 
@@ -175,7 +176,7 @@ public:
 
         // Validate sample rate
         if (sample_rate != 8000 && sample_rate != 16000) {
-            std::cerr << "[SileroVAD] Warning: Sample rate " << sample_rate
+            muninn::mlog_warn() << "[SileroVAD] Warning: Sample rate " << sample_rate
                       << " not supported, use 8000 or 16000\n";
             return segments;
         }
@@ -285,22 +286,22 @@ public:
             if (segments.empty()) {
                 // No speech detected, but include preamble as a segment
                 segments.emplace_back(0.0f, preamble_end);
-                std::cout << "[SileroVAD] No speech detected, adding preamble segment 0.0-" << preamble_end << "s\n";
+                muninn::mlog() << "[SileroVAD] No speech detected, adding preamble segment 0.0-" << preamble_end << "s\n";
             } else if (segments[0].start > 0.0f) {
                 // First segment doesn't start at 0, extend it or insert preamble
                 if (segments[0].start <= preamble_end) {
                     // Extend first segment to include preamble
                     segments[0].start = 0.0f;
-                    std::cout << "[SileroVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
+                    muninn::mlog() << "[SileroVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
                 } else {
                     // Insert preamble as separate segment at the beginning
                     segments.insert(segments.begin(), SpeechSegment(0.0f, preamble_end));
-                    std::cout << "[SileroVAD] Inserted preamble segment 0.0-" << preamble_end << "s\n";
+                    muninn::mlog() << "[SileroVAD] Inserted preamble segment 0.0-" << preamble_end << "s\n";
                 }
             }
         }
 
-        std::cout << "[SileroVAD] Detected " << segments.size() << " speech segments\n";
+        muninn::mlog() << "[SileroVAD] Detected " << segments.size() << " speech segments\n";
         return segments;
     }
 
@@ -373,12 +374,12 @@ std::vector<float> SileroVAD::filter_silence(
         }
 
         if (max_sample < 0.001f) {
-            std::cout << "[SileroVAD] Track is silent - skipping\n";
+            muninn::mlog() << "[SileroVAD] Track is silent - skipping\n";
             silence_removed_ = static_cast<float>(samples.size()) / sample_rate;
             return {};
         }
 
-        std::cout << "[SileroVAD] No speech detected - returning original audio\n";
+        muninn::mlog() << "[SileroVAD] No speech detected - returning original audio\n";
         silence_removed_ = 0.0f;
         return samples;
     }
@@ -403,7 +404,7 @@ std::vector<float> SileroVAD::filter_silence(
     // negative amount of silence removed.
     silence_removed_ = total_duration - static_cast<float>(filtered.size()) / sample_rate;
 
-    std::cout << "[SileroVAD] Removed " << silence_removed_ << "s silence ("
+    muninn::mlog() << "[SileroVAD] Removed " << silence_removed_ << "s silence ("
               << static_cast<int>(silence_removed_ / std::max(total_duration, 1e-6f) * 100) << "%)\n";
 
     return filtered;

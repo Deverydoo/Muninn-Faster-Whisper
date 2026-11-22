@@ -1,4 +1,5 @@
 #include "muninn/vad.h"
+#include "log_stream.h"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -52,7 +53,7 @@ float VAD::estimate_noise_floor(const std::vector<float>& energies) {
     float max_threshold = noise_floor + (dynamic_range * 0.5f);
     threshold = std::min(threshold, max_threshold);
 
-    std::cout << "[VAD] Noise floor: " << noise_floor
+    muninn::mlog() << "[VAD] Noise floor: " << noise_floor
               << ", Speech level: " << speech_level
               << ", Dynamic range: " << dynamic_range << "\n";
 
@@ -87,7 +88,7 @@ std::vector<SpeechSegment> VAD::detect_speech(
     float threshold = options_.threshold;
     if (options_.adaptive_threshold) {
         threshold = estimate_noise_floor(energies);
-        std::cout << "[VAD] Adaptive threshold: " << threshold << "\n";
+        muninn::mlog() << "[VAD] Adaptive threshold: " << threshold << "\n";
     }
 
     // Detect speech frames
@@ -174,17 +175,17 @@ std::vector<SpeechSegment> VAD::post_process_segments(
         if (result.empty()) {
             // No speech detected, but include preamble as a segment
             result.emplace_back(0.0f, preamble_sec);
-            std::cout << "[VAD] No speech detected, adding preamble segment 0.0-" << preamble_sec << "s\n";
+            muninn::mlog() << "[VAD] No speech detected, adding preamble segment 0.0-" << preamble_sec << "s\n";
         } else if (result[0].start > 0.0f) {
             // First segment doesn't start at 0, extend it or insert preamble
             if (result[0].start <= preamble_sec) {
                 // Extend first segment to include preamble
                 result[0].start = 0.0f;
-                std::cout << "[VAD] Extended first segment to include preamble (now 0.0-" << result[0].end << "s)\n";
+                muninn::mlog() << "[VAD] Extended first segment to include preamble (now 0.0-" << result[0].end << "s)\n";
             } else {
                 // Insert preamble as separate segment at the beginning
                 result.insert(result.begin(), SpeechSegment(0.0f, preamble_sec));
-                std::cout << "[VAD] Inserted preamble segment 0.0-" << preamble_sec << "s\n";
+                muninn::mlog() << "[VAD] Inserted preamble segment 0.0-" << preamble_sec << "s\n";
             }
         }
     }
@@ -209,12 +210,12 @@ std::vector<float> VAD::filter_silence(
 
         if (max_sample < 0.001f) {
             // Truly silent - return empty to skip transcription
-            std::cout << "[VAD] Track is silent (max amplitude: " << max_sample << ") - skipping\n";
+            muninn::mlog() << "[VAD] Track is silent (max amplitude: " << max_sample << ") - skipping\n";
             silence_removed_ = static_cast<float>(samples.size()) / sample_rate;
             return {};  // Empty = skip this track
         }
 
-        std::cout << "[VAD] No speech detected - returning original audio\n";
+        muninn::mlog() << "[VAD] No speech detected - returning original audio\n";
         silence_removed_ = 0.0f;
         return samples;
     }
@@ -240,8 +241,8 @@ std::vector<float> VAD::filter_silence(
     // which ignored clamping and could report negative silence.
     silence_removed_ = total_duration - static_cast<float>(filtered.size()) / sample_rate;
 
-    std::cout << "[VAD] Detected " << segments.size() << " speech segment(s)\n";
-    std::cout << "[VAD] Removed " << silence_removed_ << "s of silence ("
+    muninn::mlog() << "[VAD] Detected " << segments.size() << " speech segment(s)\n";
+    muninn::mlog() << "[VAD] Removed " << silence_removed_ << "s of silence ("
               << static_cast<int>(silence_removed_ / std::max(total_duration, 1e-6f) * 100) << "%)\n";
 
     return filtered;
@@ -317,32 +318,32 @@ VADType auto_detect_vad_type(
     // ═══════════════════════════════════════════════════════════
     switch (track_type) {
         case TrackType::SystemAudio:
-            std::cout << "[Auto-VAD] Track " << track_id
+            muninn::mlog() << "[Auto-VAD] Track " << track_id
                       << ": Type=SystemAudio → No VAD (Whisper segmentation)\n";
             return VADType::None;
 
         case TrackType::GameAudio:
-            std::cout << "[Auto-VAD] Track " << track_id
+            muninn::mlog() << "[Auto-VAD] Track " << track_id
                       << ": Type=GameAudio → No VAD (Whisper segmentation)\n";
             return VADType::None;
 
         case TrackType::MovieAudio:
-            std::cout << "[Auto-VAD] Track " << track_id
+            muninn::mlog() << "[Auto-VAD] Track " << track_id
                       << ": Type=MovieAudio → No VAD (Whisper segmentation)\n";
             return VADType::None;
 
         case TrackType::Music:
-            std::cout << "[Auto-VAD] Track " << track_id
+            muninn::mlog() << "[Auto-VAD] Track " << track_id
                       << ": Type=Music → No VAD (Whisper segmentation)\n";
             return VADType::None;
 
         case TrackType::Microphone:
-            std::cout << "[Auto-VAD] Track " << track_id
+            muninn::mlog() << "[Auto-VAD] Track " << track_id
                       << ": Type=Microphone → Silero VAD\n";
             return VADType::Silero;
 
         case TrackType::VoiceChat:
-            std::cout << "[Auto-VAD] Track " << track_id
+            muninn::mlog() << "[Auto-VAD] Track " << track_id
                       << ": Type=VoiceChat → Silero VAD\n";
             return VADType::Silero;
 
@@ -359,7 +360,7 @@ VADType auto_detect_vad_type(
     // System audio (games, movies, etc.) should NOT use VAD - Whisper handles it better
     // VAD is designed for microphone speech with clear speech/silence boundaries
     if (total_tracks > 1 && track_id == 0) {
-        std::cout << "[Auto-VAD] Track " << track_id
+        muninn::mlog() << "[Auto-VAD] Track " << track_id
                   << ": Multi-track system/game audio → No VAD (let Whisper segment)\n";
         return VADType::None;
     }
@@ -369,32 +370,32 @@ VADType auto_detect_vad_type(
     // ═══════════════════════════════════════════════════════════
     auto characteristics = analyze_audio_characteristics(samples);
 
-    std::cout << "[Auto-VAD] Track " << track_id
+    muninn::mlog() << "[Auto-VAD] Track " << track_id
               << ": Noise=" << characteristics.noise_floor
               << ", Speech=" << characteristics.speech_level
               << ", Range=" << characteristics.dynamic_range << "\n";
 
     // Silent track
     if (characteristics.is_silent) {
-        std::cout << "[Auto-VAD] Track " << track_id << ": Silent → Energy VAD\n";
+        muninn::mlog() << "[Auto-VAD] Track " << track_id << ": Silent → Energy VAD\n";
         return VADType::Energy;
     }
 
     // Clean speech detection - prioritize low noise floor
     // Very clean speech: Extremely low noise (noise gates, studio mics)
     if (characteristics.noise_floor < 0.0001f && characteristics.dynamic_range > 0.01f) {
-        std::cout << "[Auto-VAD] Track " << track_id << ": Very clean speech (noise gate) → Silero VAD\n";
+        muninn::mlog() << "[Auto-VAD] Track " << track_id << ": Very clean speech (noise gate) → Silero VAD\n";
         return VADType::Silero;
     }
 
     // Clean speech: Low noise floor + reasonable dynamic range
     if (characteristics.noise_floor < 0.01f && characteristics.dynamic_range > 0.15f) {
-        std::cout << "[Auto-VAD] Track " << track_id << ": Clean speech → Silero VAD\n";
+        muninn::mlog() << "[Auto-VAD] Track " << track_id << ": Clean speech → Silero VAD\n";
         return VADType::Silero;
     }
 
     // Mixed/noisy content or low dynamic range
-    std::cout << "[Auto-VAD] Track " << track_id << ": Mixed/noisy audio → Energy VAD\n";
+    muninn::mlog() << "[Auto-VAD] Track " << track_id << ": Mixed/noisy audio → Energy VAD\n";
     return VADType::Energy;
 }
 

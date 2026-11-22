@@ -1,4 +1,5 @@
 #include "muninn/transcriber.h"
+#include "log_stream.h"
 #include "muninn/logging.h"
 #include "muninn/mel_spectrogram.h"
 #include "muninn/audio_extractor.h"
@@ -174,13 +175,13 @@ public:
                 startofprev_id = id_of("<|startofprev|>", 0);
             }
         } catch (const std::exception& e) {
-            std::cerr << "[Muninn] Vocabulary unavailable, using built-in token ids: " << e.what() << "\n";
+            muninn::mlog_warn() << "[Muninn] Vocabulary unavailable, using built-in token ids: " << e.what() << "\n";
             vocabulary = nullptr;
             token_to_id.clear();
         }
 
         tokens_initialized = true;
-        std::cout << "[Muninn] Token IDs initialized: sot=" << sot_id
+        muninn::mlog() << "[Muninn] Token IDs initialized: sot=" << sot_id
                   << ", eot=" << eot_id << ", timestamp_begin=" << timestamp_begin << "\n";
     }
 
@@ -190,7 +191,7 @@ public:
     ) {
         // Bounds check to prevent crash on empty input
         if (mel_features.empty() || mel_features[0].empty()) {
-            std::cerr << "[Muninn] Warning: Empty mel features for language detection, defaulting to English\n";
+            muninn::mlog_warn() << "[Muninn] Warning: Empty mel features for language detection, defaulting to English\n";
             return {"en", 0.0f};
         }
 
@@ -233,7 +234,7 @@ public:
             lang_code = lang_code.substr(2, lang_code.size() - 4);
         }
 
-        std::cout << "[Muninn] Detected language: " << lang_code
+        muninn::mlog() << "[Muninn] Detected language: " << lang_code
                   << " (probability: " << best->second << ")\n";
 
         return {lang_code, best->second};
@@ -1077,7 +1078,7 @@ bool Transcriber::Impl::is_hallucination(
         // "with Conan Exiles"). Strict `>` restores the documented intent and
         // still catches genuine loops (3 identical words gives 3 > 1).
         if (max_repeat_count * 2 > static_cast<int>(words.size())) {
-            std::cerr << "[Muninn] Skipping repetitive hallucination: '"
+            muninn::mlog_warn() << "[Muninn] Skipping repetitive hallucination: '"
                       << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
                       << "' (repeat: " << max_repeat_count << "/" << words.size() << " words)\n";
             return true;
@@ -1099,7 +1100,7 @@ bool Transcriber::Impl::is_hallucination(
             // If any n-gram appears 3+ times, it's a hallucination
             for (const auto& [ngram, count] : ngram_counts) {
                 if (count >= 3) {
-                    std::cerr << "[Muninn] Skipping phrase-repetition hallucination: '"
+                    muninn::mlog_warn() << "[Muninn] Skipping phrase-repetition hallucination: '"
                               << ngram << "' repeated " << count << " times\n";
                     return true;
                 }
@@ -1155,7 +1156,7 @@ bool Transcriber::Impl::is_hallucination(
 
             // If same character repeats 6+ times consecutively, it's a hallucination
             if (max_char_repeat >= 6) {
-                std::cerr << "[Muninn] Skipping character-repetition hallucination: '"
+                muninn::mlog_warn() << "[Muninn] Skipping character-repetition hallucination: '"
                           << segment.text.substr(0, std::min(size_t(60), segment.text.length()))
                           << "...' (" << max_char_repeat << " consecutive same characters)\n";
                 return true;
@@ -1172,7 +1173,7 @@ bool Transcriber::Impl::is_hallucination(
             const bool spaced = std::count(segment.text.begin(), segment.text.end(), ' ') * 20 >
                                 static_cast<long long>(codepoints.size());
             if (!spaced && codepoints.size() >= 10 && unique_ratio < 0.10f) {
-                std::cerr << "[Muninn] Skipping low-diversity hallucination: '"
+                muninn::mlog_warn() << "[Muninn] Skipping low-diversity hallucination: '"
                           << segment.text.substr(0, std::min(size_t(60), segment.text.length()))
                           << "...' (unique ratio: " << (unique_ratio * 100.0f) << "%)\n";
                 return true;
@@ -1186,7 +1187,7 @@ bool Transcriber::Impl::is_hallucination(
     float compression_ratio = compression_ratio_of(segment.text);
 
     if (compression_ratio > options.compression_ratio_threshold && avg_logprob < options.log_prob_threshold) {
-        std::cerr << "[Muninn] Skipping high-compression hallucination: '"
+        muninn::mlog_warn() << "[Muninn] Skipping high-compression hallucination: '"
                   << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
                   << "' (ratio: " << compression_ratio << ", logprob: " << avg_logprob << ")\n";
         return true;
@@ -1304,7 +1305,7 @@ void filter_silence_hallucinations(
         }
 
         if (overlap < threshold) {
-            std::cerr << "[Muninn] Skipping silence hallucination: '"
+            muninn::mlog_warn() << "[Muninn] Skipping silence hallucination: '"
                       << it->text.substr(0, std::min(size_t(50), it->text.length()))
                       << "' (speech overlap: " << (overlap * 100.0f) << "%, "
                       << it->words.size() << " words)\n";
@@ -1416,7 +1417,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
         // Previous output, unless it came from a high-temperature (unreliable) decode.
         bool should_use_context = options.condition_on_previous && !previous_tokens.empty();
         if (should_use_context && previous_temperature >= options.prompt_reset_on_temperature) {
-            std::cout << "[Muninn] Resetting prompt context (prev temp=" << previous_temperature
+            muninn::mlog() << "[Muninn] Resetting prompt context (prev temp=" << previous_temperature
                       << " >= threshold=" << options.prompt_reset_on_temperature << ")\n";
             should_use_context = false;
         }
@@ -1534,7 +1535,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
             attempts.push_back({result, avg_logprob, compression_ratio, current_temp});
 
             if (should_retry && temp_idx + 1 < temperatures.size()) {
-                std::cout << "[Muninn] Temperature fallback: T=" << current_temp
+                muninn::mlog() << "[Muninn] Temperature fallback: T=" << current_temp
                          << " -> T=" << temperatures[temp_idx + 1]
                          << " (compression=" << compression_ratio
                          << ", logprob=" << avg_logprob << ")\n";
@@ -1659,7 +1660,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                         }
                     } catch (const std::exception& e) {
                         // Alignment failed - fall back to heuristic approach
-                        std::cerr << "[Muninn] Alignment failed, using heuristic: " << e.what() << "\n";
+                        muninn::mlog_warn() << "[Muninn] Alignment failed, using heuristic: " << e.what() << "\n";
                         alignment_data.clear();
                     }
                 }
@@ -1686,7 +1687,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
                         if (!seg.text.empty()) {
                             segments.push_back(seg);
-                            std::cout << "[Muninn] Segment [" << seg.start << "-" << seg.end << "]: "
+                            muninn::mlog() << "[Muninn] Segment [" << seg.start << "-" << seg.end << "]: "
                                      << seg.text.substr(0, std::min(size_t(80), seg.text.length())) << "\n";
                         }
                     }
@@ -1708,7 +1709,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
                     if (!segment.text.empty()) {
                         segments.push_back(segment);
-                        std::cout << "[Muninn] Chunk [" << segment.start << "-" << segment.end << "]: "
+                        muninn::mlog() << "[Muninn] Chunk [" << segment.start << "-" << segment.end << "]: "
                                  << segment.text.substr(0, std::min(size_t(80), segment.text.length())) << "\n";
                     }
                 }
@@ -1743,7 +1744,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
 
         // Bounds check to prevent crash on empty input
         if (batch_mel_features[0].empty() || batch_mel_features[0][0].empty()) {
-            std::cerr << "[Muninn] Warning: Empty mel features in batch, skipping\n";
+            muninn::mlog_warn() << "[Muninn] Warning: Empty mel features in batch, skipping\n";
             return all_segments;
         }
 
@@ -1967,20 +1968,20 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                                              avg_logprob, result.no_speech_prob, options)) {
                             if (!seg.text.empty()) {
                                 all_segments[b].push_back(seg);
-                                std::cout << "[Muninn] Batch[" << b << "] [" << seg.start << "-" << seg.end << "]: "
+                                muninn::mlog() << "[Muninn] Batch[" << b << "] [" << seg.start << "-" << seg.end << "]: "
                                          << seg.text.substr(0, std::min(size_t(60), seg.text.length())) << "\n";
 
                                 // Debug: Log hex bytes of first segment's text for encoding diagnosis
                                 if (b == 0 && all_segments[b].size() == 1) {
-                                    std::cout << "[Muninn] DEBUG encoding - first 40 bytes: ";
+                                    muninn::mlog() << "[Muninn] DEBUG encoding - first 40 bytes: ";
                                     for (size_t i = 0; i < std::min(size_t(40), seg.text.size()); i++) {
-                                        std::cout << std::hex << (static_cast<unsigned char>(seg.text[i]) >> 4);
-                                        std::cout << (static_cast<unsigned char>(seg.text[i]) & 0xF) << " ";
+                                        muninn::mlog() << std::hex << (static_cast<unsigned char>(seg.text[i]) >> 4);
+                                        muninn::mlog() << (static_cast<unsigned char>(seg.text[i]) & 0xF) << " ";
                                     }
-                                    std::cout << std::dec << "\n";
+                                    muninn::mlog() << std::dec << "\n";
                                 }
 
-                                std::cout.flush();
+                                muninn::mlog().flush();
                             }
                         }
                     }
@@ -1998,7 +1999,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                     if (!is_hallucination(segment, num_tokens, avg_logprob, result.no_speech_prob, options)) {
                         if (!segment.text.empty()) {
                             all_segments[b].push_back(segment);
-                            std::cout << "[Muninn] Batch[" << b << "] [" << segment.start << "-" << segment.end << "]: "
+                            muninn::mlog() << "[Muninn] Batch[" << b << "] [" << segment.start << "-" << segment.end << "]: "
                                      << segment.text.substr(0, std::min(size_t(60), segment.text.length())) << "\n";
                         }
                     }
@@ -2010,8 +2011,8 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
           }
         }
 
-        std::cout << "[Muninn] Batch complete\n";
-        std::cout.flush();
+        muninn::mlog() << "[Muninn] Batch complete\n";
+        muninn::mlog().flush();
 
     } catch (const std::exception& e) {
         Logger::error("Batch transcription failed: " + std::string(e.what()));
@@ -2403,7 +2404,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
     }
 
     float original_duration = audio_samples.size() / 16000.0f;
-    std::cout << "[Muninn] Audio: " << audio_samples.size() << " samples, duration: "
+    muninn::mlog() << "[Muninn] Audio: " << audio_samples.size() << " samples, duration: "
               << original_duration << "s\n";
 
     // Apply clip timestamps if specified
@@ -2421,7 +2422,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
             clipped_samples.assign(audio_samples.begin() + start_sample, audio_samples.begin() + end_sample);
             clip_offset = clip_start;
 
-            std::cout << "[Muninn] Clipping audio: " << clip_start << "s - " << clip_end << "s ("
+            muninn::mlog() << "[Muninn] Clipping audio: " << clip_start << "s - " << clip_end << "s ("
                       << clipped_samples.size() << " samples)\n";
         } else {
             clipped_samples = audio_samples;
@@ -2486,7 +2487,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
         }
 
         auto apply_energy_vad = [&]() {
-            std::cout << "[Muninn] Applying Energy VAD filter...\n";
+            muninn::mlog() << "[Muninn] Applying Energy VAD filter...\n";
             VADOptions vad_opts;
             vad_opts.threshold = options.vad_threshold;
             vad_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
@@ -2494,7 +2495,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
             vad_opts.speech_pad_ms = options.vad_speech_pad_ms;
             VAD vad(vad_opts);
             processed_samples = vad.filter_silence(clipped_samples, 16000, speech_segments);
-            std::cout << "[Muninn] Energy VAD: " << speech_segments.size() << " speech segments, "
+            muninn::mlog() << "[Muninn] Energy VAD: " << speech_segments.size() << " speech segments, "
                       << (processed_samples.size() / 16000.0f) << "s of speech\n";
         };
 
@@ -2510,15 +2511,15 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                 break;
 
             case VADType::Silero: {
-                std::cout << "[Muninn] Applying Silero VAD filter...\n";
+                muninn::mlog() << "[Muninn] Applying Silero VAD filter...\n";
 
                 if (!is_silero_vad_available()) {
-                    std::cerr << "[Muninn] Silero VAD not available, falling back to Energy VAD\n";
+                    muninn::mlog_warn() << "[Muninn] Silero VAD not available, falling back to Energy VAD\n";
                     use_energy_vad = true;
                     break;
                 }
                 if (options.silero_model_path.empty()) {
-                    std::cerr << "[Muninn] Silero model path not specified, falling back to Energy VAD\n";
+                    muninn::mlog_warn() << "[Muninn] Silero model path not specified, falling back to Energy VAD\n";
                     use_energy_vad = true;
                     break;
                 }
@@ -2549,10 +2550,10 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                         return prepared;
                     }
 
-                    std::cout << "[Muninn] Silero VAD: " << speech_segments.size() << " speech segments, "
+                    muninn::mlog() << "[Muninn] Silero VAD: " << speech_segments.size() << " speech segments, "
                               << (processed_samples.size() / 16000.0f) << "s of speech\n";
                 } catch (const std::exception& e) {
-                    std::cerr << "[Muninn] Silero VAD failed: " << e.what() << ", falling back to Energy VAD\n";
+                    muninn::mlog_warn() << "[Muninn] Silero VAD failed: " << e.what() << ", falling back to Energy VAD\n";
                     use_energy_vad = true;
                 }
                 break;
@@ -2566,15 +2567,15 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                 // Russian video, its output was character-for-character
                 // identical to vad_filter=false. ten_vad.cpp has been complete
                 // and compiled the whole time; nothing ever called it.
-                std::cout << "[Muninn] Applying TEN VAD filter...\n";
+                muninn::mlog() << "[Muninn] Applying TEN VAD filter...\n";
 
                 if (!is_ten_vad_available()) {
-                    std::cerr << "[Muninn] TEN VAD not available, falling back to Energy VAD\n";
+                    muninn::mlog_warn() << "[Muninn] TEN VAD not available, falling back to Energy VAD\n";
                     use_energy_vad = true;
                     break;
                 }
                 if (options.ten_vad_model_path.empty()) {
-                    std::cerr << "[Muninn] TEN model path not specified, falling back to Energy VAD\n";
+                    muninn::mlog_warn() << "[Muninn] TEN model path not specified, falling back to Energy VAD\n";
                     use_energy_vad = true;
                     break;
                 }
@@ -2610,17 +2611,17 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                         return prepared;
                     }
 
-                    std::cout << "[Muninn] TEN VAD: " << speech_segments.size() << " speech segments, "
+                    muninn::mlog() << "[Muninn] TEN VAD: " << speech_segments.size() << " speech segments, "
                               << (processed_samples.size() / 16000.0f) << "s of speech\n";
                 } catch (const std::exception& e) {
-                    std::cerr << "[Muninn] TEN VAD failed: " << e.what() << ", falling back to Energy VAD\n";
+                    muninn::mlog_warn() << "[Muninn] TEN VAD failed: " << e.what() << ", falling back to Energy VAD\n";
                     use_energy_vad = true;
                 }
                 break;
             }
 
             case VADType::WebRTC:
-                std::cerr << "[Muninn] WebRTC VAD not yet implemented, falling back to Energy VAD\n";
+                muninn::mlog_warn() << "[Muninn] WebRTC VAD not yet implemented, falling back to Energy VAD\n";
                 use_energy_vad = true;
                 break;
 
@@ -2724,7 +2725,7 @@ TranscribeResult Transcriber::transcribe(
             std::move(prepared), options,
             track_id, total_tracks, progress_callback);
     } catch (const std::exception& e) {
-        std::cerr << "[Muninn] Transcription failed: " << e.what() << "\n";
+        muninn::mlog_warn() << "[Muninn] Transcription failed: " << e.what() << "\n";
         throw;
     }
 }
@@ -2742,7 +2743,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
 
     auto check_cancelled = [this, &result]() -> bool {
         if (cancelled.load(std::memory_order_acquire)) {
-            std::cout << "[Muninn] Transcription cancelled\n";
+            muninn::mlog() << "[Muninn] Transcription cancelled\n";
             result.was_cancelled = true;
             return true;
         }
@@ -2816,7 +2817,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 progress_callback(track_id, total_tracks, 0.08f,
                     "Detecting language...");
             }
-            std::cout << "[Muninn] Detecting language from audio...\n";
+            muninn::mlog() << "[Muninn] Detecting language from audio...\n";
 
             // Use first 30s of mel features for language detection
             int detect_frames = std::min(n_frames, 3000);  // 30 seconds
@@ -2831,7 +2832,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 result.language = detected_lang;
                 result.language_probability = lang_prob;
             } catch (const std::exception& e) {
-                std::cerr << "[Muninn] Language detection failed: " << e.what()
+                muninn::mlog_warn() << "[Muninn] Language detection failed: " << e.what()
                           << ", defaulting to English\n";
                 effective_options.language = "en";
                 result.language = "en";
@@ -2918,7 +2919,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
             }
 
             int num_chunks = static_cast<int>(chunk_ranges.size());
-            std::cout << "[Muninn] Processing " << num_chunks << " chunk(s) with batch size " << BATCH_SIZE << "\n";
+            muninn::mlog() << "[Muninn] Processing " << num_chunks << " chunk(s) with batch size " << BATCH_SIZE << "\n";
 
             // Prepare all chunks upfront
             std::vector<std::vector<std::vector<float>>> all_chunk_features;
@@ -3016,7 +3017,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                     int current_batch_size = batch_end - batch_start;
                     int batch_num = batch_start / BATCH_SIZE + 1;
 
-                    std::cout << "[Muninn] Processing batch " << batch_num
+                    muninn::mlog() << "[Muninn] Processing batch " << batch_num
                               << "/" << total_batches
                               << " (chunks " << (batch_start + 1) << "-" << batch_end << ")\n";
 
@@ -3058,7 +3059,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                             "Transcribed batch " + std::to_string(batch_num) + "/" + std::to_string(total_batches)
                         );
                         if (!should_continue) {
-                            std::cout << "[Muninn] Transcription cancelled by callback\n";
+                            muninn::mlog() << "[Muninn] Transcription cancelled by callback\n";
                             result.was_cancelled = true;
                             return finish();
                         }
@@ -3076,7 +3077,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
 
         } else {
             // Single chunk processing (audio <= 30 seconds)
-            std::cout << "[Muninn] Audio short enough for single-pass transcription\n";
+            muninn::mlog() << "[Muninn] Audio short enough for single-pass transcription\n";
 
             // Report progress - Starting single-chunk transcription (10%)
             if (progress_callback) {
@@ -3239,7 +3240,7 @@ TranscribeResult Transcriber::transcribe(
 
         // Check for cancellation before each track
         if (pimpl_->cancelled.load(std::memory_order_acquire)) {
-            std::cout << "[Muninn] Transcription cancelled\n";
+            muninn::mlog() << "[Muninn] Transcription cancelled\n";
             combined_result.was_cancelled = true;
             break;
         }
@@ -3251,7 +3252,7 @@ TranscribeResult Transcriber::transcribe(
                 "Processing track " + std::to_string(track + 1) + "/" + std::to_string(track_count)
             );
             if (!should_continue) {
-                std::cout << "[Muninn] Transcription cancelled by user\n";
+                muninn::mlog() << "[Muninn] Transcription cancelled by user\n";
                 combined_result.was_cancelled = true;
                 break;
             }
@@ -3354,12 +3355,12 @@ TranscribeResult Transcriber::transcribe(
             if (combined_result.language == "auto" && !track_result.language.empty() && track_result.language != "auto") {
                 combined_result.language = track_result.language;
                 combined_result.language_probability = track_result.language_probability;
-                std::cout << "[Muninn] Detected language from track " << track << ": " << track_result.language
+                muninn::mlog() << "[Muninn] Detected language from track " << track << ": " << track_result.language
                           << " (confidence: " << (track_result.language_probability * 100.0f) << "%)\n";
             }
 
             Logger::info("Track " + std::to_string(track) + ": " + std::to_string(track_result.segments.size()) + " segment(s)");
-            std::cout.flush();
+            muninn::mlog().flush();
 
             // Report track completion (100%)
             if (progress_callback) {
@@ -3408,7 +3409,7 @@ TranscribeResult Transcriber::transcribe(
     // ═══════════════════════════════════════════════════════════
     if (options.enable_diarization && !options.diarization_model_path.empty()) {
         try {
-            std::cout << "\n[Muninn] Running speaker diarization...\n";
+            muninn::mlog() << "\n[Muninn] Running speaker diarization...\n";
 
             // Initialize diarizer
             DiarizationOptions diar_opts;
@@ -3439,19 +3440,19 @@ TranscribeResult Transcriber::transcribe(
 
                 if (!has_segments) continue;
 
-                std::cout << "[Diarization] Processing Track " << track << "...\n";
+                muninn::mlog() << "[Diarization] Processing Track " << track << "...\n";
 
                 // Extract audio for this track
                 std::vector<float> track_audio;
                 if (!diar_extractor.extract_track(track, track_audio)) {
-                    std::cerr << "[Diarization] WARNING: Failed to extract track " << track << "\n";
+                    muninn::mlog_warn() << "[Diarization] WARNING: Failed to extract track " << track << "\n";
                     continue;
                 }
 
                 // Run diarization
                 auto diar_result = diarizer.diarize(track_audio.data(), track_audio.size(), 16000);
 
-                std::cout << "[Diarization] Track " << track << ": Detected "
+                muninn::mlog() << "[Diarization] Track " << track << ": Detected "
                           << diar_result.num_speakers << " speaker(s)\n";
 
                 track_diarization[track] = diar_result;
@@ -3478,11 +3479,11 @@ TranscribeResult Transcriber::transcribe(
                 }
             }
 
-            std::cout << "[Muninn] ✓ Speaker diarization complete\n";
+            muninn::mlog() << "[Muninn] ✓ Speaker diarization complete\n";
 
         } catch (const std::exception& e) {
-            std::cerr << "[Muninn] Warning: Diarization failed: " << e.what() << "\n";
-            std::cerr << "[Muninn] Continuing without speaker labels...\n";
+            muninn::mlog_warn() << "[Muninn] Warning: Diarization failed: " << e.what() << "\n";
+            muninn::mlog_warn() << "[Muninn] Continuing without speaker labels...\n";
         }
     }
 
@@ -3551,7 +3552,7 @@ Transcriber::DeviceInfo Transcriber::get_device_info() const {
 
 void Transcriber::cancel() {
     pimpl_->cancelled.store(true, std::memory_order_release);
-    std::cout << "[Muninn] Cancellation requested\n";
+    muninn::mlog() << "[Muninn] Cancellation requested\n";
 }
 
 void Transcriber::reset_cancel() {
