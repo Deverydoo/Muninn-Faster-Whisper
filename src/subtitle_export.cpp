@@ -302,6 +302,41 @@ int single_track_id(const std::vector<Segment>& segments) {
     return segments.empty() ? 0 : segments.front().track_id;
 }
 
+// Open a subtitle file for writing. Honours overwrite_existing.
+std::ofstream open_output(const std::string& output_path,
+                          const SubtitleExportOptions& options,
+                          const char* what) {
+    const std::filesystem::path path = utf8_path(output_path);
+    std::error_code ec;
+    if (!options.overwrite_existing && std::filesystem::exists(path, ec)) {
+        throw std::runtime_error(std::string(what) + " file already exists and overwrite_existing "
+                                 "is false: " + output_path);
+    }
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        throw std::runtime_error(std::string("Failed to create ") + what + " file: " + output_path);
+    }
+    return file;
+}
+
+// ASS text: { } and \ would start override tags or escapes, so they get a
+// backslash in front (what FFmpeg does); a line break becomes \N.
+std::string escape_ass_text(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        if (c == '{' || c == '}' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n') {
+            out += "\\N";
+        } else if (c != '\r') {
+            out += c;
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════
@@ -316,6 +351,8 @@ std::string SubtitleExporter::export_subtitles(const std::vector<Segment>& segme
             return export_srt(segments, video_path, options);
         case SubtitleFormat::VTT:
             return export_vtt(segments, video_path, options);
+        case SubtitleFormat::ASS:
+            return export_ass(segments, video_path, options);
         default:
             throw std::runtime_error("Unsupported subtitle format");
     }
@@ -336,6 +373,29 @@ std::vector<SubtitleEntry> SubtitleExporter::build_entries(const std::vector<Seg
     if (options.enable_korean_mode)     return segment_korean(segments, options);
     if (options.enable_japanese_mode)   return segment_japanese(segments, options);
 
+    // No mode flag set: the language code can pick one.
+    if (!options.language.empty()) {
+        SubtitleExportOptions chosen = options;
+        chosen.language.clear();
+        const std::string& code = options.language;
+        const std::string base = code.substr(0, code.find_first_of("-_"));
+        if (base == "ja") chosen.enable_japanese_mode = true;
+        else if (base == "ko") chosen.enable_korean_mode = true;
+        else if (base == "zh") {
+            chosen.enable_chinese_mode = true;
+            chosen.chinese_traditional = (code == "zh-TW" || code == "zh-HK" || code == "zh-Hant" ||
+                                          code == "zh_TW" || code == "zh_HK");
+        }
+        else if (base == "ru") chosen.enable_russian_mode = true;
+        else if (base == "es" || base == "pt") chosen.enable_spanish_mode = true;
+        else if (base == "ar") chosen.enable_arabic_mode = true;
+        else if (base == "hi") chosen.enable_hindi_mode = true;
+        else if (base == "id") chosen.enable_indonesian_mode = true;
+        else if (base == "vi") chosen.enable_vietnamese_mode = true;
+        else if (base == "th") chosen.enable_thai_mode = true;
+        return build_entries(segments, chosen);
+    }
+
     // Standard segment-based subtitles
     return segments_to_entries(segments, options);
 }
@@ -349,10 +409,7 @@ std::string SubtitleExporter::export_srt(const std::vector<Segment>& segments,
 
     const std::vector<SubtitleEntry> entries = build_entries(segments, options);
 
-    std::ofstream file(utf8_path(output_path));
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to create SRT file: " + output_path);
-    }
+    std::ofstream file = open_output(output_path, options, "SRT");
 
     for (const auto& entry : entries) {
         file << format_srt_entry(entry);
@@ -372,10 +429,7 @@ std::string SubtitleExporter::export_vtt(const std::vector<Segment>& segments,
 
     const std::vector<SubtitleEntry> entries = build_entries(segments, options);
 
-    std::ofstream file(utf8_path(output_path));
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to create VTT file: " + output_path);
-    }
+    std::ofstream file = open_output(output_path, options, "VTT");
 
     // VTT header
     file << "WEBVTT\n\n";
@@ -393,11 +447,54 @@ std::string SubtitleExporter::export_vtt(const std::vector<Segment>& segments,
             file << "}\n\n";
         }
     }
+    if (options.vtt_include_confidence_styling) {
+        file << "STYLE\n";
+        file << "::cue(.uncertain) {\n";
+        file << "  color: #ff8080;\n";
+        file << "}\n\n";
+    }
 
     // Write cues
     for (const auto& entry : entries) {
         file << format_vtt_entry(entry, options);
         file << "\n";  // Blank line between cues
+    }
+
+    file.close();
+    return output_path;
+}
+
+std::string SubtitleExporter::export_ass(const std::vector<Segment>& segments,
+                                        const std::string& video_path,
+                                        const SubtitleExportOptions& options) {
+    const std::string output_path = options.output_path.empty() ?
+        generate_output_path(video_path, SubtitleFormat::ASS) :
+        options.output_path;
+
+    const std::vector<SubtitleEntry> entries = build_entries(segments, options);
+
+    std::ofstream file = open_output(output_path, options, "ASS");
+
+    file << "[Script Info]\n"
+            "; Written by Muninn\n"
+            "ScriptType: v4.00+\n"
+            "PlayResX: 1920\n"
+            "PlayResY: 1080\n"
+            "WrapStyle: 0\n"
+            "ScaledBorderAndShadow: yes\n"
+            "\n"
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+            "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+            "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            "Style: Default,Arial,64,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+            "0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1\n"
+            "\n"
+            "[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
+    for (const auto& entry : entries) {
+        file << format_ass_entry(entry);
     }
 
     file.close();
@@ -563,38 +660,111 @@ std::string SubtitleExporter::format_vtt_entry(const SubtitleEntry& entry,
     oss << format_vtt_timestamp(entry.start) << " --> "
         << format_vtt_timestamp(entry.end) << "\n";
 
-    // Text with optional voice tags
-    if (options.vtt_include_word_timestamps && !entry.words.empty()) {
-        // Word-level timing with <v> tags
-        std::string voice_tag = entry.speaker_id >= 0 ?
-            ("Speaker" + std::to_string(entry.speaker_id)) : "Default";
-
-        oss << "<v " << voice_tag << ">";
-
-        for (const auto& word : entry.words) {
-            oss << escape_markup(word.word);
-            if (&word != &entry.words.back()) {
-                oss << " ";
-            }
-        }
-
-        oss << "</v>\n";
-
-    } else if (options.vtt_include_speaker_colors && entry.speaker_id >= 0) {
-        // Speaker voice tag (for styling)
-        std::string voice_tag = "Speaker" + std::to_string(entry.speaker_id);
-        oss << "<v " << voice_tag << ">" << escape_markup(entry.text) << "</v>\n";
-
-    } else {
-        // Plain text
-        oss << escape_markup(entry.text) << "\n";
+    const bool voice = entry.speaker_id >= 0 &&
+                       (options.vtt_include_speaker_colors || options.vtt_include_word_timestamps);
+    if (voice) {
+        oss << "<v Speaker" << entry.speaker_id << ">";
     }
+
+    const bool per_word = !entry.words.empty() &&
+                          (options.vtt_include_word_timestamps || options.vtt_include_confidence_styling);
+    if (per_word) {
+        // Words are written one by one so each can carry its own timestamp
+        // tag (<00:00:01.250>, the time it is spoken) and confidence class.
+        // Line breaks fall where the cue text has them: after the word that
+        // fills a line's characters. Words are separated by a space only when
+        // the cue text has spaces (not for Chinese, Japanese or Thai).
+        const std::vector<std::string> lines = non_empty_lines(entry.text);
+        std::vector<size_t> line_ends;  // visible characters up to the end of each line
+        size_t running = 0;
+        for (const auto& line : lines) {
+            running += count_visible_code_points(line);
+            line_ends.push_back(running);
+        }
+        const bool spaced = entry.text.find(' ') != std::string::npos;
+
+        size_t written = 0;
+        size_t line = 0;
+        float last_tag = entry.start;
+        for (size_t i = 0; i < entry.words.size(); ++i) {
+            const Word& word = entry.words[i];
+            const size_t begin = word.word.find_first_not_of(' ');
+            const std::string text = (begin == std::string::npos) ? "" : word.word.substr(begin);
+            if (text.empty()) continue;
+
+            if (written > 0) {
+                if (line + 1 < line_ends.size() && written >= line_ends[line]) {
+                    oss << "\n";
+                    ++line;
+                } else if (spaced) {
+                    oss << " ";
+                }
+            }
+
+            // Timestamp tags must lie inside the cue and never go backwards.
+            if (options.vtt_include_word_timestamps && written > 0) {
+                float t = std::max(word.start, last_tag);
+                t = std::min(std::max(t, entry.start), entry.end);
+                oss << "<" << format_vtt_timestamp(t) << ">";
+                last_tag = t;
+            }
+
+            const bool uncertain = options.vtt_include_confidence_styling && word.probability < 0.5f;
+            if (uncertain) oss << "<c.uncertain>";
+            oss << escape_markup(text);
+            if (uncertain) oss << "</c>";
+
+            written += count_visible_code_points(text);
+        }
+    } else {
+        oss << escape_markup(entry.text);
+    }
+
+    if (voice) {
+        oss << "</v>";
+    }
+    oss << "\n";
 
     return oss.str();
 }
 
 std::string SubtitleExporter::format_vtt_timestamp(float seconds) {
     return format_hmsm(seconds, '.');
+}
+
+// ═══════════════════════════════════════════════════════════
+// ASS Formatting
+// ═══════════════════════════════════════════════════════════
+
+std::string SubtitleExporter::format_ass_timestamp(float seconds) {
+    long long total_cs = 0;
+    if (std::isfinite(seconds) && seconds > 0.0f) {
+        total_cs = std::llround(static_cast<double>(seconds) * 100.0);
+    }
+    const long long hours = total_cs / 360000LL;
+    const long long minutes = (total_cs / 6000LL) % 60LL;
+    const long long secs = (total_cs / 100LL) % 60LL;
+    const long long centis = total_cs % 100LL;
+
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%lld:%02lld:%02lld.%02lld", hours, minutes, secs, centis);
+    return buf;
+}
+
+std::string SubtitleExporter::format_ass_entry(const SubtitleEntry& entry) {
+    // The Name field is one CSV column, so it can't hold a comma.
+    std::string name = entry.speaker_label;
+    if (name.empty() && entry.speaker_id >= 0) {
+        name = "Speaker " + std::to_string(entry.speaker_id);
+    }
+    std::replace(name.begin(), name.end(), ',', ' ');
+    std::replace(name.begin(), name.end(), '\n', ' ');
+
+    std::ostringstream oss;
+    oss << "Dialogue: 0," << format_ass_timestamp(entry.start) << ","
+        << format_ass_timestamp(entry.end) << ",Default," << name << ",0,0,0,,"
+        << escape_ass_text(entry.text) << "\n";
+    return oss.str();
 }
 
 // ═══════════════════════════════════════════════════════════
