@@ -431,6 +431,36 @@ if(BUILD_TESTS)
     add_executable(muninn_accuracy tests/muninn_accuracy.cpp)
     target_link_libraries(muninn_accuracy PRIVATE muninn)
 
+    # Checks that need no model and no GPU (decode, mel, energy VAD, subtitles).
+    add_executable(test_core tests/test_core.cpp)
+    target_link_libraries(test_core PRIVATE muninn)
+    if(SILERO_VAD_ENABLED)
+        target_compile_definitions(test_core PRIVATE MUNINN_TEST_EXPECT_SILERO)
+    endif()
+
+    # ctest labels:
+    #   cpu    needs nothing but the build (CI runs: ctest -L cpu)
+    #   model  needs a Whisper model; registered only when MUNINN_TEST_MODEL
+    #          and MUNINN_TEST_AUDIO are set
+    #   gpu    needs a CUDA GPU
+    enable_testing()
+    add_test(NAME core COMMAND test_core)
+    set_tests_properties(core PROPERTIES LABELS "cpu")
+
+    set(MUNINN_TEST_MODEL "" CACHE PATH "Whisper model folder for the model tests (empty = not registered)")
+    set(MUNINN_TEST_AUDIO "" CACHE FILEPATH "Audio or video file for the model tests")
+    if(MUNINN_TEST_MODEL AND MUNINN_TEST_AUDIO)
+        add_test(NAME transcribe_file COMMAND muninn_test_app "${MUNINN_TEST_MODEL}" "${MUNINN_TEST_AUDIO}")
+        set_tests_properties(transcribe_file PROPERTIES LABELS "model;gpu")
+    endif()
+
+    # A dynamic FFmpeg's DLLs live in FFMPEG_DIR/bin, not beside the tests.
+    if(FFMPEG_DIR AND NOT FFMPEG_STATIC)
+        get_property(_muninn_tests DIRECTORY PROPERTY TESTS)
+        set_tests_properties(${_muninn_tests} PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${FFMPEG_DIR}/bin")
+    endif()
+
     # Ensure test apps can find DLLs
     if(BUILD_SHARED_LIBS)
         set_target_properties(muninn_test_app PROPERTIES
