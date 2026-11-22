@@ -17,6 +17,7 @@
 #include <iostream>
 #include <thread>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 #include <atomic>
@@ -185,6 +186,14 @@ public:
                   << ", eot=" << eot_id << ", timestamp_begin=" << timestamp_begin << "\n";
     }
 
+    // Whisper's start sequence: <|startoftranscript|> <|xx|> <|task|> for a
+    // multilingual model, <|startoftranscript|> alone for an English-only one
+    // (it has no language or task tokens; they used to be sent anyway).
+    std::vector<std::string> sot_sequence(const TranscribeOptions& options) const {
+        if (model && !model->is_multilingual()) return {"<|startoftranscript|>"};
+        return {"<|startoftranscript|>", "<|" + options.language + "|>", "<|" + options.task + "|>"};
+    }
+
     // Detect language from mel-spectrogram features
     std::pair<std::string, float> detect_language(
         const std::vector<std::vector<float>>& mel_features
@@ -197,19 +206,23 @@ public:
 
         int n_frames = mel_features.size();
         int n_mels = mel_features[0].size();
+        // Padded to 30 s like a decode window (faster-whisper does the same):
+        // a short unpadded input skews the guess.
+        const int padded_frames = std::max(n_frames, 3000);
 
         // Flatten and transpose mel features for CTranslate2
         std::vector<float> flat_features;
-        flat_features.reserve(n_frames * n_mels);
+        flat_features.reserve(static_cast<size_t>(padded_frames) * n_mels);
 
         for (int mel = 0; mel < n_mels; mel++) {
             for (int frame = 0; frame < n_frames; frame++) {
                 flat_features.push_back(mel_features[frame][mel]);
             }
+            flat_features.insert(flat_features.end(), padded_frames - n_frames, 0.0f);
         }
 
         ctranslate2::StorageView features(
-            ctranslate2::Shape{1, static_cast<ctranslate2::dim_t>(n_mels), static_cast<ctranslate2::dim_t>(n_frames)},
+            ctranslate2::Shape{1, static_cast<ctranslate2::dim_t>(n_mels), static_cast<ctranslate2::dim_t>(padded_frames)},
             flat_features
         );
 
@@ -1408,11 +1421,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
         // string up as ONE vocabulary entry, so a sentence passed as a string
         // became a single unknown token (and it used to come after the task
         // token, where Whisper reads it as already-transcribed speech).
-        std::vector<std::string> prompt_tokens = {
-            "<|startoftranscript|>",
-            "<|" + options.language + "|>",  // Language token
-            "<|" + options.task + "|>"       // Task token
-        };
+        std::vector<std::string> prompt_tokens = sot_sequence(options);
 
         // Previous output, unless it came from a high-temperature (unreliable) decode.
         bool should_use_context = options.condition_on_previous && !previous_tokens.empty();
@@ -1676,8 +1685,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                         seg.avg_logprob = avg_logprob;
                         seg.no_speech_prob = result.no_speech_prob;
                         seg.temperature = used_temperature;
-                        seg.compression_ratio = static_cast<float>(num_tokens) /
-                            static_cast<float>(std::max(1, static_cast<int>(seg.text.length())));
+                        seg.compression_ratio = compression_ratio;   // the window's, as faster-whisper reports it
 
                         // Check for hallucinations
                         if (is_hallucination(seg, num_tokens / std::max(size_t(1), timestamped_segs.size()),
@@ -1789,11 +1797,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         // Prepare prompts for each batch item (same prompt for all)
         std::vector<std::vector<std::string>> prompts;
         for (size_t b = 0; b < batch_size; ++b) {
-            prompts.push_back({
-                "<|startoftranscript|>",
-                "<|" + options.language + "|>",
-                "<|" + options.task + "|>"
-            });
+            prompts.push_back(sot_sequence(options));
         }
 
         // Configure Whisper options
@@ -1958,11 +1962,11 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
 
                 if (!timestamped_segs.empty()) {
                     // Use Whisper's native timestamp tokens
+                    const float window_ratio = compression_ratio_of(extract_text(result.sequences[0]));
                     for (auto& seg : timestamped_segs) {
                         seg.avg_logprob = avg_logprob;
                         seg.no_speech_prob = result.no_speech_prob;
-                        seg.compression_ratio = static_cast<float>(num_tokens) /
-                            static_cast<float>(std::max(1, static_cast<int>(seg.text.length())));
+                        seg.compression_ratio = window_ratio;
 
                         if (!is_hallucination(seg, num_tokens / std::max(size_t(1), timestamped_segs.size()),
                                              avg_logprob, result.no_speech_prob, options)) {
@@ -1993,8 +1997,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                     segment.text = extract_text(result.sequences[0]);
                     segment.avg_logprob = avg_logprob;
                     segment.no_speech_prob = result.no_speech_prob;
-                    segment.compression_ratio = static_cast<float>(num_tokens) /
-                                               static_cast<float>(std::max(1, static_cast<int>(segment.text.length())));
+                    segment.compression_ratio = compression_ratio_of(segment.text);
 
                     if (!is_hallucination(segment, num_tokens, avg_logprob, result.no_speech_prob, options)) {
                         if (!segment.text.empty()) {
@@ -2288,6 +2291,27 @@ Transcriber::Transcriber(
         // Initialize token IDs for word-level alignment
         pimpl_->initialize_token_ids();
 
+        // config.json keys CTranslate2 relies on without saying so: with no
+        // suppress_ids it suppresses nothing (music notes, "(music)" come
+        // through), and without alignment_heads word timings are poor.
+        // faster-whisper refuses such a model; Muninn says what's missing.
+        {
+            std::ifstream cfg(std::filesystem::u8path(model_path) / "config.json", std::ios::binary);
+            if (cfg) {
+                const std::string text((std::istreambuf_iterator<char>(cfg)), std::istreambuf_iterator<char>());
+                std::vector<std::string> keys = {"suppress_ids", "suppress_ids_begin", "alignment_heads"};
+                if (is_multilingual) keys.push_back("lang_ids");
+                for (const auto& key : keys) {
+                    if (text.find("\"" + key + "\"") == std::string::npos) {
+                        Logger::warn("The model's config.json has no \"" + key + "\"; results may be worse. "
+                                     "Re-convert the model with a current ct2-transformers-converter.");
+                    }
+                }
+            } else {
+                Logger::warn("The model has no config.json; tokens won't be suppressed as Whisper expects");
+            }
+        }
+
         Logger::info("Model loaded successfully");
 
     } catch (const std::exception& e) {
@@ -2484,6 +2508,14 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                 hint = it->second;
             }
             effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks, hint);
+        }
+
+        if (effective_vad_type == VADType::TEN) {
+            // TEN feeds raw audio to a model that expects features and state,
+            // so it always threw and fell back. Until it's implemented
+            // properly, Silero (the same kind of detector) stands in.
+            Logger::warn("TEN VAD isn't available yet; using Silero VAD");
+            effective_vad_type = VADType::Silero;
         }
 
         auto apply_energy_vad = [&]() {
@@ -2789,6 +2821,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 }
             }
         }
+        for (size_t i = 0; i < result.segments.size(); ++i) result.segments[i].id = static_cast<int>(i);
         result.failed_windows = failed_windows;
         if (failed_windows > 0) {
             result.error = last_error;
@@ -2819,28 +2852,55 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
             }
             muninn::mlog() << "[Muninn] Detecting language from audio...\n";
 
-            // Use first 30s of mel features for language detection
-            int detect_frames = std::min(n_frames, 3000);  // 30 seconds
-            std::vector<std::vector<float>> detect_mel(
-                mel_features.begin(),
-                mel_features.begin() + detect_frames
-            );
-
-            try {
-                auto [detected_lang, lang_prob] = detect_language(detect_mel);
-                effective_options.language = detected_lang;
-                result.language = detected_lang;
-                result.language_probability = lang_prob;
-            } catch (const std::exception& e) {
-                muninn::mlog_warn() << "[Muninn] Language detection failed: " << e.what()
-                          << ", defaulting to English\n";
+            // Up to three 30 s windows (start, middle, end) and a vote weighted
+            // by confidence: the first 30 s alone is often intro music or a
+            // game's title screen.
+            std::vector<int> starts = {0};
+            if (n_frames > 6000) starts.push_back(n_frames / 2 - 1500);
+            if (n_frames > 3000) starts.push_back(n_frames - 3000);
+            std::map<std::string, float> votes;
+            int answered = 0;
+            for (int s : starts) {
+                const int e = std::min(n_frames, s + 3000);
+                std::vector<std::vector<float>> detect_mel(mel_features.begin() + s, mel_features.begin() + e);
+                try {
+                    auto [lang, prob] = detect_language(detect_mel);
+                    if (prob > 0.0f) {
+                        votes[lang] += prob;
+                        ++answered;
+                    }
+                } catch (const std::exception& e) {
+                    Logger::warn("Language detection failed on one window: " + std::string(e.what()));
+                }
+            }
+            if (votes.empty()) {
+                Logger::warn("Language detection gave no answer; transcribing as English");
                 effective_options.language = "en";
                 result.language = "en";
                 result.language_probability = 0.0f;
+            } else {
+                auto best = std::max_element(votes.begin(), votes.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; });
+                effective_options.language = best->first;
+                result.language = best->first;
+                result.language_probability = best->second / static_cast<float>(answered);
             }
+        } else if (!model->is_multilingual()) {
+            // English-only model: always English, whatever was asked.
+            effective_options.language = "en";
+            result.language = "en";
+            result.language_probability = 1.0f;
         } else {
             result.language = options.language;
             result.language_probability = 1.0f;
+        }
+
+        // A language this model doesn't know used to become the unknown
+        // token and decode as garbage. faster-whisper raises; so does Muninn.
+        if (model->is_multilingual() && !token_to_id.empty() &&
+            token_to_id.find("<|" + effective_options.language + "|>") == token_to_id.end()) {
+            throw std::invalid_argument("This model doesn't support the language '" +
+                                        effective_options.language + "'");
         }
         perf_log("language detection");
 
@@ -3121,7 +3181,7 @@ TranscribeResult Transcriber::transcribe(
 
     combined_result.duration = duration;
     combined_result.language = options.language;
-    combined_result.language_probability = 1.0f;
+    combined_result.language_probability = options.language == "auto" ? 0.0f : 1.0f;
 
     // Phase A: parallel audio extraction.
     //
@@ -3352,7 +3412,9 @@ TranscribeResult Transcriber::transcribe(
             // This is critical for translation - when language is "auto", Whisper detects
             // the actual language (e.g., "en", "ja", "ko") and we need to preserve that
             // for NLLB translation to work correctly
-            if (combined_result.language == "auto" && !track_result.language.empty() && track_result.language != "auto") {
+            if (options.language == "auto" && !track_result.language.empty() && track_result.language != "auto" &&
+                (combined_result.language == "auto" ||
+                 track_result.language_probability > combined_result.language_probability)) {
                 combined_result.language = track_result.language;
                 combined_result.language_probability = track_result.language_probability;
                 muninn::mlog() << "[Muninn] Detected language from track " << track << ": " << track_result.language
@@ -3397,6 +3459,11 @@ TranscribeResult Transcriber::transcribe(
     extractor.close();
 
     Logger::info("All tracks complete. Total segments: " + std::to_string(combined_result.segments.size()));
+
+    // Ids in output order (they were all 0).
+    for (size_t i = 0; i < combined_result.segments.size(); ++i) {
+        combined_result.segments[i].id = static_cast<int>(i);
+    }
 
     // Nothing worked at all: an error, not an empty transcript.
     if (combined_result.failed_tracks > 0 && combined_result.segments.empty() &&
