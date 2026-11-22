@@ -1,0 +1,115 @@
+THIRD-PARTY SOFTWARE IN THE MUNINN BINARIES
+==========================================
+
+The Muninn binaries are built with the components below. Each is under its
+own license, and nothing in Muninn's license limits the rights those licenses
+give you. Full license texts are in the "licenses" folder next to this file.
+
+
+CTranslate2 4.8.3 (bin/ctranslate2.dll)
+---------------------------------------
+License: MIT. Copyright (c) 2019 OpenNMT.     licenses/CTranslate2-LICENSE.txt
+Source:  https://github.com/OpenNMT/CTranslate2/tree/v4.8.3
+Built with Muninn's local changes (patches/ctranslate2-v4.8.3-local.patch in
+the Muninn repository; build options in patches/README.md), CUDA 13.2.
+
+Built into ctranslate2.dll:
+  - cpu_features (Google)          Apache 2.0   licenses/cpu_features-LICENSE.txt
+  - spdlog, with its bundled fmt   MIT          licenses/spdlog-LICENSE.txt
+  - Thrust / CUB / libcu++ (NVIDIA)
+                                   Apache 2.0 (libcu++ with LLVM exceptions),
+                                   parts BSD    licenses/thrust-LICENSE.txt
+  - CUTLASS headers (NVIDIA)       BSD 3-Clause licenses/cutlass-LICENSE.txt
+
+
+ONNX Runtime 1.31.0 (bin/onnxruntime.dll, lib/onnxruntime.lib, include/onnxruntime)
+-------------------------------------------------------------------------------
+License: MIT. Copyright (c) Microsoft Corporation.
+         licenses/onnxruntime-LICENSE.txt
+         licenses/onnxruntime-ThirdPartyNotices.txt
+The CPU package (Microsoft.ML.OnnxRuntime 1.31.0), unmodified.
+
+
+FFmpeg 9.0.2 (bin/avformat-63.dll, avcodec-63.dll, avutil-61.dll, swresample-7.dll)
+----------------------------------------------------------------------------------
+License: GNU Lesser General Public License, version 2.1 or later.
+         licenses/LGPL-2.1.txt, licenses/FFmpeg-LICENSE.md
+Copyright (C) the FFmpeg developers. FFmpeg is a trademark of Fabrice Bellard.
+Website: https://ffmpeg.org/
+
+Built LGPL-only: no --enable-gpl, no --enable-nonfree. Source: the unmodified
+release tarball
+
+  https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+
+built with the MSVC toolchain (Visual Studio 2022, /MD) and this configure
+line:
+
+  --toolchain=msvc --target-os=win64 --arch=x86_64 --enable-shared
+  --disable-static --disable-debug --disable-programs --disable-doc
+  --disable-htmlpages --disable-manpages --disable-podpages --disable-txtpages
+  --enable-libass --enable-libdav1d --enable-ffnvcodec --enable-nvenc
+  --enable-nvdec --enable-cuvid --disable-filter=gfxcapture
+  --pkg-config-flags=--static --extra-cflags=-MD --extra-cxxflags=-MD
+
+Built into the FFmpeg DLLs included here (static libraries from vcpkg):
+  - dav1d 1.5.4 (avcodec)          BSD 2-Clause licenses/dav1d-COPYING.txt
+  - zlib 1.3.2 (avcodec, avformat) zlib License licenses/zlib-LICENSE.txt
+  - nv-codec-headers (avcodec)     MIT          licenses/nv-codec-headers-LICENSE.txt
+    (NVIDIA's encode/decode headers; the driver is loaded at run time)
+libass and its dependencies, also in that configure line, go into avfilter,
+which Muninn does not use and which is not included.
+
+The FFmpeg libraries are separate DLLs, and muninn.dll loads them by name.
+You may replace them with your own build of FFmpeg 9.0.x (same major library
+versions: avformat 63, avcodec 63, avutil 61, swresample 7). Muninn's source
+is public, so you can also rebuild muninn.dll against another FFmpeg
+(LGPL 2.1 section 6).
+
+
+SentencePiece (inside muninn.dll)
+---------------------------------
+License: Apache 2.0. Copyright Google LLC.     licenses/sentencepiece-LICENSE.txt
+Source:  https://github.com/google/sentencepiece (commit c40fb66), static.
+It includes:
+  - Abseil (parts)                 Apache 2.0   licenses/sentencepiece-absl-LICENSE.txt
+  - protobuf-lite                  BSD 3-Clause licenses/sentencepiece-protobuf-lite-LICENSE.txt
+  - darts-clone                    BSD 2-Clause licenses/sentencepiece-darts_clone-LICENSE.txt
+  - esaxx                          MIT          licenses/sentencepiece-esaxx-LICENSE.txt
+
+
+Silero VAD v6.2 (models/silero_vad.onnx)
+----------------------------------------
+License: MIT. Copyright (c) 2020-present Silero Team.
+         licenses/silero-vad-LICENSE.txt
+Source:  https://github.com/snakers4/silero-vad (src/silero_vad/data/silero_vad.onnx)
+
+
+faster-whisper and Whisper
+--------------------------
+Muninn ports faster-whisper's transcription method to C++, and uses
+Whisper's audio front end (mel filters, tokenizer conventions).
+
+  faster-whisper: MIT License. Copyright (c) 2023 SYSTRAN.
+  Whisper:        MIT License. Copyright (c) 2022 OpenAI.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions: The above copyright
+  notice and this permission notice shall be included in all copies or
+  substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
+  WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+  THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+Not included: NVIDIA CUDA and cuDNN
+-----------------------------------
+ctranslate2.dll needs the CUDA 13 runtime (cudart, cuBLAS) and cuDNN 9, which
+you install yourself from NVIDIA under NVIDIA's own license agreements.
