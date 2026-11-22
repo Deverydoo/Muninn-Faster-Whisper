@@ -504,13 +504,14 @@ if(BUILD_EXAMPLES)
     add_executable(translation_example examples/translation_example.cpp)
     target_link_libraries(translation_example PRIVATE muninn)
 
-    # Diarization example (requires ONNX Runtime and StreamingTranscriber)
-    if(SILERO_VAD_ENABLED)
-        # Note: diarization_streaming disabled until streaming_transcriber.cpp is fixed
-        # add_executable(diarization_streaming examples/diarization_streaming.cpp)
-        # target_include_directories(diarization_streaming PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        # target_link_libraries(diarization_streaming PRIVATE muninn ${ONNXRUNTIME_LIB})
+    # Streaming: live captions with word highlighting, and live translation to
+    # English. Both play an audio file in real time: <model> <audio> [device]
+    add_executable(karaoke_captions examples/karaoke_captions.cpp)
+    target_link_libraries(karaoke_captions PRIVATE muninn)
+    add_executable(translation_streaming examples/translation_streaming.cpp)
+    target_link_libraries(translation_streaming PRIVATE muninn)
 
+    if(SILERO_VAD_ENABLED)
         add_executable(subtitle_export examples/subtitle_export.cpp)
         target_include_directories(subtitle_export PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
         target_link_libraries(subtitle_export PRIVATE muninn ${ONNXRUNTIME_LIB})
