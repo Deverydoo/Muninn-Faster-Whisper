@@ -39,18 +39,36 @@ struct TranslationOptions {
 };
 
 /**
+ * @brief What translate_batch_result() returns
+ *
+ * texts has one entry per input, in input order. An entry is "" when its input
+ * was empty or whitespace, when it failed, or when it was never reached
+ * because the batch was cancelled or the language isn't supported. It is never
+ * the untranslated source text (except when source and target are the same
+ * language, where the source is the correct answer).
+ */
+struct TranslationBatchResult {
+    std::vector<std::string> texts;
+    bool cancelled = false;     // cancel() or unload_model() stopped the batch before every item was done
+    size_t failed_count = 0;    // non-empty inputs left "" (errors, cancellation, unsupported language)
+    std::string error;          // the first error, "" when there was none
+};
+
+/**
  * @brief Text translator using NLLB-200 model via CTranslate2
  *
- * Supports translation between 15 major world languages:
- * - Latin-script: English, Spanish, French, German, Italian, Portuguese, Vietnamese
- * - Cyrillic: Russian, Ukrainian
- * - Asian: Chinese (Simplified), Japanese, Korean, Thai
- * - Other: Arabic, Hindi
+ * Language codes are Whisper-style short codes ("en", "ja"). Case and region
+ * are ignored when only the base language is mapped: "EN", "en-US" and "en_us"
+ * all mean English. "zh-TW"/"zh-Hant" mean Traditional Chinese.
  *
  * Thread Safety:
  * - Static methods (supported_languages, to_nllb_code, from_nllb_code) are thread-safe
- * - Instance methods are NOT thread-safe for concurrent calls on the same instance
- * - For multi-threaded use, create one Translator per thread or use external synchronization
+ * - translate_batch() holds a shared lock on the model for the whole decode,
+ *   and unload_model()/shutdown() take it exclusively, so unloading while a
+ *   batch runs waits for (and shortens) that batch instead of freeing the
+ *   model under it. cancel() may be called from any thread.
+ * - Destroying the Translator while another thread is still inside one of its
+ *   methods is not allowed.
  *
  * Performance Tips:
  * - Use translate_batch() instead of calling translate() in a loop (5-10x faster)
@@ -71,16 +89,22 @@ public:
     /**
      * @brief Initialize translator with NLLB model
      *
-     * @param model_path Path to CTranslate2-converted NLLB model directory
+     * @param model_path Path to CTranslate2-converted NLLB model directory (UTF-8).
+     *                   It must contain sentencepiece.bpe.model.
      * @param device "cuda" or "cpu" (default: "cuda")
-     * @param compute_type "float16", "int8", "float32" (default: "float16")
+     * @param compute_type "default" (float16 on CUDA, float32 on CPU), or
+     *                     "float16", "int8", "int8_float16", "float32", ...
+     *                     A type the device can't run falls back to the
+     *                     nearest one it can (float16 on CPU becomes float32).
      * @param device_index GPU index for multi-GPU systems (default: 0)
      *
-     * @throws std::runtime_error if model cannot be loaded
+     * @throws std::runtime_error if the model or its SentencePiece tokenizer
+     *         can't be loaded (there is no fallback tokenizer), or if Muninn was
+     *         built without SentencePiece.
      */
     Translator(const std::string& model_path,
                const std::string& device = "cuda",
-               const std::string& compute_type = "float16",
+               const std::string& compute_type = "default",
                int device_index = 0);
 
     ~Translator();
@@ -94,13 +118,17 @@ public:
     /**
      * @brief Unload the model and release GPU resources
      *
-     * Releases the CTranslate2 model and its CUDA resources without blocking.
-     * Uses a timeout for thread pool shutdown to avoid hanging on CUDA teardown.
+     * Releases the CTranslate2 model's GPU memory. If a translate_batch() is
+     * running, it is asked to stop after its current chunk (its remaining
+     * items come back "" with cancelled = true) and this waits for it.
      * After calling this, the translator cannot be used until a new one is created.
      *
-     * @param timeout_ms Maximum time to wait for thread pool shutdown (default 3000ms)
+     * @param timeout_ms How long to wait for a running batch to let go of the
+     *                   model (default 3000 ms; negative = wait as long as it takes)
+     * @return true when the model is unloaded (or was not loaded); false when
+     *         the timeout passed first, in which case nothing was released
      */
-    void unload_model(int timeout_ms = 3000);
+    bool unload_model(int timeout_ms = 3000);
 
     /**
      * @brief Translate a single text
@@ -109,7 +137,7 @@ public:
      * @param source_lang Source language code ("en", "ja", "es", etc.)
      * @param target_lang Target language code
      * @param options Translation options
-     * @return Translated text
+     * @return Translated text, or "" if the text was empty or translation failed
      */
     std::string translate(const std::string& text,
                           const std::string& source_lang,
@@ -123,9 +151,20 @@ public:
      * @param source_lang Source language code
      * @param target_lang Target language code
      * @param options Translation options
-     * @return Translated texts (same order as input)
+     * @return Translated texts (same order as input); "" for an empty input
+     *         and for any item that failed or was cancelled. Use
+     *         translate_batch_result() to tell those apart.
      */
     std::vector<std::string> translate_batch(
+        const std::vector<std::string>& texts,
+        const std::string& source_lang,
+        const std::string& target_lang,
+        const TranslationOptions& options = {});
+
+    /**
+     * @brief translate_batch() with the outcome: cancelled, failures, error
+     */
+    TranslationBatchResult translate_batch_result(
         const std::vector<std::string>& texts,
         const std::string& source_lang,
         const std::string& target_lang,
@@ -148,7 +187,7 @@ public:
 
     /**
      * @brief Check if a language is supported
-     * @param lang_code Language code ("en", "ja", etc.)
+     * @param lang_code Language code ("en", "ja", "en-US", etc.)
      * @return true if supported
      */
     bool is_language_supported(const std::string& lang_code) const;
@@ -170,7 +209,8 @@ public:
 
     /**
      * @brief Convert Whisper/short language code to NLLB code
-     * @param code Short code ("en", "ja", etc.)
+     * @param code Short code ("en", "ja", "pt-BR", "ZH_tw", etc.; case and
+     *             region are normalised) or an NLLB code, returned as is
      * @return NLLB code ("eng_Latn", "jpn_Jpan", etc.) or empty if unsupported
      */
     static std::string to_nllb_code(const std::string& code);
@@ -200,7 +240,8 @@ public:
      * destructor can hang indefinitely.
      *
      * After calling shutdown(), the translator is no longer usable.
-     * Calling translate() after shutdown() will return the original text unchanged.
+     * Calling translate() after shutdown() returns "" (translate_batch_result
+     * reports the error).
      */
     void shutdown();
 
@@ -208,7 +249,9 @@ public:
      * @brief Request cancellation of ongoing translation
      *
      * Thread-safe method that can be called from any thread (e.g., UI thread)
-     * to request cancellation of ongoing translate_batch() calls.
+     * to request cancellation of ongoing translate_batch() calls. The batch
+     * stops after its current chunk; items not finished come back "".
+     * The flag stays set (new batches return at once) until reset_cancel().
      */
     void cancel();
 

@@ -21,6 +21,8 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <string>
+#include <vector>
 
 void print_separator(const char* title = nullptr) {
     std::cout << "\n";
@@ -93,7 +95,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Loading NLLB model: " << nllb_model_path << "\n";
         start = std::chrono::high_resolution_clock::now();
 
-        muninn::Translator translator(nllb_model_path, "cuda", "float16");
+        // "default" compute type: float16 on CUDA, float32 on CPU.
+        muninn::Translator translator(nllb_model_path, "cuda");
 
         auto nllb_load_time = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - start).count();
@@ -144,29 +147,47 @@ int main(int argc, char* argv[]) {
 
         start = std::chrono::high_resolution_clock::now();
         int total_translations = 0;
+        int failed_translations = 0;
 
-        // Process each segment
-        for (auto& segment : result.segments) {
+        // One batch per target language: much faster than one call per
+        // segment, and CTranslate2 groups similar-length sentences itself.
+        std::vector<std::string> source_texts;
+        for (const auto& segment : result.segments) source_texts.push_back(segment.text);
+
+        std::vector<std::vector<std::string>> per_target(target_langs.size());
+        for (size_t t = 0; t < target_langs.size(); ++t) {
+            const std::string& target = target_langs[t];
+            if (muninn::Translator::to_nllb_code(target) ==
+                muninn::Translator::to_nllb_code(result.language)) {
+                continue;  // same as source
+            }
+            muninn::TranslationBatchResult batch =
+                translator.translate_batch_result(source_texts, result.language, target, trans_opts);
+            if (!batch.error.empty()) {
+                std::cerr << "  " << target << ": " << batch.failed_count
+                          << " segment(s) not translated: " << batch.error << "\n";
+            }
+            failed_translations += static_cast<int>(batch.failed_count);
+            per_target[t] = std::move(batch.texts);
+        }
+
+        for (size_t i = 0; i < result.segments.size(); ++i) {
+            auto& segment = result.segments[i];
             std::cout << "\n[" << format_time(segment.start) << " -> "
                       << format_time(segment.end) << "]\n";
             std::cout << "  Original (" << result.language << "): " << segment.text << "\n";
 
-            // Translate to each target language
-            for (const auto& target : target_langs) {
-                // Skip if source == target
-                if (target == result.language) {
+            for (size_t t = 0; t < target_langs.size(); ++t) {
+                const std::string& target = target_langs[t];
+                if (per_target[t].empty()) {
                     std::cout << "  " << target << ": (same as source)\n";
                     continue;
                 }
-
-                std::string translated = translator.translate(
-                    segment.text,
-                    result.language,
-                    target,
-                    trans_opts
-                );
-
-                std::cout << "  " << target << ": " << translated << "\n";
+                const std::string& translated = per_target[t][i];
+                // "" means empty input or a failed item; never the source text.
+                std::cout << "  " << target << ": "
+                          << (translated.empty() ? "(not translated)" : translated) << "\n";
+                if (translated.empty()) continue;
                 total_translations++;
 
                 // Store the last translation in the segment
