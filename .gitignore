@@ -120,3 +120,12 @@ docs/archive/
 
 # Static build used by Loki Studio
 build_static/
+
+# Every local build folder (build_static, build_cuda13, build_ct483, build_release, ...)
+build_*/
+
+# The same mangled paths, written with the private-use colon (U+F03A)
+D*Vibe_Projects*
+
+# Release archives
+Muninn-*.zip
