@@ -83,9 +83,8 @@ bool RussianCaptionEngine::isSentenceEnd(const std::string& text) const {
 std::string RussianCaptionEngine::splitLines(const std::string& text,
                                               int maxChars,
                                               int maxLines) const {
-    if (static_cast<int>(countCharacters(text)) <= maxChars) {
-        return text;
-    }
+    // No early return on countCharacters(text): it leaves out spaces, while
+    // the loop below counts them, so short-word lines could run long.
 
     // Split into words
     std::vector<std::string> words;
@@ -114,7 +113,8 @@ std::string RussianCaptionEngine::splitLines(const std::string& text,
     std::string currentLine;
     size_t currentCount = 0;
 
-    for (size_t i = 0; i < words.size() && static_cast<int>(lines.size()) < maxLines; ++i) {
+    (void)maxLines;  // every line is returned; buildCues keeps cues within maxLines
+    for (size_t i = 0; i < words.size(); ++i) {
         const std::string& word = words[i];
         size_t wordLen = countCharacters(word);
 
@@ -172,7 +172,7 @@ std::string RussianCaptionEngine::splitLines(const std::string& text,
     }
 
     // Add remaining
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines) {
+    if (!currentLine.empty()) {
         lines.push_back(currentLine);
     }
 

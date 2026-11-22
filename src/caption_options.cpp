@@ -7,60 +7,34 @@ namespace muninn {
 // CaptionEngineOptions::merge
 // ═══════════════════════════════════════════════════════════════════════════
 
-void CaptionEngineOptions::merge(const CaptionEngineOptions& overrides) {
-    // Only override non-default values
-    // For now, just copy all values from overrides if they differ from defaults
+void CaptionEngineOptions::merge(const CaptionEngineOverrides& overrides) {
+    // Every value the caller set wins, whatever it is. Unset values keep the
+    // preset's. (The old version compared against the defaults, so asking for
+    // exactly 42 characters or 2 lines on a preset with other values did
+    // nothing, and the booleans always overwrote the preset.)
+    if (!overrides.languageHint.empty()) languageHint = overrides.languageHint;
+    if (!overrides.scriptHint.empty()) scriptHint = overrides.scriptHint;
 
-    if (!overrides.languageHint.empty()) {
-        languageHint = overrides.languageHint;
-    }
-    if (!overrides.scriptHint.empty()) {
-        scriptHint = overrides.scriptHint;
-    }
-
-    // Layout constraints
-    if (overrides.maxCharsPerLine != 42) {
-        maxCharsPerLine = overrides.maxCharsPerLine;
-    }
-    if (overrides.maxLines != 2) {
-        maxLines = overrides.maxLines;
-    }
-    if (overrides.maxDuration != 7.0f) {
-        maxDuration = overrides.maxDuration;
-    }
-    if (overrides.minDuration != 1.0f) {
-        minDuration = overrides.minDuration;
+    if (overrides.maxCharsPerLine) maxCharsPerLine = *overrides.maxCharsPerLine;
+    if (overrides.maxLines) maxLines = *overrides.maxLines;
+    if (overrides.maxDuration) maxDuration = *overrides.maxDuration;
+    if (overrides.minDuration) minDuration = *overrides.minDuration;
+    if (overrides.maxCps) maxCps = *overrides.maxCps;
+    if (overrides.breakOnSentence) breakOnSentence = *overrides.breakOnSentence;
+    if (overrides.breakOnPause) breakOnPause = *overrides.breakOnPause;
+    if (overrides.avoidOrphanWords) avoidOrphanWords = *overrides.avoidOrphanWords;
+    if (overrides.balanceLines) balanceLines = *overrides.balanceLines;
+    if (overrides.generatePresentationEvents) {
+        generatePresentationEvents = *overrides.generatePresentationEvents;
     }
 
-    // CPS
-    if (overrides.maxCps != 17.0f) {
-        maxCps = overrides.maxCps;
+    if (overrides.phraseLeadInMs) presentation.phraseLeadInMs = *overrides.phraseLeadInMs;
+    if (overrides.tokenRevealMs) presentation.tokenRevealMs = *overrides.tokenRevealMs;
+    if (overrides.minHoldAfterSpeechS) presentation.minHoldAfterSpeechS = *overrides.minHoldAfterSpeechS;
+    if (overrides.fadeOutMs) presentation.fadeOutMs = *overrides.fadeOutMs;
+    if (overrides.pauseBreakThresholdMs) {
+        presentation.pauseBreakThresholdMs = *overrides.pauseBreakThresholdMs;
     }
-
-    // Break behavior
-    breakOnSentence = overrides.breakOnSentence;
-    breakOnPause = overrides.breakOnPause;
-    if (overrides.pauseThresholdMs != 320.0f) {
-        pauseThresholdMs = overrides.pauseThresholdMs;
-    }
-
-    // Typography
-    applyLineBreakRules = overrides.applyLineBreakRules;
-    avoidOrphanWords = overrides.avoidOrphanWords;
-    balanceLines = overrides.balanceLines;
-
-    // Karaoke
-    enableKaraoke = overrides.enableKaraoke;
-    if (overrides.karaokeGranularity != TokenGranularity::Word) {
-        karaokeGranularity = overrides.karaokeGranularity;
-    }
-
-    // Presentation (merge if any value differs from default)
-    presentation = overrides.presentation;
-
-    // Output
-    includeWordTimestamps = overrides.includeWordTimestamps;
-    generatePresentationEvents = overrides.generatePresentationEvents;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -80,9 +54,6 @@ CaptionEngineOptions japanese() {
     opts.maxCps = 11.0f;  // Lower CPS for character-based
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.applyLineBreakRules = true;  // Kinsoku shori
-    opts.karaokeGranularity = TokenGranularity::Character;
     return opts;
 }
 
@@ -97,9 +68,6 @@ CaptionEngineOptions korean() {
     opts.maxCps = 13.0f;
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.applyLineBreakRules = true;  // Geumchik
-    opts.karaokeGranularity = TokenGranularity::Syllable;
     return opts;
 }
 
@@ -114,9 +82,6 @@ CaptionEngineOptions chineseSimplified() {
     opts.maxCps = 11.0f;  // 9-11 CPS for Chinese
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.applyLineBreakRules = true;
-    opts.karaokeGranularity = TokenGranularity::Character;
     return opts;
 }
 
@@ -131,9 +96,6 @@ CaptionEngineOptions chineseTraditional() {
     opts.maxCps = 11.0f;
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.applyLineBreakRules = true;
-    opts.karaokeGranularity = TokenGranularity::Character;
     return opts;
 }
 
@@ -148,10 +110,7 @@ CaptionEngineOptions russian() {
     opts.maxCps = 17.0f;  // 14-17 CPS
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.applyLineBreakRules = true;  // Single-letter preposition rules
     opts.avoidOrphanWords = true;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -166,8 +125,6 @@ CaptionEngineOptions arabic() {
     opts.maxCps = 15.0f;  // 12-15 CPS (slower for RTL)
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -182,8 +139,6 @@ CaptionEngineOptions hindi() {
     opts.maxCps = 16.0f;  // 14-16 CPS
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -198,9 +153,7 @@ CaptionEngineOptions english() {
     opts.maxCps = 17.0f;
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
     opts.avoidOrphanWords = true;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -215,9 +168,7 @@ CaptionEngineOptions spanish() {
     opts.maxCps = 17.0f;  // 15-17 CPS
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
     opts.avoidOrphanWords = true;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -232,9 +183,7 @@ CaptionEngineOptions portuguese() {
     opts.maxCps = 17.0f;  // 15-17 CPS
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
     opts.avoidOrphanWords = true;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -249,8 +198,6 @@ CaptionEngineOptions indonesian() {
     opts.maxCps = 17.0f;
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -265,8 +212,6 @@ CaptionEngineOptions vietnamese() {
     opts.maxCps = 17.0f;
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.karaokeGranularity = TokenGranularity::Word;
     return opts;
 }
 
@@ -281,8 +226,6 @@ CaptionEngineOptions thai() {
     opts.maxCps = 14.0f;  // 12-14 CPS
     opts.breakOnSentence = true;
     opts.breakOnPause = true;
-    opts.pauseThresholdMs = 320.0f;
-    opts.karaokeGranularity = TokenGranularity::Character;
     return opts;
 }
 

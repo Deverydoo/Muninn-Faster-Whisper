@@ -15,7 +15,7 @@ namespace muninn {
 enum class SubtitleFormat {
     SRT,        // SubRip (.srt) - universal compatibility
     VTT,        // WebVTT (.vtt) - web standard with styling support
-    ASS         // Advanced SubStation Alpha (.ass) - advanced styling (future)
+    ASS         // Advanced SubStation Alpha (.ass) - one plain style, for players and editors that want ASS
 };
 
 /**
@@ -30,7 +30,10 @@ struct SubtitleExportOptions {
     // ═══════════════════════════════════════════════════════════
     // Language
     // ═══════════════════════════════════════════════════════════
-    std::string language = "";             // Language code (empty = use segment language)
+    std::string language = "";             // Picks a language mode when no enable_*_mode flag is set:
+                                           // "ja", "ko", "zh" ("zh-TW"/"zh-Hant" = Traditional), "ru",
+                                           // "es"/"pt", "ar", "hi", "id", "vi", "th". Empty or any
+                                           // other code = standard segment-based subtitles.
     bool enable_japanese_mode = false;     // Enable Japanese-specific segmentation
 
     // ═══════════════════════════════════════════════════════════
@@ -92,7 +95,6 @@ struct SubtitleExportOptions {
     float russian_max_cps = 17.0f;         // Max characters per second (14-17 CPS)
     bool russian_break_on_sentence = true; // Break on sentence-enders: . ! ? — …
     bool russian_line_break_rules = true;  // Enforce Russian line-break rules (preposition handling)
-    bool russian_word_karaoke = false;     // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // Spanish/Portuguese-Specific Segmentation (Tier 1 - Latin America)
@@ -106,7 +108,6 @@ struct SubtitleExportOptions {
     float spanish_max_cps = 17.0f;         // Max characters per second (15-17 CPS)
     bool spanish_break_on_sentence = true; // Break on sentence-enders: . ! ? ¿ ¡ ...
     bool spanish_line_break_rules = true;  // Avoid short prepositions at line ends
-    bool spanish_word_karaoke = false;     // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // Arabic-Specific Segmentation (Tier 1 - Middle East/North Africa)
@@ -120,7 +121,6 @@ struct SubtitleExportOptions {
     float arabic_max_cps = 15.0f;          // Max characters per second (12-15 CPS)
     bool arabic_break_on_sentence = true;  // Break on sentence-enders: . ! ? ؟ ،
     bool arabic_ligature_safe = true;      // Avoid breaking Arabic ligatures
-    bool arabic_word_karaoke = false;      // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // Hindi/Devanagari-Specific Segmentation (Tier 1 - India)
@@ -133,8 +133,6 @@ struct SubtitleExportOptions {
     float hindi_min_duration = 1.0f;       // Min subtitle duration
     float hindi_max_cps = 16.0f;           // Max characters per second (14-16 CPS)
     bool hindi_break_on_sentence = true;   // Break on sentence-enders: । ! ? ...
-    bool hindi_phrase_segmentation = true; // Phrase-level segmentation
-    bool hindi_word_karaoke = false;       // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // Indonesian-Specific Segmentation (Tier 3 - Southeast Asia Growth)
@@ -147,7 +145,6 @@ struct SubtitleExportOptions {
     float indonesian_min_duration = 1.0f;  // Min subtitle duration
     float indonesian_max_cps = 17.0f;      // Max characters per second (15-17 CPS)
     bool indonesian_break_on_sentence = true;  // Break on sentence-enders
-    bool indonesian_word_karaoke = false;  // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // Vietnamese-Specific Segmentation (Tier 3 - Southeast Asia Growth)
@@ -160,7 +157,6 @@ struct SubtitleExportOptions {
     float vietnamese_min_duration = 1.0f;  // Min subtitle duration
     float vietnamese_max_cps = 17.0f;      // Max characters per second (15-17 CPS)
     bool vietnamese_break_on_sentence = true;  // Break on sentence-enders
-    bool vietnamese_word_karaoke = false;  // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // Thai-Specific Segmentation (Tier 3 - Southeast Asia Growth)
@@ -173,7 +169,6 @@ struct SubtitleExportOptions {
     float thai_min_duration = 1.0f;        // Min subtitle duration
     float thai_max_cps = 14.0f;            // Max characters per second (12-14 CPS)
     bool thai_break_on_sentence = true;    // Break on Thai sentence-enders
-    bool thai_word_karaoke = false;        // Enable per-word karaoke timing
 
     // ═══════════════════════════════════════════════════════════
     // AAA English Karaoke Captioning (when enable_karaoke_mode = true)
@@ -196,7 +191,6 @@ struct SubtitleExportOptions {
     float word_lead_ms = 60.0f;            // Per-word reveal lead time (0-120ms)
     float min_hold_after_speech_s = 1.4f;  // Minimum hold after last word (1-2s)
     float clear_after_silence_s = 4.5f;    // Clear captions after this silence (3-6s)
-    float fade_out_ms = 250.0f;            // Fade out duration (200-350ms), never hard cut
 
     // ═══════════════════════════════════════════════════════════
     // Speaker Labels
@@ -210,24 +204,27 @@ struct SubtitleExportOptions {
     // ═══════════════════════════════════════════════════════════
     float min_duration = 0.3f;             // Minimum subtitle duration (seconds)
     float max_duration = 7.0f;             // Maximum subtitle duration (seconds)
-    float gap_threshold = 0.1f;            // Merge segments closer than this (seconds)
+    float gap_threshold = 0.0f;            // Merge a segment into the cue before it when the gap is
+                                           // shorter than this (seconds). 0 = never merge. Merges stay
+                                           // within one track and one speaker, and never go past
+                                           // max_duration or max_chars_per_line x max_lines.
 
     // ═══════════════════════════════════════════════════════════
     // VTT-specific (WebVTT with styling)
     // ═══════════════════════════════════════════════════════════
-    bool vtt_include_word_timestamps = false;  // Word-level <v> tags
+    bool vtt_include_word_timestamps = false;  // Per-word <00:00:01.000> timestamp tags (karaoke)
     bool vtt_include_speaker_colors = false;   // Speaker-specific colors
     std::map<int, std::string> vtt_speaker_colors;  // speaker_id -> hex color
 
     // VTT styling options
-    bool vtt_include_confidence_styling = false;  // Color by confidence
-    bool vtt_include_intensity_styling = false;   // Bold/size by intensity
+    bool vtt_include_confidence_styling = false;  // Words below 0.5 probability get the
+                                                  // ::cue(.uncertain) class (dimmed red)
 
     // ═══════════════════════════════════════════════════════════
     // Output
     // ═══════════════════════════════════════════════════════════
     std::string output_path;               // Output file path (empty = auto-generate)
-    bool overwrite_existing = true;        // Overwrite if file exists
+    bool overwrite_existing = true;        // false = throw instead of replacing an existing file
 };
 
 /**
@@ -240,6 +237,7 @@ struct SubtitleEntry {
     std::string text;                      // Subtitle text
 
     // Optional metadata
+    int track_id = 0;                      // Audio track the text came from
     int speaker_id = -1;                   // Speaker ID (-1 = no speaker)
     std::string speaker_label;             // Speaker label
     std::vector<Word> words;               // Word-level timing (for VTT)
@@ -255,6 +253,7 @@ struct SubtitleEntry {
  * Features:
  * - SRT: Universal compatibility (all video players)
  * - VTT: Web standard with styling, word-level timing, speaker colors
+ * - ASS: One plain style, for tools that want ASS
  * - Auto-splitting long text to fit subtitle guidelines
  * - Speaker label integration
  * - Automatic output path generation (same directory as video)
@@ -315,6 +314,23 @@ public:
                           const SubtitleExportOptions& options = SubtitleExportOptions());
 
     /**
+     * @brief Export to ASS format (Advanced SubStation Alpha)
+     *
+     * Creates <video_name>.ass with one plain style ("Default": white text,
+     * black outline, bottom centre, 1920x1080 script resolution). Speaker
+     * labels go in the Name field. { } and \ in the text are escaped the way
+     * FFmpeg does it, so transcribed text can't turn into override tags.
+     *
+     * @param segments Transcription segments
+     * @param video_path Video file path
+     * @param options Export options
+     * @return Output ASS file path
+     */
+    std::string export_ass(const std::vector<Segment>& segments,
+                          const std::string& video_path,
+                          const SubtitleExportOptions& options = SubtitleExportOptions());
+
+    /**
      * @brief Export to VTT format (WebVTT)
      *
      * Creates <video_name>.vtt with optional styling and word-level timing.
@@ -331,6 +347,17 @@ public:
     // ═══════════════════════════════════════════════════════════
     // Low-level Formatting
     // ═══════════════════════════════════════════════════════════
+
+    /**
+     * @brief Build the subtitle entries the exporters write
+     *
+     * Picks the segmenter from the options (karaoke, a language mode, or the
+     * standard segment-based one). The result never drops text, has at most
+     * max_lines lines per entry, is sorted by start time, has no overlapping
+     * entries, and is numbered from 1.
+     */
+    static std::vector<SubtitleEntry> build_entries(const std::vector<Segment>& segments,
+                                                    const SubtitleExportOptions& options);
 
     /**
      * @brief Convert segments to subtitle entries
@@ -363,6 +390,19 @@ public:
     static std::string format_vtt_entry(const SubtitleEntry& entry,
                                        const SubtitleExportOptions& options);
 
+    /**
+     * @brief Format subtitle entry as an ASS "Dialogue:" line
+     *
+     * @param entry Subtitle entry
+     * @return One Dialogue line, ending in a newline
+     */
+    static std::string format_ass_entry(const SubtitleEntry& entry);
+
+    /**
+     * @brief Format time for ASS (H:MM:SS.cc, centiseconds)
+     */
+    static std::string format_ass_timestamp(float seconds);
+
     // ═══════════════════════════════════════════════════════════
     // Utilities
     // ═══════════════════════════════════════════════════════════
@@ -378,11 +418,16 @@ public:
                                            SubtitleFormat format);
 
     /**
-     * @brief Split long text into multiple lines
+     * @brief Split long text into lines at spaces
+     *
+     * Line length is counted in characters (UTF-8 code points), not bytes.
+     * No text is ever dropped: when the text needs more than max_lines lines,
+     * all of them are returned, and the exporters turn the extra lines into
+     * another cue. A single word longer than a line gets a line of its own.
      *
      * @param text Text to split
      * @param max_chars_per_line Max characters per line
-     * @param max_lines Max number of lines
+     * @param max_lines Lines per cue (kept for the callers; never truncates)
      * @return Split text with newlines
      */
     static std::string split_text(const std::string& text,
@@ -1131,13 +1176,17 @@ namespace SubtitleMetadata {
     /**
      * @brief Generate JSON metadata (Loki Studio format)
      *
-     * Creates <video_name>_metadata.json with transcription data.
+     * Creates <video_name>_metadata.json with transcription data. Each audio
+     * track gets its own "channel_N" entry (channel_1 = track 0) with its
+     * track_id. Times are written to the millisecond.
      *
      * @param segments Transcription segments
-     * @param video_path Video file path
+     * @param video_path Video file path (UTF-8)
      * @param whisper_model Model name used
      * @param language Detected language
      * @param duration Total audio duration
+     * @param device Device the transcription ran on ("cuda", "cpu"); written
+     *               as "unknown" when not given
      * @return Metadata JSON file path
      */
     MUNINN_API std::string generate_metadata_json(
@@ -1145,13 +1194,19 @@ namespace SubtitleMetadata {
         const std::string& video_path,
         const std::string& whisper_model,
         const std::string& language,
-        float duration);
+        float duration,
+        const std::string& device = "unknown");
 
     /**
      * @brief Load segments from metadata JSON
      *
-     * @param metadata_json_path Path to metadata JSON file
-     * @return Segments loaded from JSON
+     * Reads a file written by generate_metadata_json: segments with their
+     * words, speakers, language and track (from "track_id", or from the
+     * channel number). Throws std::runtime_error if the file can't be read
+     * or isn't valid JSON.
+     *
+     * @param metadata_json_path Path to metadata JSON file (UTF-8)
+     * @return Segments loaded from JSON, track by track
      */
     MUNINN_API std::vector<Segment> load_from_metadata_json(
         const std::string& metadata_json_path);
