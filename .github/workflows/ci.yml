@@ -1,0 +1,183 @@
+# CPU-only build and tests on GitHub's Windows runners.
+#
+# The runners have no GPU and no CUDA toolkit, so this builds CTranslate2
+# 4.8.3 (with patches/ctranslate2-v4.8.3-local.patch) without CUDA, then
+# Muninn with WITH_CUDA=OFF, and runs the tests labelled "cpu". The release
+# DLL is built locally with CUDA 13.2; see patches/README.md.
+#
+# Dependencies:
+#   CTranslate2  v4.8.3 from OpenNMT, local patch applied, CPU only (cached)
+#   SentencePiece  the commit the local build uses (cached)
+#   ONNX Runtime 1.31.0 CPU, from NuGet (same onnxruntime.dll as the zip) (cached)
+#   FFmpeg 9.0 LGPL shared build from BtbN/FFmpeg-Builds, checksum-verified
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CT2_TAG: v4.8.3
+  SPM_COMMIT: c40fb66f94ba04855bbd71f6b318b5427939ec7e
+  ORT_VERSION: 1.31.0
+  ORT_NUPKG_SHA256: 7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b
+  FFMPEG_NAME: ffmpeg-n9.0-latest-win64-lgpl-shared-9.0
+  # CTranslate2 and some of its submodules declare cmake_minimum_required
+  # below 3.5, which CMake 4 refuses without this.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  build-cpu:
+    name: Windows x64, CPU only
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------- CTranslate2 ----------------
+      - name: Restore CTranslate2
+        id: ct2-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            third_party/CTranslate2-4.8.3/include
+            third_party/CTranslate2-4.8.3/build/Release
+          key: ct2-${{ env.CT2_TAG }}-cpu-r1-${{ hashFiles('patches/ctranslate2-v4.8.3-local.patch') }}
+
+      - name: Build CTranslate2 (CPU)
+        if: steps.ct2-cache.outputs.cache-hit != 'true'
+        run: |
+          $src = "third_party/CTranslate2-4.8.3"
+          git clone --depth 1 --branch $env:CT2_TAG https://github.com/OpenNMT/CTranslate2.git $src
+          # Only the submodules a CPU build without the CLI needs.
+          git -C $src submodule update --init --depth 1 third_party/spdlog third_party/cpu_features
+          git -C $src apply ../../patches/ctranslate2-v4.8.3-local.patch
+          # Same options as the local CUDA build (patches/README.md), with CUDA off.
+          cmake -S $src -B "$src/build" -A x64 `
+            -DBUILD_SHARED_LIBS=ON -DBUILD_CLI=OFF -DBUILD_TESTS=OFF `
+            -DWITH_CUDA=OFF -DWITH_CUDNN=OFF `
+            -DWITH_MKL=OFF -DWITH_DNNL=OFF -DWITH_OPENBLAS=OFF -DWITH_RUY=OFF `
+            -DWITH_FLASH_ATTN=OFF -DWITH_TENSOR_PARALLEL=OFF `
+            -DENABLE_CPU_DISPATCH=ON -DOPENMP_RUNTIME=NONE
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build "$src/build" --config Release --target ctranslate2 --parallel
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Save CTranslate2
+        if: steps.ct2-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            third_party/CTranslate2-4.8.3/include
+            third_party/CTranslate2-4.8.3/build/Release
+          key: ${{ steps.ct2-cache.outputs.cache-primary-key }}
+
+      # ---------------- SentencePiece ----------------
+      - name: Restore SentencePiece
+        id: spm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            third_party/sentencepiece/src/*.h
+            third_party/sentencepiece/build/src/Release/sentencepiece.lib
+          key: spm-${{ env.SPM_COMMIT }}-r1
+
+      - name: Build SentencePiece
+        if: steps.spm-cache.outputs.cache-hit != 'true'
+        run: |
+          $src = "third_party/sentencepiece"
+          git init -q $src
+          git -C $src fetch -q --depth 1 https://github.com/google/sentencepiece.git $env:SPM_COMMIT
+          git -C $src checkout -q FETCH_HEAD
+          cmake -S $src -B "$src/build" -A x64 -DSPM_ENABLE_SHARED=OFF -DSPM_BUILD_TEST=OFF
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build "$src/build" --config Release --target sentencepiece-static --parallel
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Save SentencePiece
+        if: steps.spm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            third_party/sentencepiece/src/*.h
+            third_party/sentencepiece/build/src/Release/sentencepiece.lib
+          key: ${{ steps.spm-cache.outputs.cache-primary-key }}
+
+      # ---------------- ONNX Runtime ----------------
+      - name: Restore ONNX Runtime
+        id: ort-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party/onnx/onnxruntime-win-x64-${{ env.ORT_VERSION }}
+          key: ort-${{ env.ORT_VERSION }}-cpu-r1
+
+      - name: Download ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          $pkg = "$env:RUNNER_TEMP/ort.nupkg"
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$env:ORT_VERSION/microsoft.ml.onnxruntime.$env:ORT_VERSION.nupkg" -OutFile $pkg
+          $hash = (Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:ORT_NUPKG_SHA256) { throw "ONNX Runtime package checksum mismatch: $hash" }
+          Expand-Archive $pkg -DestinationPath "$env:RUNNER_TEMP/ort"
+          # Lay it out like the release zip (include/, lib/), which CMakeLists.txt expects.
+          $dst = "third_party/onnx/onnxruntime-win-x64-$env:ORT_VERSION"
+          New-Item -ItemType Directory -Force "$dst/include", "$dst/lib" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/ort/build/native/include/*" "$dst/include"
+          Copy-Item "$env:RUNNER_TEMP/ort/runtimes/win-x64/native/*" "$dst/lib"
+          Copy-Item "$env:RUNNER_TEMP/ort/LICENSE", "$env:RUNNER_TEMP/ort/ThirdPartyNotices.txt" $dst
+
+      - name: Save ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/onnx/onnxruntime-win-x64-${{ env.ORT_VERSION }}
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+
+      # ---------------- FFmpeg ----------------
+      - name: Download FFmpeg
+        run: |
+          $base = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+          $zip = "$env:RUNNER_TEMP/$env:FFMPEG_NAME.zip"
+          Invoke-WebRequest -Uri "$base/$env:FFMPEG_NAME.zip" -OutFile $zip
+          $sums = (Invoke-WebRequest -Uri "$base/checksums.sha256").Content
+          $line = ($sums -split "`n") | Where-Object { $_ -match "\s$([regex]::Escape($env:FFMPEG_NAME)).zip\s*$" }
+          if (-not $line) { throw "No checksum listed for $env:FFMPEG_NAME.zip" }
+          $want = ($line -split '\s+')[0].ToLower()
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $want) { throw "FFmpeg checksum mismatch: $hash, expected $want" }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          "FFMPEG_DIR=$($env:RUNNER_TEMP -replace '\\','/')/$env:FFMPEG_NAME" >> $env:GITHUB_ENV
+          Get-ChildItem "$env:RUNNER_TEMP/$env:FFMPEG_NAME/bin" -Filter *.dll | ForEach-Object Name
+
+      # ---------------- Muninn ----------------
+      - name: Configure Muninn
+        run: |
+          cmake -S . -B build -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DWITH_CUDA=OFF -DWITH_SILERO_VAD=ON `
+            -DFFMPEG_STATIC=OFF "-DFFMPEG_DIR=$env:FFMPEG_DIR" `
+            -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build Muninn
+        run: cmake --build build --config Release --parallel
+
+      # Only the "cpu" tests: the "model" and "gpu" ones need a Whisper model
+      # and a CUDA GPU, and are not even registered without MUNINN_TEST_MODEL.
+      - name: Test
+        run: ctest --test-dir build -C Release -L cpu --output-on-failure
