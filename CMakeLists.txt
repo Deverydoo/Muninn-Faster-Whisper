@@ -97,14 +97,14 @@ endif()
 # =======================
 # Three ways to find FFmpeg, in priority order:
 #   Option 1: FFMPEG_DIR + FFMPEG_STATIC=ON
-#       Static MSVC build (lib<name>.lib naming). Used by Loki Studio's
-#       "Muninn Pattern" — FFmpeg gets baked into muninn.dll so no
-#       av*/sw*.dll need to ship at runtime. Adds the Windows system
-#       libs FFmpeg's static link requires (bcrypt, crypt32, ws2_32, …).
-#       This is the production build path as of v1.2.0.
+#       Static MSVC build (lib<name>.lib naming): FFmpeg baked into
+#       muninn.dll. Loki Studio used this from v1.2.0 to 1.5; it is a
+#       fallback now. FFmpeg is LGPL 2.1, and static linking into a
+#       closed DLL leaves the user no way to swap FFmpeg.
 #   Option 2: FFMPEG_DIR alone (no STATIC flag)
-#       Dynamic FFmpeg with import libs (avformat.lib, not libavformat.lib).
-#       Legacy path — muninn.dll ends up dynamically linked.
+#       Dynamic FFmpeg with import libs (avformat.lib). Loki Studio's build
+#       since 1.6.0 (Loki-Studio/cpp_modules/ffmpeg-9.0.2/install_msvc_shared):
+#       muninn.dll uses the av*.dll that Loki Studio ships beside it.
 #   Option 3: neither set
 #       pkg-config + vcpkg fallback.
 if(FFMPEG_DIR AND FFMPEG_STATIC)
@@ -177,12 +177,15 @@ if(FFMPEG_DIR AND FFMPEG_STATIC)
 elseif(FFMPEG_DIR)
     message(STATUS "Using DYNAMIC FFmpeg from: ${FFMPEG_DIR} (muninn.dll will need av*.dll at runtime)")
     set(FFMPEG_INCLUDE_DIRS "${FFMPEG_DIR}/include")
-    set(FFMPEG_LIBRARIES
-        "${FFMPEG_DIR}/lib/avformat.lib"
-        "${FFMPEG_DIR}/lib/avcodec.lib"
-        "${FFMPEG_DIR}/lib/avutil.lib"
-        "${FFMPEG_DIR}/lib/swresample.lib"
-    )
+    # FFmpeg's MSVC shared install puts the import libraries in bin/, beside the DLLs.
+    set(FFMPEG_LIBRARIES)
+    foreach(_ff avformat avcodec avutil swresample)
+        if(EXISTS "${FFMPEG_DIR}/lib/${_ff}.lib")
+            list(APPEND FFMPEG_LIBRARIES "${FFMPEG_DIR}/lib/${_ff}.lib")
+        else()
+            list(APPEND FFMPEG_LIBRARIES "${FFMPEG_DIR}/bin/${_ff}.lib")
+        endif()
+    endforeach()
     add_library(PkgConfig::FFMPEG INTERFACE IMPORTED)
     set_target_properties(PkgConfig::FFMPEG PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIRS}"
