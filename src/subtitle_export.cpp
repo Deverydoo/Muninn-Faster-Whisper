@@ -2390,9 +2390,8 @@ std::string SubtitleExporter::split_russian_text(const std::string& text,
                                                   int max_chars,
                                                   int max_lines,
                                                   bool use_line_break_rules) {
-    if (count_russian_chars(text) <= static_cast<size_t>(max_chars)) {
-        return text;
-    }
+    // No early return on count_russian_chars(text): it leaves out spaces, while
+    // the loop below counts one per word gap, as a reader sees the line.
 
     // Split into words (Russian uses spaces between words)
     std::vector<std::string> words;
@@ -2547,14 +2546,10 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_russian(
             entry.words = current_words;
 
             // Split text if too long for display
-            if (count_russian_chars(current_text) > static_cast<size_t>(options.russian_max_chars)) {
-                entry.text = split_russian_text(current_text,
-                                                options.russian_max_chars,
-                                                options.max_lines,
-                                                options.russian_line_break_rules);
-            } else {
-                entry.text = current_text;
-            }
+            entry.text = split_russian_text(current_text,
+                                            options.russian_max_chars,
+                                            options.max_lines,
+                                            options.russian_line_break_rules);
 
             entries.push_back(entry);
 
@@ -2722,9 +2717,8 @@ std::string SubtitleExporter::split_spanish_text(const std::string& text,
                                                   int max_chars,
                                                   int max_lines,
                                                   bool use_line_break_rules) {
-    if (count_spanish_chars(text) <= static_cast<size_t>(max_chars)) {
-        return text;
-    }
+    // No early return on count_spanish_chars(text): it leaves out spaces, while
+    // the loop below counts one per word gap, as a reader sees the line.
 
     // Split into words (Spanish uses spaces)
     std::vector<std::string> words;
@@ -2859,14 +2853,10 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_spanish(
             entry.end = current_end;
             entry.words = current_words;
 
-            if (count_spanish_chars(current_text) > static_cast<size_t>(options.spanish_max_chars)) {
-                entry.text = split_spanish_text(current_text,
-                                                options.spanish_max_chars,
-                                                options.max_lines,
-                                                options.spanish_line_break_rules);
-            } else {
-                entry.text = current_text;
-            }
+            entry.text = split_spanish_text(current_text,
+                                            options.spanish_max_chars,
+                                            options.max_lines,
+                                            options.spanish_line_break_rules);
 
             entries.push_back(entry);
 
@@ -3005,9 +2995,8 @@ std::string SubtitleExporter::split_arabic_text(const std::string& text,
                                                  int max_chars,
                                                  int max_lines,
                                                  bool /* ligature_safe */) {
-    if (count_arabic_chars(text) <= static_cast<size_t>(max_chars)) {
-        return text;
-    }
+    // No early return on count_arabic_chars(text): it leaves out spaces, while
+    // the loop below counts one per word gap, as a reader sees the line.
 
     // Arabic uses spaces between words
     std::vector<std::string> words;
@@ -3118,14 +3107,10 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_arabic(
             entry.end = current_end;
             entry.words = current_words;
 
-            if (count_arabic_chars(current_text) > static_cast<size_t>(options.arabic_max_chars)) {
-                entry.text = split_arabic_text(current_text,
-                                               options.arabic_max_chars,
-                                               options.max_lines,
-                                               options.arabic_ligature_safe);
-            } else {
-                entry.text = current_text;
-            }
+            entry.text = split_arabic_text(current_text,
+                                           options.arabic_max_chars,
+                                           options.max_lines,
+                                           options.arabic_ligature_safe);
 
             entries.push_back(entry);
 
@@ -3244,9 +3229,8 @@ bool SubtitleExporter::ends_with_hindi_sentence_end(const std::string& text) {
 std::string SubtitleExporter::split_hindi_text(const std::string& text,
                                                 int max_chars,
                                                 int max_lines) {
-    if (count_hindi_chars(text) <= static_cast<size_t>(max_chars)) {
-        return text;
-    }
+    // No early return on count_hindi_chars(text): it leaves out spaces, while
+    // the loop below counts one per word gap, as a reader sees the line.
 
     // Hindi uses spaces between words
     std::vector<std::string> words;
@@ -3356,13 +3340,9 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_hindi(
             entry.end = current_end;
             entry.words = current_words;
 
-            if (count_hindi_chars(current_text) > static_cast<size_t>(options.hindi_max_chars)) {
-                entry.text = split_hindi_text(current_text,
-                                              options.hindi_max_chars,
-                                              options.max_lines);
-            } else {
-                entry.text = current_text;
-            }
+            entry.text = split_hindi_text(current_text,
+                                          options.hindi_max_chars,
+                                          options.max_lines);
 
             entries.push_back(entry);
 
@@ -3477,11 +3457,7 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_indonesian(
             entry.end = current_end;
             entry.words = current_words;
 
-            if (count_indonesian_chars(current_text) > static_cast<size_t>(options.indonesian_max_chars)) {
-                entry.text = split_text(current_text, options.indonesian_max_chars, options.max_lines);
-            } else {
-                entry.text = current_text;
-            }
+            entry.text = split_text(current_text, options.indonesian_max_chars, options.max_lines);
 
             entries.push_back(entry);
 
@@ -3624,11 +3600,7 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_vietnamese(
             entry.end = current_end;
             entry.words = current_words;
 
-            if (count_vietnamese_chars(current_text) > static_cast<size_t>(options.vietnamese_max_chars)) {
-                entry.text = split_text(current_text, options.vietnamese_max_chars, options.max_lines);
-            } else {
-                entry.text = current_text;
-            }
+            entry.text = split_text(current_text, options.vietnamese_max_chars, options.max_lines);
 
             entries.push_back(entry);
 
