@@ -133,6 +133,13 @@ struct TranscribeResult {
     float duration;                  // Total audio duration in seconds
     bool was_cancelled;              // True if transcription was cancelled by user
 
+    // Failures. A window or track that failed (CUDA out of memory, a decode
+    // error) used to vanish: the run reported success with fewer segments.
+    // When nothing at all succeeded, transcribe() throws instead.
+    int failed_windows = 0;          // 30 s windows whose decode threw
+    int failed_tracks = 0;           // audio tracks that couldn't be extracted, prepared or decoded
+    std::string error;               // the last failure, empty when none
+
     TranscribeResult() : language_probability(0.0f), duration(0.0f), was_cancelled(false) {}
 
     // Iterator support for range-based for loops

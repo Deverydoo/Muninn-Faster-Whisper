@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <set>
 #if __has_include(<zlib.h>)
@@ -107,6 +108,19 @@ public:
 
     // Mutex to protect model pointer access during load/unload/transcribe
     mutable std::mutex model_mutex;
+    // Held shared for a whole transcription and exclusively by unload_model(),
+    // so the model can't be freed under a running decode (model_mutex alone
+    // only covered the "is it loaded" check).
+    mutable std::shared_mutex inference_mutex;
+
+    // Windows whose decode threw during the current transcribe_from_prepared
+    // (inference thread only), and the last error.
+    int failed_windows = 0;
+    std::string last_error;
+    void note_failure(const std::string& what) {
+        ++failed_windows;
+        last_error = what;
+    }
 
     Impl() : mel_converter(16000, 400, 128, 160) {}
 
@@ -287,6 +301,8 @@ public:
         float  clip_offset = 0.0f;       // seconds added to all segment timestamps post-inference
         float  original_duration = 0.0f; // pre-VAD audio duration (after clip)
         bool   no_speech = false;        // true if VAD removed everything → skip inference
+        bool   extract_failed = false;   // the track couldn't be read (counts as a failed track)
+        std::string extract_error;
     };
 
     // Run clip + VAD + mel-spectrogram. CPU-only; safe to call from a worker
@@ -1263,6 +1279,10 @@ void filter_silence_hallucinations(
     if (threshold <= 0.0f || speech_segments.empty()) {
         return;  // Disabled or no VAD info
     }
+    // A fraction of the segment that must be speech. Loki Studio's setting
+    // used to say "seconds" and allow up to 10: 1.0 or more deleted every
+    // segment on a VAD-filtered track.
+    threshold = std::min(threshold, 1.0f);
 
     auto it = segments.begin();
     while (it != segments.end()) {
@@ -1471,6 +1491,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
             if (future_results.empty()) {
                 Logger::error("No results from Whisper inference for chunk");
+                note_failure("CTranslate2 returned no result for a window");
                 return segments;
             }
             Logger::info("CTranslate2 returned " + std::to_string(future_results.size()) + " result(s)");
@@ -1698,6 +1719,7 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
     } catch (const std::exception& e) {
         Logger::error("Chunk transcription failed: " + std::string(e.what()));
+        note_failure(e.what());
     }
 
     Logger::info("Chunk returned " + std::to_string(segments.size()) + " segments");
@@ -1984,6 +2006,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
             }
           } catch (const std::exception& e) {
             Logger::error("Batch item " + std::to_string(b) + " EXCEPTION: " + std::string(e.what()));
+            note_failure(e.what());
           }
         }
 
@@ -1991,7 +2014,8 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         std::cout.flush();
 
     } catch (const std::exception& e) {
-        std::cerr << "[Muninn] Batch transcription failed: " << e.what() << "\n";
+        Logger::error("Batch transcription failed: " + std::string(e.what()));
+        for (size_t i = 0; i < batch_mel_features.size(); ++i) note_failure(e.what());
     }
 
     return all_segments;
@@ -2005,6 +2029,14 @@ Transcriber::Transcriber(
     const std::string& model_path,
     const std::string& device,
     const std::string& compute_type
+) : Transcriber(model_path, device, compute_type, 0, 0) {}
+
+Transcriber::Transcriber(
+    const std::string& model_path,
+    const std::string& device,
+    const std::string& compute_type,
+    int intra_threads,
+    int device_index
 ) : pimpl_(std::make_unique<Impl>()) {
 
     try {
@@ -2145,12 +2177,43 @@ Transcriber::Transcriber(
         // Track if CUDA was the final decision (for exception fallback)
         bool cuda_was_requested = (ct_device == ctranslate2::Device::CUDA);
 
+        // The caller's precision, threads and GPU index (they used to be
+        // dropped: the model always loaded at CTranslate2's defaults, which on
+        // CPU is 4 threads). The CPU has no float16, so a float16 request
+        // becomes float32 there (and int8_float16 becomes int8_float32).
+        auto make_model = [&](ctranslate2::Device dev) {
+            std::string ct = compute_type;
+            if (ct.empty() || ct == "auto") ct = "default";
+            if (dev == ctranslate2::Device::CPU) {
+                if (ct == "float16" || ct == "bfloat16") ct = "float32";
+                else if (ct == "int8_float16" || ct == "int8_bfloat16") ct = "int8_float32";
+            }
+            ctranslate2::ComputeType ctype = ctranslate2::ComputeType::DEFAULT;
+            try {
+                ctype = ctranslate2::str_to_compute_type(ct);
+            } catch (const std::exception&) {
+                Logger::warn("Unknown compute type '" + compute_type + "', using the model's own");
+            }
+            ctranslate2::ReplicaPoolConfig config;
+            if (dev == ctranslate2::Device::CPU) {
+                const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+                config.num_threads_per_replica = intra_threads > 0
+                    ? static_cast<size_t>(intra_threads)
+                    : static_cast<size_t>(std::max(1u, hw / 2));   // about one per physical core
+            } else if (intra_threads > 0) {
+                config.num_threads_per_replica = static_cast<size_t>(intra_threads);
+            }
+            const int index = dev == ctranslate2::Device::CUDA ? std::max(0, device_index) : 0;
+            Logger::info("Compute type: " + ct + (dev == ctranslate2::Device::CPU
+                ? ", CPU threads: " + std::to_string(config.num_threads_per_replica)
+                : ", GPU " + std::to_string(index)));
+            return std::make_unique<ctranslate2::models::Whisper>(
+                model_path, dev, ctype, std::vector<int>{index}, false, config);
+        };
+
         if (cuda_was_requested) {
             try {
-                pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
-                    model_path,
-                    ct_device
-                );
+                pimpl_->model = make_model(ct_device);
             } catch (const std::exception& cuda_error) {
                 // CUDA initialization failed - fall back to CPU
                 // Common reasons: compute capability too low, driver issues, AMD GPU, etc.
@@ -2161,17 +2224,11 @@ Transcriber::Transcriber(
                 cuda_fallback_to_cpu = true;
 
                 // Retry with CPU
-                pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
-                    model_path,
-                    ct_device
-                );
+                pimpl_->model = make_model(ct_device);
             }
         } else {
             // CPU was explicitly requested
-            pimpl_->model = std::make_unique<ctranslate2::models::Whisper>(
-                model_path,
-                ct_device
-            );
+            pimpl_->model = make_model(ct_device);
         }
 
         // Log if we had to fall back
@@ -2205,7 +2262,7 @@ Transcriber::Transcriber(
 
         // Determine actual device used
         pimpl_->using_cuda = (ct_device == ctranslate2::Device::CUDA);
-        pimpl_->device_index = 0;
+        pimpl_->device_index = pimpl_->using_cuda ? std::max(0, device_index) : 0;
 
         // Log device info
         if (pimpl_->using_cuda) {
@@ -2241,18 +2298,11 @@ Transcriber::Transcriber(
 
 // Constructor using ModelOptions struct
 Transcriber::Transcriber(const ModelOptions& options)
-    : Transcriber(options.model_path, options.device_string(), options.compute_type_string())
+    : Transcriber(options.model_path, options.device_string(), options.compute_type_string(),
+                  options.intra_threads, options.device_index)
 {
-    // ModelOptions::intra_threads / inter_threads aren't forwarded to
-    // CTranslate2's ReplicaPoolConfig. Rationale: on CUDA (our default and
-    // the only supported high-performance path) a single replica is the
-    // correct configuration — extra replicas duplicate VRAM with no
-    // throughput gain unless multiple GPUs are present. On CPU fallback the
-    // CTranslate2 defaults (auto-detect intra_threads = std::hardware_concurrency,
-    // 1 inter_thread) are already reasonable. If multi-GPU or tuned CPU
-    // becomes a real need, plumbing those fields requires changing the
-    // delegated 3-arg constructor's signature; do that change explicitly
-    // when the use case arrives.
+    // inter_threads (replicas) stays at one: a second replica duplicates the
+    // model in VRAM for no gain on one GPU.
 }
 
 Transcriber::~Transcriber() {
@@ -2266,6 +2316,8 @@ void Transcriber::unload_model(int timeout_ms) {
         return;
     }
 
+    // Waits for a running transcribe() to finish (it holds this shared).
+    std::unique_lock<std::shared_mutex> inference(pimpl_->inference_mutex);
     std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
     if (!pimpl_->model) {
         return;
@@ -2380,6 +2432,28 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
 
     original_duration = clipped_samples.size() / 16000.0f;
 
+    // A track with no signal at all (under -80 dBFS throughout: an unused
+    // recording track) has nothing to transcribe.
+    if (options.skip_silent_tracks && !clipped_samples.empty()) {
+        float peak = 0.0f;
+        for (float s : clipped_samples) peak = std::max(peak, std::fabs(s));
+        if (peak < 1e-4f) {
+            Logger::info("Track " + std::to_string(track_id) + " is silent, skipped");
+            prepared.original_duration = original_duration;
+            prepared.clip_offset = clip_offset;
+            prepared.no_speech = true;
+            return prepared;
+        }
+    }
+
+    // Cancellable between stages (VAD and mel each run for seconds).
+    if (cancelled.load(std::memory_order_acquire)) {
+        prepared.original_duration = original_duration;
+        prepared.clip_offset = clip_offset;
+        prepared.no_speech = true;
+        return prepared;
+    }
+
     // VAD
     std::vector<float> processed_samples;
     std::vector<SpeechSegment> speech_segments;
@@ -2401,7 +2475,14 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
     if (apply_vad) {
         VADType effective_vad_type = options.vad_type;
         if (options.vad_type == VADType::Auto) {
-            effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks);
+            // The caller's hint for this track (Loki Studio names them from
+            // the track titles: Microphone, Game, Music). It was never passed,
+            // so every track took the "unknown" path.
+            TrackType hint = TrackType::Unknown;
+            if (auto it = options.track_hints.find(track_id); it != options.track_hints.end()) {
+                hint = it->second;
+            }
+            effective_vad_type = auto_detect_vad_type(clipped_samples, track_id, total_tracks, hint);
         }
 
         auto apply_energy_vad = [&]() {
@@ -2569,6 +2650,13 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
     }
     perf_log("VAD");
 
+    if (cancelled.load(std::memory_order_acquire)) {
+        prepared.original_duration = original_duration;
+        prepared.clip_offset = clip_offset;
+        prepared.no_speech = true;
+        return prepared;
+    }
+
     // mel-spectrogram (CPU-bound, ~10s for 20-min track)
     if (progress_callback) {
         progress_callback(track_id, total_tracks, 0.07f, "Computing mel-spectrogram...");
@@ -2600,9 +2688,14 @@ TranscribeResult Transcriber::transcribe(
 ) {
     Logger::info("=== transcribe(samples) ENTERED: " + std::to_string(audio_samples.size()) + " samples ===");
 
-    // Reset cancellation flag at start of new transcription
-    pimpl_->cancelled.store(false, std::memory_order_release);
+    // The cancel flag is cleared when a run ends, not when it starts: a
+    // cancel() that arrived just before this call used to be wiped here.
+    struct ClearCancel {
+        std::atomic<bool>& flag;
+        ~ClearCancel() { flag.store(false, std::memory_order_release); }
+    } clear_cancel{pimpl_->cancelled};
 
+    std::shared_lock<std::shared_mutex> inference(pimpl_->inference_mutex);
     {
         std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
         if (!pimpl_->model_loaded || !pimpl_->model) {
@@ -2644,6 +2737,8 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
     ProgressCallback progress_callback
 ) {
     TranscribeResult result;
+    failed_windows = 0;
+    last_error.clear();
 
     auto check_cancelled = [this, &result]() -> bool {
         if (cancelled.load(std::memory_order_acquire)) {
@@ -2665,6 +2760,44 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
 
     // Create mutable copy of options for language detection
     TranscribeOptions effective_options = options;
+
+    // Every exit goes through here, a cancelled one too: timestamps go back to
+    // the original timeline (VAD remap, clip offset) and the silence filter
+    // runs. A cancelled run used to return them on the VAD-joined timeline.
+    auto finish = [&]() -> TranscribeResult {
+        if (!speech_segments.empty()) {
+            for (auto& seg : result.segments) {
+                seg.start = remap_timestamp_to_original(seg.start, speech_segments);
+                seg.end = remap_timestamp_to_original(seg.end, speech_segments);
+                for (auto& word : seg.words) {
+                    word.start = remap_timestamp_to_original(word.start, speech_segments);
+                    word.end = remap_timestamp_to_original(word.end, speech_segments);
+                }
+                tighten_to_words(seg);
+            }
+            filter_silence_hallucinations(result.segments, speech_segments,
+                                          options.hallucination_silence_threshold);
+        }
+        if (clip_offset > 0.0f) {
+            for (auto& seg : result.segments) {
+                seg.start += clip_offset;
+                seg.end += clip_offset;
+                for (auto& word : seg.words) {
+                    word.start += clip_offset;
+                    word.end += clip_offset;
+                }
+            }
+        }
+        result.failed_windows = failed_windows;
+        if (failed_windows > 0) {
+            result.error = last_error;
+            Logger::error(std::to_string(failed_windows) + " window(s) failed: " + last_error);
+            if (result.segments.empty() && !result.was_cancelled) {
+                throw std::runtime_error("Transcription failed: " + last_error);
+            }
+        }
+        return result;
+    };
 
         // Local perf timer for the inference half (prep timings live in
         // prepare_features_for_track).
@@ -2829,7 +2962,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 int seek = 0;
                 while (seek < n_frames) {
                     if (check_cancelled()) {
-                        return result;
+                        return finish();
                     }
                     const int window_end = std::min(seek + MAX_FRAMES, n_frames);
                     if (window_end - seek < 10) break;   // under 0.1 s left
@@ -2868,7 +3001,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                                 "Transcribed " + std::to_string(seek / 100) + " of " +
                                 std::to_string(n_frames / 100) + " s")) {
                             result.was_cancelled = true;
-                            return result;
+                            return finish();
                         }
                     }
                 }
@@ -2876,7 +3009,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 for (int batch_start = 0; batch_start < num_chunks; batch_start += BATCH_SIZE) {
                     // Check for cancellation before each batch
                     if (check_cancelled()) {
-                        return result;
+                        return finish();
                     }
 
                     int batch_end = std::min(batch_start + BATCH_SIZE, num_chunks);
@@ -2927,42 +3060,19 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                         if (!should_continue) {
                             std::cout << "[Muninn] Transcription cancelled by callback\n";
                             result.was_cancelled = true;
-                            return result;
+                            return finish();
                         }
                     }
 
                     // Also check atomic cancel flag (for cancel() called from another thread)
                     if (check_cancelled()) {
-                        return result;
+                        return finish();
                     }
                 }
 
             }
 
-            std::cout << "[Muninn] Completed batched transcription: " << result.segments.size() << " total segments\n";
-            std::cout.flush();
-
-            // Remap timestamps from filtered audio back to original timeline if VAD was applied
-            if (!speech_segments.empty()) {
-                std::cout << "[Muninn] Remapping timestamps to original timeline...\n";
-                std::cout.flush();
-                for (auto& seg : result.segments) {
-                    float orig_start = remap_timestamp_to_original(seg.start, speech_segments);
-                    float orig_end = remap_timestamp_to_original(seg.end, speech_segments);
-                    seg.start = orig_start;
-                    seg.end = orig_end;
-                    // Also remap word timestamps to original timeline
-                    for (auto& word : seg.words) {
-                        word.start = remap_timestamp_to_original(word.start, speech_segments);
-                        word.end = remap_timestamp_to_original(word.end, speech_segments);
-                    }
-                    tighten_to_words(seg);
-                }
-
-                // Filter segments in silent regions (hallucination silence threshold)
-                filter_silence_hallucinations(result.segments, speech_segments,
-                                              options.hallucination_silence_threshold);
-            }
+            Logger::info("Completed transcription: " + std::to_string(result.segments.size()) + " segments");
 
         } else {
             // Single chunk processing (audio <= 30 seconds)
@@ -2980,46 +3090,9 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
             if (progress_callback) {
                 progress_callback(track_id, total_tracks, 0.90f, "Transcription complete");
             }
-
-            // Remap timestamps from filtered audio back to original timeline if VAD was applied
-            if (!speech_segments.empty()) {
-                std::cout << "[Muninn] Remapping timestamps to original timeline...\n";
-                for (auto& seg : result.segments) {
-                    float orig_start = remap_timestamp_to_original(seg.start, speech_segments);
-                    float orig_end = remap_timestamp_to_original(seg.end, speech_segments);
-                    seg.start = orig_start;
-                    seg.end = orig_end;
-                    // Also remap word timestamps to original timeline
-                    for (auto& word : seg.words) {
-                        word.start = remap_timestamp_to_original(word.start, speech_segments);
-                        word.end = remap_timestamp_to_original(word.end, speech_segments);
-                    }
-                    tighten_to_words(seg);
-                }
-
-                // Filter segments in silent regions (hallucination silence threshold)
-                filter_silence_hallucinations(result.segments, speech_segments,
-                                              options.hallucination_silence_threshold);
-            }
         }
 
-        // Add clip_offset to all segment timestamps to reflect original timeline
-        if (clip_offset > 0.0f) {
-            std::cout << "[Muninn] Adjusting timestamps by clip offset: +" << clip_offset << "s\n";
-            for (auto& seg : result.segments) {
-                seg.start += clip_offset;
-                seg.end += clip_offset;
-                // Also adjust word timestamps if present
-                for (auto& word : seg.words) {
-                    word.start += clip_offset;
-                    word.end += clip_offset;
-                }
-            }
-        }
-
-        // Language is already set above during language detection or from options
-
-    return result;
+    return finish();
 }
 
 TranscribeResult Transcriber::transcribe(
@@ -3096,10 +3169,14 @@ TranscribeResult Transcriber::transcribe(
         extract_futures.push_back(std::async(std::launch::async, run_extract, track));
     }
 
-    // Reset cancellation + verify model is loaded once for the whole run.
-    // The single-track entry transcribe(samples) does this itself, but we
-    // bypass it here to call prepare/infer directly when pipelined.
-    pimpl_->cancelled.store(false, std::memory_order_release);
+    // Verify the model is loaded once for the whole run, and keep it loaded
+    // (unload_model waits for this lock). The cancel flag is cleared when the
+    // run ends, so a cancel() sent just before the call still counts.
+    struct ClearCancel {
+        std::atomic<bool>& flag;
+        ~ClearCancel() { flag.store(false, std::memory_order_release); }
+    } clear_cancel{pimpl_->cancelled};
+    std::shared_lock<std::shared_mutex> inference(pimpl_->inference_mutex);
     {
         std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
         if (!pimpl_->model_loaded || !pimpl_->model) {
@@ -3133,6 +3210,8 @@ TranscribeResult Transcriber::transcribe(
                 Logger::warn("Failed to extract track " + std::to_string(track) + ": " + et.error);
                 Impl::PreparedFeatures pf;
                 pf.no_speech = true;  // signals "skip this track"
+                pf.extract_failed = true;
+                pf.extract_error = et.error;
                 return pf;
             }
             Logger::info("Track " + std::to_string(track) + ": " +
@@ -3188,14 +3267,24 @@ TranscribeResult Transcriber::transcribe(
         Impl::PreparedFeatures prepared;
         try {
             if (pipelined) {
-                prepared = next_prep.get();
+                // The next track's prep starts before this one's result is
+                // read, so a prep that throws doesn't stop later tracks.
+                auto current = std::move(next_prep);
                 if (i + 1 < enabled_tracks.size()) {
                     next_prep = launch_prep(i + 1);
+                }
+                prepared = current.get();
+                if (prepared.extract_failed) {
+                    ++combined_result.failed_tracks;
+                    combined_result.error = "track " + std::to_string(track) + ": " + prepared.extract_error;
+                    continue;
                 }
             } else {
                 ExtractedTrack et = extract_futures[i].get();
                 if (!et.ok) {
                     Logger::warn("Failed to extract track " + std::to_string(track) + ": " + et.error);
+                    ++combined_result.failed_tracks;
+                    combined_result.error = "track " + std::to_string(track) + ": " + et.error;
                     continue;
                 }
                 Logger::info("Track " + std::to_string(track) + ": " +
@@ -3209,6 +3298,8 @@ TranscribeResult Transcriber::transcribe(
             }
         } catch (const std::exception& e) {
             Logger::error("Track " + std::to_string(track) + " prep EXCEPTION: " + std::string(e.what()));
+            ++combined_result.failed_tracks;
+            combined_result.error = "track " + std::to_string(track) + ": " + e.what();
             continue;
         }
 
@@ -3223,6 +3314,8 @@ TranscribeResult Transcriber::transcribe(
                     std::move(prepared), options, track, track_count, progress_callback);
             }
             Logger::info("transcribe() returned " + std::to_string(track_result.segments.size()) + " segments");
+            combined_result.failed_windows += track_result.failed_windows;
+            if (!track_result.error.empty()) combined_result.error = track_result.error;
 
             // Report progress - Transcription complete, processing results (95%)
             if (progress_callback) {
@@ -3278,8 +3371,12 @@ TranscribeResult Transcriber::transcribe(
 
         } catch (const std::exception& e) {
             Logger::error("Track " + std::to_string(track) + " transcription EXCEPTION: " + std::string(e.what()));
+            ++combined_result.failed_tracks;
+            combined_result.error = "track " + std::to_string(track) + ": " + e.what();
         } catch (...) {
             Logger::error("Track " + std::to_string(track) + " transcription UNKNOWN EXCEPTION");
+            ++combined_result.failed_tracks;
+            combined_result.error = "track " + std::to_string(track) + ": unknown error";
         }
 
         // #8: release allocator cache between tracks so VRAM doesn't hold
@@ -3299,7 +3396,12 @@ TranscribeResult Transcriber::transcribe(
     extractor.close();
 
     Logger::info("All tracks complete. Total segments: " + std::to_string(combined_result.segments.size()));
-    std::cout.flush();
+
+    // Nothing worked at all: an error, not an empty transcript.
+    if (combined_result.failed_tracks > 0 && combined_result.segments.empty() &&
+        !combined_result.was_cancelled) {
+        throw std::runtime_error("Transcription failed: " + combined_result.error);
+    }
 
     // ═══════════════════════════════════════════════════════════
     // Speaker Diarization (if enabled)
@@ -3466,8 +3568,10 @@ void Transcriber::clear_cache() {
     // temporary buffers (activation cache, cuBLAS workspaces) are freed.
     // Useful between tracks on long multi-track jobs so VRAM doesn't
     // balloon to the worst chunk's peak across the whole run.
+    if (!pimpl_) return;
+    std::shared_lock<std::shared_mutex> inference(pimpl_->inference_mutex);
     std::lock_guard<std::mutex> lock(pimpl_->model_mutex);
-    if (pimpl_ && pimpl_->model) {
+    if (pimpl_->model) {
         try {
             pimpl_->model->clear_cache();
         } catch (const std::exception& e) {

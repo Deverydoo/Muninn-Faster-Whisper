@@ -186,15 +186,17 @@ public:
      * The cancellation is cooperative - the transcription will stop at the
      * next safe checkpoint (typically between batches or chunks).
      *
-     * After cancellation, call reset_cancel() before starting a new transcription.
+     * The flag is cleared when the running transcribe() returns, so a cancel()
+     * sent just before transcribe() starts still cancels that run.
      */
     void cancel();
 
     /**
      * @brief Reset cancellation flag
      *
-     * Call this before starting a new transcription if a previous one was cancelled.
-     * This is automatically called at the start of transcribe().
+     * Only needed when cancel() was called while no transcription was running
+     * and the next run should not be cancelled. transcribe() clears the flag
+     * itself when it returns.
      */
     void reset_cancel();
 
@@ -206,6 +208,10 @@ public:
 /**     * @brief Clear internal caches to free GPU memory     *     * Call this between batch transcriptions to prevent CUDA memory accumulation.     * The model remains loaded, but temporary buffers are freed.     * This is useful for long batch jobs processing many videos.     */    void clear_cache();
 
 private:
+    // Both public constructors land here.
+    Transcriber(const std::string& model_path, const std::string& device,
+                const std::string& compute_type, int intra_threads, int device_index);
+
     class Impl;  // Forward declaration for pimpl idiom
     std::unique_ptr<Impl> pimpl_;
 };
