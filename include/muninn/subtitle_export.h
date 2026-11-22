@@ -1176,13 +1176,17 @@ namespace SubtitleMetadata {
     /**
      * @brief Generate JSON metadata (Loki Studio format)
      *
-     * Creates <video_name>_metadata.json with transcription data.
+     * Creates <video_name>_metadata.json with transcription data. Each audio
+     * track gets its own "channel_N" entry (channel_1 = track 0) with its
+     * track_id. Times are written to the millisecond.
      *
      * @param segments Transcription segments
-     * @param video_path Video file path
+     * @param video_path Video file path (UTF-8)
      * @param whisper_model Model name used
      * @param language Detected language
      * @param duration Total audio duration
+     * @param device Device the transcription ran on ("cuda", "cpu"); written
+     *               as "unknown" when not given
      * @return Metadata JSON file path
      */
     MUNINN_API std::string generate_metadata_json(
@@ -1190,13 +1194,19 @@ namespace SubtitleMetadata {
         const std::string& video_path,
         const std::string& whisper_model,
         const std::string& language,
-        float duration);
+        float duration,
+        const std::string& device = "unknown");
 
     /**
      * @brief Load segments from metadata JSON
      *
-     * @param metadata_json_path Path to metadata JSON file
-     * @return Segments loaded from JSON
+     * Reads a file written by generate_metadata_json: segments with their
+     * words, speakers, language and track (from "track_id", or from the
+     * channel number). Throws std::runtime_error if the file can't be read
+     * or isn't valid JSON.
+     *
+     * @param metadata_json_path Path to metadata JSON file (UTF-8)
+     * @return Segments loaded from JSON, track by track
      */
     MUNINN_API std::vector<Segment> load_from_metadata_json(
         const std::string& metadata_json_path);

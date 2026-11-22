@@ -3922,8 +3922,10 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_thai(
 
 namespace SubtitleMetadata {
 
+namespace {
+
 // Helper: Escape JSON string
-static std::string escape_json_string(const std::string& str) {
+std::string escape_json_string(const std::string& str) {
     std::string escaped;
     escaped.reserve(str.size());
 
@@ -3950,78 +3952,309 @@ static std::string escape_json_string(const std::string& str) {
     return escaped;
 }
 
+// A number with a fixed count of decimals; NaN and infinity become 0 so the
+// file stays valid JSON.
+std::string json_number(double value, int decimals) {
+    if (!std::isfinite(value)) value = 0.0;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.*f", decimals, value);
+    return buf;
+}
+
+// ── A small JSON reader, enough for the files generate_metadata_json writes
+// (and hand-edited ones). Throws std::runtime_error on malformed input.
+
+struct JsonValue {
+    enum class Type { Null, Bool, Number, String, Array, Object } type = Type::Null;
+    bool boolean = false;
+    double number = 0.0;
+    std::string string;
+    std::vector<JsonValue> array;
+    std::vector<std::pair<std::string, JsonValue>> object;  // keeps file order
+
+    const JsonValue* find(const std::string& key) const {
+        for (const auto& [k, v] : object) {
+            if (k == key) return &v;
+        }
+        return nullptr;
+    }
+    double number_or(const std::string& key, double fallback) const {
+        const JsonValue* v = find(key);
+        return (v && v->type == Type::Number) ? v->number : fallback;
+    }
+    std::string string_or(const std::string& key, const std::string& fallback) const {
+        const JsonValue* v = find(key);
+        return (v && v->type == Type::String) ? v->string : fallback;
+    }
+};
+
+class JsonReader {
+public:
+    explicit JsonReader(const std::string& text) : text_(text) {}
+
+    JsonValue parse_document() {
+        JsonValue value = parse_value(0);
+        skip_space();
+        if (pos_ != text_.size()) fail("unexpected text after the end");
+        return value;
+    }
+
+private:
+    const std::string& text_;
+    size_t pos_ = 0;
+
+    [[noreturn]] void fail(const std::string& what) const {
+        throw std::runtime_error("Invalid metadata JSON at byte " + std::to_string(pos_) + ": " + what);
+    }
+
+    void skip_space() {
+        while (pos_ < text_.size() &&
+               (text_[pos_] == ' ' || text_[pos_] == '\t' || text_[pos_] == '\n' || text_[pos_] == '\r')) {
+            ++pos_;
+        }
+    }
+
+    bool consume(char c) {
+        skip_space();
+        if (pos_ < text_.size() && text_[pos_] == c) {
+            ++pos_;
+            return true;
+        }
+        return false;
+    }
+
+    void expect(char c) {
+        if (!consume(c)) fail(std::string("expected '") + c + "'");
+    }
+
+    bool consume_word(const char* word) {
+        const size_t len = std::char_traits<char>::length(word);
+        if (text_.compare(pos_, len, word) == 0) {
+            pos_ += len;
+            return true;
+        }
+        return false;
+    }
+
+    JsonValue parse_value(int depth) {
+        if (depth > 64) fail("nested too deeply");
+        skip_space();
+        if (pos_ >= text_.size()) fail("unexpected end");
+
+        JsonValue value;
+        const char c = text_[pos_];
+        if (c == '{') {
+            ++pos_;
+            value.type = JsonValue::Type::Object;
+            if (consume('}')) return value;
+            do {
+                skip_space();
+                if (pos_ >= text_.size() || text_[pos_] != '"') fail("expected a key");
+                std::string key = parse_string();
+                expect(':');
+                value.object.emplace_back(std::move(key), parse_value(depth + 1));
+            } while (consume(','));
+            expect('}');
+        } else if (c == '[') {
+            ++pos_;
+            value.type = JsonValue::Type::Array;
+            if (consume(']')) return value;
+            do {
+                value.array.push_back(parse_value(depth + 1));
+            } while (consume(','));
+            expect(']');
+        } else if (c == '"') {
+            value.type = JsonValue::Type::String;
+            value.string = parse_string();
+        } else if (consume_word("true")) {
+            value.type = JsonValue::Type::Bool;
+            value.boolean = true;
+        } else if (consume_word("false")) {
+            value.type = JsonValue::Type::Bool;
+        } else if (consume_word("null")) {
+            value.type = JsonValue::Type::Null;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            value.type = JsonValue::Type::Number;
+            const char* begin = text_.c_str() + pos_;
+            char* end = nullptr;
+            value.number = std::strtod(begin, &end);
+            if (end == begin) fail("bad number");
+            pos_ += static_cast<size_t>(end - begin);
+        } else {
+            fail("unexpected character");
+        }
+        return value;
+    }
+
+    static void append_utf8(std::string& out, uint32_t cp) {
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
+    uint32_t parse_hex4() {
+        if (pos_ + 4 > text_.size()) fail("short \\u escape");
+        uint32_t cp = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char h = text_[pos_++];
+            cp <<= 4;
+            if (h >= '0' && h <= '9') cp |= static_cast<uint32_t>(h - '0');
+            else if (h >= 'a' && h <= 'f') cp |= static_cast<uint32_t>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') cp |= static_cast<uint32_t>(h - 'A' + 10);
+            else fail("bad \\u escape");
+        }
+        return cp;
+    }
+
+    std::string parse_string() {
+        ++pos_;  // opening quote
+        std::string out;
+        while (true) {
+            if (pos_ >= text_.size()) fail("unterminated string");
+            const char c = text_[pos_++];
+            if (c == '"') break;
+            if (c != '\\') {
+                out += c;  // UTF-8 bytes pass straight through
+                continue;
+            }
+            if (pos_ >= text_.size()) fail("unterminated escape");
+            const char e = text_[pos_++];
+            switch (e) {
+                case '"':  out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/':  out += '/'; break;
+                case 'b':  out += '\b'; break;
+                case 'f':  out += '\f'; break;
+                case 'n':  out += '\n'; break;
+                case 'r':  out += '\r'; break;
+                case 't':  out += '\t'; break;
+                case 'u': {
+                    uint32_t cp = parse_hex4();
+                    if (cp >= 0xD800 && cp <= 0xDBFF && text_.compare(pos_, 2, "\\u") == 0) {
+                        pos_ += 2;
+                        const uint32_t low = parse_hex4();
+                        if (low >= 0xDC00 && low <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        } else {
+                            fail("bad surrogate pair");
+                        }
+                    }
+                    append_utf8(out, cp);
+                    break;
+                }
+                default:
+                    fail("unknown escape");
+            }
+        }
+        return out;
+    }
+};
+
+// "channel_3" -> 3, anything else -> 0.
+int channel_number(const std::string& key) {
+    const std::string prefix = "channel_";
+    if (key.compare(0, prefix.size(), prefix) != 0) return 0;
+    try {
+        return std::stoi(key.substr(prefix.size()));
+    } catch (...) {
+        return 0;
+    }
+}
+
+}  // namespace
+
 std::string generate_metadata_json(const std::vector<Segment>& segments,
                                    const std::string& video_path,
                                    const std::string& whisper_model,
                                    const std::string& language,
-                                   float duration) {
+                                   float duration,
+                                   const std::string& device) {
     // Generate output path
     const std::filesystem::path video = utf8_path(video_path);
     std::filesystem::path metadata_path = video.parent_path();
     metadata_path /= video.stem();
     metadata_path += "_metadata.json";
 
-    // Build full transcript text
-    std::string full_text;
-    for (const auto& seg : segments) {
-        full_text += seg.text + " ";
-    }
+    // One channel per audio track, in track order: channel_1 is track 0.
+    std::map<int, std::vector<const Segment*>> by_track;
+    for (const auto& seg : segments) by_track[seg.track_id].push_back(&seg);
+    if (by_track.empty()) by_track[0];
 
     // Get current timestamp
     auto now = std::chrono::system_clock::now();
     auto timestamp = std::chrono::system_clock::to_time_t(now);
 
-    // Build JSON manually
+    // Build JSON manually. Times have millisecond precision (3 decimals).
     std::ostringstream json;
-    json << std::setprecision(2) << std::fixed;
 
     json << "{\n";
     json << "  \"video_file\": \"" << escape_json_string(path_to_utf8(video.filename())) << "\",\n";
-    json << "  \"processed_date\": " << timestamp << ",\n";
+    json << "  \"processed_date\": " << static_cast<long long>(timestamp) << ",\n";
     json << "  \"whisper_model\": \"" << escape_json_string(whisper_model) << "\",\n";
     json << "  \"engine\": \"muninn-faster-whisper\",\n";
-    json << "  \"device\": \"cuda\",\n";
+    json << "  \"device\": \"" << escape_json_string(device.empty() ? "unknown" : device) << "\",\n";
     json << "  \"transcriptions\": {\n";
-    json << "    \"channel_1\": {\n";
-    json << "      \"text\": \"" << escape_json_string(full_text) << "\",\n";
-    json << "      \"segments\": [\n";
 
-    // Write segments
-    for (size_t i = 0; i < segments.size(); ++i) {
-        const auto& seg = segments[i];
-        json << "        {\n";
-        json << "          \"start\": " << seg.start << ",\n";
-        json << "          \"end\": " << seg.end << ",\n";
-        json << "          \"text\": \"" << escape_json_string(seg.text) << "\"";
+    size_t channel_index = 0;
+    for (const auto& [track, track_segments] : by_track) {
+        std::string full_text;
+        for (const Segment* seg : track_segments) {
+            if (!full_text.empty()) full_text += " ";
+            full_text += seg->text;
+        }
 
-        // Optional: Add words
-        if (!seg.words.empty()) {
-            json << ",\n          \"words\": [\n";
-            for (size_t j = 0; j < seg.words.size(); ++j) {
-                const auto& word = seg.words[j];
-                json << "            {\n";
-                json << "              \"word\": \"" << escape_json_string(word.word) << "\",\n";
-                json << "              \"start\": " << word.start << ",\n";
-                json << "              \"end\": " << word.end << ",\n";
-                json << "              \"probability\": " << word.probability << "\n";
-                json << "            }" << (j < seg.words.size() - 1 ? "," : "") << "\n";
+        json << "    \"channel_" << (track + 1) << "\": {\n";
+        json << "      \"track_id\": " << track << ",\n";
+        json << "      \"text\": \"" << escape_json_string(full_text) << "\",\n";
+        json << "      \"segments\": [\n";
+
+        for (size_t i = 0; i < track_segments.size(); ++i) {
+            const Segment& seg = *track_segments[i];
+            json << "        {\n";
+            json << "          \"start\": " << json_number(seg.start, 3) << ",\n";
+            json << "          \"end\": " << json_number(seg.end, 3) << ",\n";
+            json << "          \"text\": \"" << escape_json_string(seg.text) << "\"";
+
+            if (!seg.words.empty()) {
+                json << ",\n          \"words\": [\n";
+                for (size_t j = 0; j < seg.words.size(); ++j) {
+                    const auto& word = seg.words[j];
+                    json << "            {\n";
+                    json << "              \"word\": \"" << escape_json_string(word.word) << "\",\n";
+                    json << "              \"start\": " << json_number(word.start, 3) << ",\n";
+                    json << "              \"end\": " << json_number(word.end, 3) << ",\n";
+                    json << "              \"probability\": " << json_number(word.probability, 4) << "\n";
+                    json << "            }" << (j + 1 < seg.words.size() ? "," : "") << "\n";
+                }
+                json << "          ]";
             }
-            json << "          ]";
+
+            if (seg.speaker_id >= 0) {
+                json << ",\n          \"speaker_id\": " << seg.speaker_id << ",\n";
+                json << "          \"speaker_label\": \"" << escape_json_string(seg.speaker_label) << "\"";
+            }
+
+            json << "\n        }" << (i + 1 < track_segments.size() ? "," : "") << "\n";
         }
 
-        // Optional: Add speaker info
-        if (seg.speaker_id >= 0) {
-            json << ",\n          \"speaker_id\": " << seg.speaker_id << ",\n";
-            json << "          \"speaker_label\": \"" << escape_json_string(seg.speaker_label) << "\"";
-        }
-
-        json << "\n        }" << (i < segments.size() - 1 ? "," : "") << "\n";
+        json << "      ],\n";
+        json << "      \"language\": \"" << escape_json_string(language) << "\",\n";
+        json << "      \"duration\": " << json_number(duration, 3) << "\n";
+        json << "    }" << (++channel_index < by_track.size() ? "," : "") << "\n";
     }
 
-    json << "      ],\n";
-    json << "      \"language\": \"" << escape_json_string(language) << "\",\n";
-    json << "      \"duration\": " << duration << "\n";
-    json << "    }\n";
     json << "  }\n";
     json << "}\n";
 
@@ -4038,10 +4271,71 @@ std::string generate_metadata_json(const std::vector<Segment>& segments,
 }
 
 std::vector<Segment> load_from_metadata_json(const std::string& metadata_json_path) {
-    // TODO: Implement JSON parsing without nlohmann/json dependency
-    // For now, this function is not implemented.
-    // Consider using a lightweight JSON parser or installing nlohmann/json via vcpkg
-    throw std::runtime_error("load_from_metadata_json not yet implemented - requires JSON parser");
+    std::ifstream file(utf8_path(metadata_json_path), std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open metadata JSON: " + metadata_json_path);
+    }
+    std::ostringstream content;
+    content << file.rdbuf();
+    std::string text = content.str();
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF) {
+        text.erase(0, 3);  // UTF-8 byte order mark
+    }
+
+    const JsonValue root = JsonReader(text).parse_document();
+    if (root.type != JsonValue::Type::Object) {
+        throw std::runtime_error("Invalid metadata JSON: the top level is not an object");
+    }
+    const JsonValue* transcriptions = root.find("transcriptions");
+    if (!transcriptions || transcriptions->type != JsonValue::Type::Object) {
+        throw std::runtime_error("Invalid metadata JSON: no \"transcriptions\" object");
+    }
+
+    // Channels in track order.
+    std::vector<std::pair<int, const JsonValue*>> channels;
+    for (const auto& [key, channel] : transcriptions->object) {
+        if (channel.type != JsonValue::Type::Object) continue;
+        const int track = static_cast<int>(channel.number_or("track_id", channel_number(key) - 1));
+        channels.emplace_back(std::max(0, track), &channel);
+    }
+    std::stable_sort(channels.begin(), channels.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<Segment> segments;
+    for (const auto& [track, channel] : channels) {
+        const std::string language = channel->string_or("language", "");
+        const JsonValue* list = channel->find("segments");
+        if (!list || list->type != JsonValue::Type::Array) continue;
+
+        for (const JsonValue& item : list->array) {
+            if (item.type != JsonValue::Type::Object) continue;
+            Segment seg;
+            seg.id = static_cast<int>(segments.size());
+            seg.track_id = track;
+            seg.start = static_cast<float>(item.number_or("start", 0.0));
+            seg.end = static_cast<float>(item.number_or("end", seg.start));
+            seg.text = item.string_or("text", "");
+            seg.language = language;
+            seg.speaker_id = static_cast<int>(item.number_or("speaker_id", -1));
+            seg.speaker_label = item.string_or("speaker_label", "");
+
+            const JsonValue* words = item.find("words");
+            if (words && words->type == JsonValue::Type::Array) {
+                for (const JsonValue& w : words->array) {
+                    if (w.type != JsonValue::Type::Object) continue;
+                    Word word;
+                    word.word = w.string_or("word", "");
+                    word.start = static_cast<float>(w.number_or("start", 0.0));
+                    word.end = static_cast<float>(w.number_or("end", word.start));
+                    word.probability = static_cast<float>(w.number_or("probability", 1.0));
+                    seg.words.push_back(std::move(word));
+                }
+            }
+            segments.push_back(std::move(seg));
+        }
+    }
+    return segments;
 }
 
 } // namespace SubtitleMetadata
