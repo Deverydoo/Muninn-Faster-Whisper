@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <chrono>
 
 namespace muninn {
@@ -284,20 +285,30 @@ std::string SubtitleExporter::format_srt_entry(const SubtitleEntry& entry) {
     return oss.str();
 }
 
+// HH:MM:SS<sep>mmm. The time is rounded to the nearest millisecond once and
+// then split with integer maths, so 1.9999 s gives 00:00:02,000 rather than
+// 00:00:01,999 or 00:00:01,1000. Negative and NaN times become zero.
+static std::string format_hmsm(float seconds, char separator) {
+    long long total_ms = 0;
+    if (std::isfinite(seconds) && seconds > 0.0f) {
+        total_ms = std::llround(static_cast<double>(seconds) * 1000.0);
+    } else if (std::isinf(seconds) && seconds > 0.0f) {
+        total_ms = 99LL * 3600000LL + 59LL * 60000LL + 59LL * 1000LL + 999LL;
+    }
+
+    const long long hours = total_ms / 3600000LL;
+    const long long minutes = (total_ms / 60000LL) % 60LL;
+    const long long secs = (total_ms / 1000LL) % 60LL;
+    const long long millis = total_ms % 1000LL;
+
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld%c%03lld",
+                  hours, minutes, secs, separator, millis);
+    return buf;
+}
+
 std::string SubtitleExporter::format_srt_timestamp(float seconds) {
-    int hours = static_cast<int>(seconds / 3600);
-    int minutes = static_cast<int>((seconds - hours * 3600) / 60);
-    int secs = static_cast<int>(seconds - hours * 3600 - minutes * 60);
-    int millis = static_cast<int>((seconds - static_cast<int>(seconds)) * 1000);
-
-    std::ostringstream oss;
-    oss << std::setfill('0')
-        << std::setw(2) << hours << ":"
-        << std::setw(2) << minutes << ":"
-        << std::setw(2) << secs << ","
-        << std::setw(3) << millis;
-
-    return oss.str();
+    return format_hmsm(seconds, ',');
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -346,19 +357,7 @@ std::string SubtitleExporter::format_vtt_entry(const SubtitleEntry& entry,
 }
 
 std::string SubtitleExporter::format_vtt_timestamp(float seconds) {
-    int hours = static_cast<int>(seconds / 3600);
-    int minutes = static_cast<int>((seconds - hours * 3600) / 60);
-    int secs = static_cast<int>(seconds - hours * 3600 - minutes * 60);
-    int millis = static_cast<int>((seconds - static_cast<int>(seconds)) * 1000);
-
-    std::ostringstream oss;
-    oss << std::setfill('0')
-        << std::setw(2) << hours << ":"
-        << std::setw(2) << minutes << ":"
-        << std::setw(2) << secs << "."
-        << std::setw(3) << millis;
-
-    return oss.str();
+    return format_hmsm(seconds, '.');
 }
 
 // ═══════════════════════════════════════════════════════════
