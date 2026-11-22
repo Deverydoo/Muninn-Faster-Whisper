@@ -229,6 +229,30 @@ std::vector<SubtitleEntry> finalize_entries(std::vector<SubtitleEntry> entries,
     std::stable_sort(out.begin(), out.end(),
                      [](const SubtitleEntry& a, const SubtitleEntry& b) { return a.start < b.start; });
 
+    // No cue may still be on screen when the next one starts. Karaoke hold
+    // times and min-duration padding both run past the next cue, so clamp
+    // each end to the next start. Two cues starting on the same millisecond
+    // (two tracks talking at once) can't both be shown that way, so they
+    // become one cue with both texts.
+    std::vector<SubtitleEntry> clamped;
+    clamped.reserve(out.size());
+    for (auto& entry : out) {
+        if (!clamped.empty()) {
+            SubtitleEntry& prev = clamped.back();
+            if (entry.start - prev.start < 0.0005f) {
+                prev.text += "\n" + entry.text;
+                prev.end = std::max(prev.end, entry.end);
+                prev.words.insert(prev.words.end(), entry.words.begin(), entry.words.end());
+                std::stable_sort(prev.words.begin(), prev.words.end(),
+                                 [](const Word& a, const Word& b) { return a.start < b.start; });
+                continue;
+            }
+            if (prev.end > entry.start) prev.end = entry.start;
+        }
+        clamped.push_back(std::move(entry));
+    }
+    out = std::move(clamped);
+
     for (size_t i = 0; i < out.size(); ++i) {
         out[i].index = static_cast<int>(i + 1);
     }
