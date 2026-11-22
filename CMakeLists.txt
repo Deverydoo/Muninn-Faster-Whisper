@@ -287,6 +287,7 @@ set(MUNINN_SOURCES
     src/transcriber.cpp
     src/streaming_transcriber.cpp
     src/translator.cpp
+    src/translate_text.cpp
     src/audio_extractor.cpp
     src/audio/audio_decoder.cpp
     src/vad.cpp
@@ -443,9 +444,20 @@ if(BUILD_TESTS)
     #   model  needs a Whisper model; registered only when MUNINN_TEST_MODEL
     #          and MUNINN_TEST_AUDIO are set
     #   gpu    needs a CUDA GPU
+    # Translator text handling and diarizer clustering. Compiles the helper
+    # sources directly: needs neither muninn.dll nor CTranslate2.
+    add_executable(test_translate_text
+        tests/test_translate_text.cpp
+        src/translate_text.cpp
+        )
+    target_include_directories(test_translate_text PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+
     enable_testing()
     add_test(NAME core COMMAND test_core)
     set_tests_properties(core PROPERTIES LABELS "cpu")
+    add_test(NAME translate_text COMMAND test_translate_text)
+    set_tests_properties(translate_text PROPERTIES LABELS "cpu")
 
     set(MUNINN_TEST_MODEL "" CACHE PATH "Whisper model folder for the model tests (empty = not registered)")
     set(MUNINN_TEST_AUDIO "" CACHE FILEPATH "Audio or video file for the model tests")
