@@ -1,12 +1,12 @@
 # CPU-only build and tests on GitHub's Windows runners.
 #
 # The runners have no GPU and no CUDA toolkit, so this builds CTranslate2
-# 4.8.3 (with patches/ctranslate2-v4.8.3-local.patch) without CUDA, then
+# 4.9.1 (with patches/ctranslate2-v4.9.1-local.patch) without CUDA, then
 # Muninn with WITH_CUDA=OFF, and runs the tests labelled "cpu". The release
 # DLL is built locally with CUDA 13.2; see patches/README.md.
 #
 # Dependencies:
-#   CTranslate2  v4.8.3 from OpenNMT, local patch applied, CPU only (cached)
+#   CTranslate2  v4.9.1 from OpenNMT, local patch applied, CPU only (cached)
 #   SentencePiece  the commit the local build uses (cached)
 #   ONNX Runtime 1.31.0 CPU, from NuGet (same onnxruntime.dll as the zip) (cached)
 #   FFmpeg 9.0 LGPL shared build from BtbN/FFmpeg-Builds, checksum-verified
@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CT2_TAG: v4.8.3
+  CT2_TAG: v4.9.1
   SPM_COMMIT: c40fb66f94ba04855bbd71f6b318b5427939ec7e
   ORT_VERSION: 1.31.0
   ORT_NUPKG_SHA256: 7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b
@@ -55,25 +55,26 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: |
-            third_party/CTranslate2-4.8.3/include
-            third_party/CTranslate2-4.8.3/build/Release
-          key: ct2-${{ env.CT2_TAG }}-cpu-r1-${{ hashFiles('patches/ctranslate2-v4.8.3-local.patch') }}
+            third_party/CTranslate2-4.9.1/include
+            third_party/CTranslate2-4.9.1/build/Release
+          key: ct2-${{ env.CT2_TAG }}-cpu-r2-${{ hashFiles('patches/ctranslate2-v4.9.1-local.patch') }}
 
       - name: Build CTranslate2 (CPU)
         if: steps.ct2-cache.outputs.cache-hit != 'true'
         run: |
-          $src = "third_party/CTranslate2-4.8.3"
+          $src = "third_party/CTranslate2-4.9.1"
           git clone --depth 1 --branch $env:CT2_TAG https://github.com/OpenNMT/CTranslate2.git $src
           # Only the submodules a CPU build without the CLI needs.
           git -C $src submodule update --init --depth 1 third_party/spdlog third_party/cpu_features
-          git -C $src apply ../../patches/ctranslate2-v4.8.3-local.patch
+          git -C $src submodule update --init --recursive --depth 1 third_party/ruy
+          git -C $src apply ../../patches/ctranslate2-v4.9.1-local.patch
           # Same options as the local CUDA build (patches/README.md), with CUDA off.
           cmake -S $src -B "$src/build" -A x64 `
             -DBUILD_SHARED_LIBS=ON -DBUILD_CLI=OFF -DBUILD_TESTS=OFF `
             -DWITH_CUDA=OFF -DWITH_CUDNN=OFF `
-            -DWITH_MKL=OFF -DWITH_DNNL=OFF -DWITH_OPENBLAS=OFF -DWITH_RUY=OFF `
+            -DWITH_MKL=OFF -DWITH_DNNL=OFF -DWITH_OPENBLAS=OFF -DWITH_RUY=ON `
             -DWITH_FLASH_ATTN=OFF -DWITH_TENSOR_PARALLEL=OFF `
-            -DENABLE_CPU_DISPATCH=ON -DOPENMP_RUNTIME=NONE
+            -DENABLE_CPU_DISPATCH=ON -DOPENMP_RUNTIME=COMP
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build "$src/build" --config Release --target ctranslate2 --parallel
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -83,8 +84,8 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: |
-            third_party/CTranslate2-4.8.3/include
-            third_party/CTranslate2-4.8.3/build/Release
+            third_party/CTranslate2-4.9.1/include
+            third_party/CTranslate2-4.9.1/build/Release
           key: ${{ steps.ct2-cache.outputs.cache-primary-key }}
 
       # ---------------- SentencePiece ----------------

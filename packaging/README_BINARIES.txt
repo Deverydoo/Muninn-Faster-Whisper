@@ -9,7 +9,7 @@ subtitle export. Source: https://github.com/Deverydoo/Muninn-Faster-Whisper
 What's in this folder
 ---------------------
   bin/       muninn.dll and the DLLs it loads:
-               ctranslate2.dll   CTranslate2 4.8.3 with Muninn's local patch,
+               ctranslate2.dll   CTranslate2 4.9.1 with Muninn's local patch,
                                  CUDA 13.2, sm_75 to sm_120
                onnxruntime.dll   ONNX Runtime 1.31.0, CPU (Silero VAD)
                avformat-63.dll, avcodec-63.dll, avutil-61.dll,

@@ -13,7 +13,7 @@ param(
     [Parameter(Mandatory)] [string] $FfmpegDir,
     [Parameter(Mandatory)] [string] $FfmpegSourceDir,
     [Parameter(Mandatory)] [string] $ExtraLicensesDir,
-    [string] $CT2Dir = "third_party/CTranslate2-4.8.3",
+    [string] $CT2Dir = "third_party/CTranslate2-4.9.1",
     [string] $OrtDir = "third_party/onnx/onnxruntime-win-x64-1.31.0",
     [string] $SpmDir = "third_party/sentencepiece",
     [string] $SileroModel = "models/silero_vad.onnx"

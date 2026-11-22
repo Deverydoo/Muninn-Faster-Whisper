@@ -6,11 +6,11 @@ own license, and nothing in Muninn's license limits the rights those licenses
 give you. Full license texts are in the "licenses" folder next to this file.
 
 
-CTranslate2 4.8.3 (bin/ctranslate2.dll)
+CTranslate2 4.9.1 (bin/ctranslate2.dll)
 ---------------------------------------
 License: MIT. Copyright (c) 2019 OpenNMT.     licenses/CTranslate2-LICENSE.txt
-Source:  https://github.com/OpenNMT/CTranslate2/tree/v4.8.3
-Built with Muninn's local changes (patches/ctranslate2-v4.8.3-local.patch in
+Source:  https://github.com/OpenNMT/CTranslate2/tree/v4.9.1
+Built with Muninn's local changes (patches/ctranslate2-v4.9.1-local.patch in
 the Muninn repository; build options in patches/README.md), CUDA 13.2.
 
 Built into ctranslate2.dll:

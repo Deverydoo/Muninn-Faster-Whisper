@@ -1,0 +1,86 @@
+{
+ "label": "ct491",
+ "clips": [
+  {
+   "clip": "ricochet_a_intro",
+   "wer": 3.7,
+   "sub": 4,
+   "del": 4,
+   "ins": 20,
+   "reference": {
+    "segments": 42,
+    "words": 767,
+    "repeated_lines": 1,
+    "short_lines": 0
+   },
+   "muninn": {
+    "segments": 40,
+    "words": 783,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 14.0,
+   "reference_seconds": 22.1,
+   "word_timing": {
+    "matched": 759,
+    "median_s": 0.016,
+    "p90_s": 0.056,
+    "over_0_5s": 27
+   }
+  },
+  {
+   "clip": "ricochet_a_story",
+   "wer": 2.8,
+   "sub": 4,
+   "del": 17,
+   "ins": 1,
+   "reference": {
+    "segments": 35,
+    "words": 781,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn": {
+    "segments": 36,
+    "words": 765,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 20.4,
+   "reference_seconds": 26.2,
+   "word_timing": {
+    "matched": 756,
+    "median_s": 0.02,
+    "p90_s": 0.086,
+    "over_0_5s": 12
+   }
+  },
+  {
+   "clip": "ricochet_d_deaths",
+   "wer": 13.4,
+   "sub": 5,
+   "del": 3,
+   "ins": 1,
+   "reference": {
+    "segments": 4,
+    "words": 67,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn": {
+    "segments": 4,
+    "words": 65,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 8.7,
+   "reference_seconds": 2.6,
+   "word_timing": {
+    "matched": 59,
+    "median_s": 0.018,
+    "p90_s": 1.608,
+    "over_0_5s": 10
+   }
+  }
+ ]
+}

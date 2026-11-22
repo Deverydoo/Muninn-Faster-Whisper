@@ -36,10 +36,10 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release")
 # =======================
 # CTranslate2
 # =======================
-# 4.8.3 with patches/ctranslate2-v4.8.3-local.patch applied, built in
+# 4.9.1 with patches/ctranslate2-v4.9.1-local.patch applied, built in
 # build_cuda13 (see patches/README.md). third_party/CTranslate2 is the older
 # 4.7.1 tree, kept as a fallback.
-set(CTranslate2_DIR "${CMAKE_SOURCE_DIR}/third_party/CTranslate2-4.8.3" CACHE PATH "Path to CTranslate2")
+set(CTranslate2_DIR "${CMAKE_SOURCE_DIR}/third_party/CTranslate2-4.9.1" CACHE PATH "Path to CTranslate2")
 
 # Search for CTranslate2 library in multiple locations:
 # 1. Pre-built in lib/ directory (recommended for quick setup)
