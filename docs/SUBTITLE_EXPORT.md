@@ -1,6 +1,6 @@
-# Subtitle Export (SRT/VTT)
+# Subtitle Export (SRT/VTT/ASS)
 
-Muninn provides automatic subtitle generation from transcription results, with support for SRT, VTT, and metadata JSON formats.
+Muninn provides automatic subtitle generation from transcription results, with support for SRT, VTT, ASS and metadata JSON formats.
 
 ## Overview
 
@@ -15,11 +15,15 @@ video.mp4 → video.srt (universal)
 
 **Features:**
 - SRT format (universal compatibility - all video players)
-- VTT format (web standard with styling, speaker colors)
-- Metadata JSON (Loki Studio format with full data preservation)
+- VTT format (web standard with styling, speaker colors, per-word timestamp tags)
+- ASS format (one plain style, for tools that want ASS)
+- Metadata JSON (Loki Studio format; can be loaded back)
 - Speaker label integration
-- Automatic text splitting (proper line lengths)
-- Multi-format export (SRT + VTT + JSON in one call)
+- Automatic text splitting. Line length is counted in characters, not bytes,
+  and no text is ever dropped: what doesn't fit on `max_lines` lines becomes
+  the next cue
+- Cues come out sorted, numbered, and never overlapping
+- Paths are UTF-8 (folders like "José" or "田中" work on Windows)
 
 ## Quick Start
 
@@ -190,11 +194,12 @@ muninn::SubtitleMetadata::generate_metadata_json(
     "video.mp4",
     "large-v3-turbo",
     result.language,
-    result.duration
+    result.duration,
+    "cuda"              // the device it ran on ("unknown" if left out)
 );
 ```
 
-**Output:** `video_metadata.json`
+**Output:** `video_metadata.json` (one `channel_N` per audio track, `channel_1` = track 0; times to the millisecond)
 ```json
 {
   "video_file": "video.mp4",
@@ -204,17 +209,18 @@ muninn::SubtitleMetadata::generate_metadata_json(
   "device": "cuda",
   "transcriptions": {
     "channel_1": {
+      "track_id": 0,
       "text": "Full transcript text...",
       "segments": [
         {
-          "start": 2.32,
-          "end": 6.72,
+          "start": 2.320,
+          "end": 6.720,
           "text": "All right, well, that was one hell of a party.",
           "words": [...]
         }
       ],
       "language": "en",
-      "duration": 2760.21
+      "duration": 2760.210
     }
   }
 }
@@ -227,31 +233,52 @@ muninn::SubtitleMetadata::generate_metadata_json(
 ```cpp
 struct SubtitleExportOptions {
     // Format
-    SubtitleFormat format = SubtitleFormat::SRT;  // SRT or VTT
+    SubtitleFormat format = SubtitleFormat::SRT;  // SRT, VTT or ASS
+    std::string language = "";             // Picks a language mode ("ja", "ko", "zh", "ru",
+                                           // "es"/"pt", "ar", "hi", "id", "vi", "th") when
+                                           // no enable_*_mode flag is set
 
     // Text formatting
-    int max_chars_per_line = 42;           // Max characters per line
-    int max_lines = 2;                     // Max lines per subtitle
+    int max_chars_per_line = 42;           // Max characters (code points) per line
+    int max_lines = 2;                     // Max lines per subtitle; more text = next cue
     bool auto_split_long_text = true;      // Auto-split at spaces/punctuation
 
     // Speaker labels
     bool include_speakers = false;         // Include speaker labels
     std::string speaker_format = "[{label}] {text}";  // Format template
+    std::map<int, std::string> speaker_names;  // speaker_id -> name, used for {label}
 
     // Timing
     float min_duration = 0.3f;             // Min subtitle duration (seconds)
     float max_duration = 7.0f;             // Max subtitle duration
-    float gap_threshold = 0.1f;            // Merge segments closer than this
+    float gap_threshold = 0.0f;            // Merge a segment into the cue before it when
+                                           // the gap is shorter (0 = never). Same track and
+                                           // speaker only, never past max_duration or
+                                           // max_chars_per_line x max_lines
 
     // VTT-specific
-    bool vtt_include_word_timestamps = false;       // Word-level <v> tags
+    bool vtt_include_word_timestamps = false;       // <00:00:01.250> tag before each word
     bool vtt_include_speaker_colors = false;        // Speaker colors
     std::map<int, std::string> vtt_speaker_colors;  // speaker_id → hex color
+    bool vtt_include_confidence_styling = false;    // ::cue(.uncertain) for words < 0.5
 
     // Output
     std::string output_path;               // Custom output path (optional)
-    bool overwrite_existing = true;        // Overwrite if exists
+    bool overwrite_existing = true;        // false = throw instead of replacing a file
 };
+```
+
+Removed in November 2026 because nothing read them: the `*_word_karaoke`
+options for Russian, Spanish, Arabic, Hindi, Indonesian, Vietnamese and Thai,
+`hindi_phrase_segmentation`, `fade_out_ms` and `vtt_include_intensity_styling`.
+
+Text is escaped for each format: `& < >` become entities in VTT, a `-->` in
+SRT text becomes `->`, and `{ } \` get a backslash in ASS (as FFmpeg does).
+
+```cpp
+// ASS: one plain style (white, black outline, bottom centre, 1920x1080)
+options.format = muninn::SubtitleFormat::ASS;
+exporter.export_subtitles(result.segments, "video.mp4", options);  // video.ass
 ```
 
 ### Speaker Format Templates
@@ -297,6 +324,15 @@ class SubtitleExporter {
                           const std::string& video_path,
                           const SubtitleExportOptions& options = {});
 
+    std::string export_ass(const std::vector<Segment>& segments,
+                          const std::string& video_path,
+                          const SubtitleExportOptions& options = {});
+
+    // The entries the exporters write (sorted, numbered, no overlaps)
+    static std::vector<SubtitleEntry> build_entries(
+        const std::vector<Segment>& segments,
+        const SubtitleExportOptions& options);
+
     // Utilities
     static std::string generate_output_path(const std::string& video_path,
                                            SubtitleFormat format);
@@ -317,9 +353,10 @@ namespace SubtitleMetadata {
         const std::string& video_path,
         const std::string& whisper_model,
         const std::string& language,
-        float duration);
+        float duration,
+        const std::string& device = "unknown");
 
-    // Load segments from metadata JSON
+    // Load segments (words, speakers, tracks) back from metadata JSON
     std::vector<Segment> load_from_metadata_json(const std::string& json_path);
 }
 ```
@@ -380,7 +417,7 @@ muninn::SubtitleExportOptions options;
 options.max_chars_per_line = 35;       // Mobile-friendly
 options.max_lines = 2;                 // Max 2 lines
 options.auto_split_long_text = true;   // Auto-split at word boundaries
-options.gap_threshold = 0.5f;          // Merge segments < 0.5s apart
+options.gap_threshold = 0.5f;          // Merge segments < 0.5s apart (same track/speaker)
 ```
 
 **Before splitting:**
