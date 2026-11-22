@@ -7,6 +7,16 @@
 // so it needs neither muninn.dll nor CTranslate2. ctest label: cpu.
 //
 // Usage: test_translate_text            (exit code 0 = all checks passed)
+
+// A user of diarization.h has no ONNX Runtime headers (this target has none
+// on its include path) and no Muninn build defines; make sure the header
+// compiles that way.
+#ifdef MUNINN_USE_SILERO_VAD
+#undef MUNINN_USE_SILERO_VAD
+#endif
+#include "muninn/diarization.h"
+
+#include "speaker_clustering.h"
 #include "translate_text.h"
 
 #include <algorithm>
@@ -212,12 +222,197 @@ void test_language_codes() {
     CHECK(!is_blank("\xE3\x80\x82"));        // 。 is text
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Speaker clustering
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The clustering loop as it was before the November 2026 audit (D1), copied
+// from diarization.cpp: O(n^3), recomputing every cluster pair's average
+// similarity on every merge. Returns the cluster index of each embedding
+// (clusters are kept in order of their first embedding).
+float old_cosine_similarity(const muninn::SpeakerEmbedding& emb1,
+                            const muninn::SpeakerEmbedding& emb2) {
+    float dot_product = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+    for (size_t i = 0; i < emb1.features.size(); ++i) {
+        dot_product += emb1.features[i] * emb2.features[i];
+        norm1 += emb1.features[i] * emb1.features[i];
+        norm2 += emb2.features[i] * emb2.features[i];
+    }
+    if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
+    return dot_product / (std::sqrt(norm1) * std::sqrt(norm2));
+}
+
+std::vector<int> old_cluster_labels(const std::vector<muninn::SpeakerEmbedding>& embeddings,
+                                    float merge_threshold, int max_speakers) {
+    std::vector<int> cluster_labels(embeddings.size(), -1);
+    std::vector<std::vector<size_t>> clusters;
+    for (size_t i = 0; i < embeddings.size(); ++i) {
+        cluster_labels[i] = static_cast<int>(i);
+        clusters.push_back({i});
+    }
+
+    bool merged = true;
+    while (merged && clusters.size() > 1) {
+        merged = false;
+        float best_similarity = -1.0f;
+        size_t best_i = 0, best_j = 0;
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            for (size_t j = i + 1; j < clusters.size(); ++j) {
+                float total_similarity = 0.0f;
+                size_t pair_count = 0;
+                for (size_t idx_i : clusters[i]) {
+                    for (size_t idx_j : clusters[j]) {
+                        total_similarity += old_cosine_similarity(embeddings[idx_i], embeddings[idx_j]);
+                        pair_count++;
+                    }
+                }
+                float avg_similarity = total_similarity / pair_count;
+                if (avg_similarity > best_similarity && avg_similarity >= merge_threshold) {
+                    best_similarity = avg_similarity;
+                    best_i = i;
+                    best_j = j;
+                    merged = true;
+                }
+            }
+        }
+        if (merged) {
+            clusters[best_i].insert(clusters[best_i].end(),
+                                    clusters[best_j].begin(), clusters[best_j].end());
+            clusters.erase(clusters.begin() + best_j);
+            for (size_t i = 0; i < clusters.size(); ++i)
+                for (size_t idx : clusters[i]) cluster_labels[idx] = static_cast<int>(i);
+        }
+    }
+
+    if (max_speakers > 0 && static_cast<int>(clusters.size()) > max_speakers) {
+        while (static_cast<int>(clusters.size()) > max_speakers) {
+            float best_similarity = -1.0f;
+            size_t best_i = 0, best_j = 0;
+            for (size_t i = 0; i < clusters.size(); ++i) {
+                for (size_t j = i + 1; j < clusters.size(); ++j) {
+                    float total_similarity = 0.0f;
+                    size_t pair_count = 0;
+                    for (size_t idx_i : clusters[i]) {
+                        for (size_t idx_j : clusters[j]) {
+                            total_similarity += old_cosine_similarity(embeddings[idx_i], embeddings[idx_j]);
+                            pair_count++;
+                        }
+                    }
+                    float avg_similarity = total_similarity / pair_count;
+                    if (avg_similarity > best_similarity) {
+                        best_similarity = avg_similarity;
+                        best_i = i;
+                        best_j = j;
+                    }
+                }
+            }
+            clusters[best_i].insert(clusters[best_i].end(),
+                                    clusters[best_j].begin(), clusters[best_j].end());
+            clusters.erase(clusters.begin() + best_j);
+            for (size_t i = 0; i < clusters.size(); ++i)
+                for (size_t idx : clusters[i]) cluster_labels[idx] = static_cast<int>(i);
+        }
+    }
+    return cluster_labels;
+}
+
+// n embeddings around `speakers` random centres; `spread` sets how far each
+// point strays from its centre (bigger = clusters overlap more).
+std::vector<muninn::SpeakerEmbedding> random_embeddings(std::mt19937& rng, size_t n, size_t dim,
+                                                        int speakers, float spread) {
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::uniform_int_distribution<int> pick(0, std::max(0, speakers - 1));
+    std::vector<std::vector<float>> centres(static_cast<size_t>(std::max(1, speakers)),
+                                            std::vector<float>(dim));
+    for (auto& c : centres)
+        for (auto& v : c) v = normal(rng);
+
+    std::vector<muninn::SpeakerEmbedding> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        const auto& c = centres[static_cast<size_t>(pick(rng))];
+        out[i].features.resize(dim);
+        for (size_t d = 0; d < dim; ++d) out[i].features[d] = c[d] + spread * normal(rng);
+        out[i].start = 0.5f * static_cast<float>(i);
+        out[i].end = out[i].start + 1.0f;
+    }
+    return out;
+}
+
+void test_clustering_matches_old() {
+    std::printf("[clustering: new vs old]\n");
+    std::mt19937 rng(20261122);
+
+    const size_t sizes[] = {1, 2, 3, 5, 8, 13, 25, 40, 60};
+    const float thresholds[] = {0.2f, 0.5f, 0.7f, 0.9f};
+    const int max_speakers[] = {0, 1, 2, 3, 10};
+    const float spreads[] = {0.3f, 0.8f, 1.5f};
+
+    int cases = 0, mismatches = 0;
+    int nontrivial = 0;  // neither one cluster nor every point on its own
+    for (size_t n : sizes) {
+        for (float spread : spreads) {
+            const int speakers = 1 + static_cast<int>(rng() % 4);
+            const auto emb = random_embeddings(rng, n, 16, speakers, spread);
+            for (float th : thresholds) {
+                for (int ms : max_speakers) {
+                    const auto expected = old_cluster_labels(emb, th, ms);
+                    const auto got = muninn::detail::cluster_embeddings(emb, th, ms);
+                    ++cases;
+                    const int k = expected.empty() ? 0 : *std::max_element(expected.begin(), expected.end()) + 1;
+                    if (k > 1 && k < static_cast<int>(n)) ++nontrivial;
+                    if (expected != got) {
+                        ++mismatches;
+                        if (mismatches <= 5) {
+                            std::printf("  mismatch: n=%zu spread=%.1f threshold=%.1f max_speakers=%d\n",
+                                        n, spread, th, ms);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::printf("  %d cases (%d with some but not all points merged), %d mismatches\n",
+                cases, nontrivial, mismatches);
+    CHECK(mismatches == 0);
+    CHECK(nontrivial > cases / 3);
+
+    // A zero vector is similar to nothing (0), as before.
+    std::vector<muninn::SpeakerEmbedding> with_zero = random_embeddings(rng, 6, 8, 2, 0.2f);
+    std::fill(with_zero[3].features.begin(), with_zero[3].features.end(), 0.0f);
+    CHECK(old_cluster_labels(with_zero, 0.5f, 0) == muninn::detail::cluster_embeddings(with_zero, 0.5f, 0));
+
+    // Edges
+    CHECK(muninn::detail::cluster_embeddings({}, 0.7f, 10).empty());
+    CHECK(muninn::detail::cluster_embeddings(random_embeddings(rng, 1, 8, 1, 0.1f), 0.7f, 10) ==
+          std::vector<int>{0});
+}
+
+void test_clustering_speed() {
+    std::printf("[clustering: speed]\n");
+    std::mt19937 rng(7);
+    // n = 2000 is about 17 minutes at the default 0.5 s step; 512 = pyannote's size.
+    const auto emb = random_embeddings(rng, 2000, 512, 4, 0.4f);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto labels = muninn::detail::cluster_embeddings(emb, 0.7f, 10);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    const int found = labels.empty() ? 0 : *std::max_element(labels.begin(), labels.end()) + 1;
+    std::printf("  n=2000, dim=512: %.2f s, %d clusters\n", seconds, found);
+    CHECK(labels.size() == 2000);
+    CHECK(seconds < 5.0);
+    CHECK(found == 4);  // four well-separated speakers
+}
+
 } // namespace
 
 int main() {
     test_sentence_splitter();
     test_clean_output();
     test_language_codes();
+    test_clustering_matches_old();
+    test_clustering_speed();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

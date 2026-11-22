@@ -7,10 +7,8 @@
 #include <map>
 #include <memory>
 
-// Only include ONNX Runtime if Silero VAD is enabled
-#ifdef MUNINN_USE_SILERO_VAD
-#include <onnxruntime_cxx_api.h>
-#endif
+// No ONNX Runtime types here: the session lives behind Diarizer::Impl, so
+// this header compiles without ONNX Runtime's headers or any Muninn define.
 
 namespace muninn {
 
@@ -57,7 +55,9 @@ struct DiarizationOptions {
     // ═══════════════════════════════════════════════════════════
     // Embedding Extraction
     // ═══════════════════════════════════════════════════════════
-    float embedding_window_s = 1.0f;       // Window size for embedding extraction (1s = 16000 samples at 16kHz)
+    float embedding_window_s = 1.0f;       // Audio per embedding. A model with a fixed input length
+                                           // (the shipped export takes 16000 samples) gets the window
+                                           // padded or cut to that length, with a warning at load.
     float embedding_step_s = 0.5f;         // Step size between embeddings (50% overlap)
 
     // ═══════════════════════════════════════════════════════════
@@ -69,8 +69,10 @@ struct DiarizationOptions {
     // ═══════════════════════════════════════════════════════════
     // Performance
     // ═══════════════════════════════════════════════════════════
-    std::string device = "cuda";           // "cuda" or "cpu"
-    int num_threads = 4;                   // CPU threads (if device = "cpu")
+    std::string device = "cpu";            // "cpu" or "cuda". CUDA needs an ONNX Runtime with the CUDA
+                                           // provider; without one it falls back to CPU (with a warning).
+                                           // The ONNX Runtime Muninn ships is CPU-only.
+    int num_threads = 4;                   // CPU threads
 };
 
 /**
@@ -135,13 +137,21 @@ public:
     /**
      * @brief Initialize diarizer with embedding model
      *
-     * @param embedding_model_path Path to pyannote embedding ONNX model
+     * @param embedding_model_path Path to pyannote embedding ONNX model (UTF-8)
      * @param options Diarization configuration
+     *
+     * @throws std::runtime_error if the model can't be loaded, the options
+     *         are invalid, or Muninn was built without ONNX Runtime
      */
     Diarizer(const std::string& embedding_model_path,
              const DiarizationOptions& options = DiarizationOptions());
 
     ~Diarizer();
+
+    Diarizer(const Diarizer&) = delete;
+    Diarizer& operator=(const Diarizer&) = delete;
+    Diarizer(Diarizer&&) noexcept;
+    Diarizer& operator=(Diarizer&&) noexcept;
 
     // ═══════════════════════════════════════════════════════════
     // Core Diarization
@@ -211,7 +221,10 @@ public:
     /**
      * @brief Cluster embeddings into speakers
      *
-     * Uses hierarchical clustering with cosine similarity.
+     * Average-linkage agglomerative clustering on cosine similarity, O(n^2)
+     * time and n^2/2 floats of memory. Merges while the average similarity
+     * is at least clustering_threshold, then while there are more than
+     * max_speakers clusters.
      *
      * @param embeddings Speaker embeddings to cluster
      * @return Vector of Speaker objects with clustered embeddings
@@ -261,28 +274,17 @@ public:
 
     /**
      * @brief Get current configuration
+     *
+     * device reflects where the model actually runs ("cpu" after a CUDA
+     * fallback).
      */
     const DiarizationOptions& get_options() const { return options_; }
 
 private:
     DiarizationOptions options_;
 
-    // ONNX Runtime
-    std::unique_ptr<Ort::Env> env_;
-    std::unique_ptr<Ort::Session> embedding_session_;
-    std::unique_ptr<Ort::SessionOptions> session_options_;
-
-    // Model metadata
-    std::vector<int64_t> input_shape_;
-    std::vector<const char*> input_names_;
-    std::vector<const char*> output_names_;
-
-    // Internal methods
-    void initialize_onnx_session();
-    std::vector<float> run_embedding_model(const float* audio_data, size_t num_samples);
-    std::vector<DiarizationSegment> embeddings_to_segments(
-        const std::vector<SpeakerEmbedding>& embeddings,
-        const std::vector<Speaker>& speakers);
+    class Impl;                     // ONNX Runtime session and model metadata
+    std::unique_ptr<Impl> impl_;
 };
 
 /**
@@ -301,6 +303,8 @@ namespace SpeakerFormatting {
 
     /**
      * @brief Build HTML with speaker-specific colors
+     *
+     * The label, the text and the color are HTML-escaped.
      *
      * @param segment Segment with speaker information
      * @param speaker_colors Map of speaker_id -> color hex code

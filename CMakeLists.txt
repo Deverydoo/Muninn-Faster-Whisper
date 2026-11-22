@@ -294,6 +294,7 @@ set(MUNINN_SOURCES
     src/silero_vad.cpp
     src/ten_vad.cpp
     src/diarization.cpp
+    src/speaker_clustering.cpp
     src/subtitle_export.cpp
     # Caption Engine System
     src/caption_types.cpp
@@ -449,7 +450,7 @@ if(BUILD_TESTS)
     add_executable(test_translate_text
         tests/test_translate_text.cpp
         src/translate_text.cpp
-        )
+        src/speaker_clustering.cpp)
     target_include_directories(test_translate_text PRIVATE
         ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
 
