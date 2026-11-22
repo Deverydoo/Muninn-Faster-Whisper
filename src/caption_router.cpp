@@ -14,8 +14,13 @@ namespace muninn {
 // ═══════════════════════════════════════════════════════════════════════════
 
 CaptionRouter& CaptionRouter::instance() {
-    static CaptionRouter instance;
+    static CaptionRouter instance;  // thread-safe initialisation (C++11)
     return instance;
+}
+
+CaptionRouter::CaptionRouter()
+    : fallbackEngine_(std::make_unique<EnglishCaptionEngine>()) {
+    registerDefaultEnginesLocked();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -24,35 +29,53 @@ CaptionRouter& CaptionRouter::instance() {
 
 void CaptionRouter::registerEngine(std::unique_ptr<ICaptionEngine> engine) {
     if (engine) {
+        std::unique_lock lock(mutex_);
         engines_.push_back(std::move(engine));
     }
 }
 
+size_t CaptionRouter::engineCount() const {
+    std::shared_lock lock(mutex_);
+    return engines_.size();
+}
+
 void CaptionRouter::registerDefaultEngines() {
-    // Clear existing engines
-    engines_.clear();
+    std::unique_lock lock(mutex_);
+    registerDefaultEnginesLocked();
+}
+
+void CaptionRouter::registerDefaultEnginesLocked() {
+    if (defaultsRegistered_) {
+        return;
+    }
+    defaultsRegistered_ = true;
+
+    auto add = [this](std::unique_ptr<ICaptionEngine> engine) {
+        engines_.push_back(std::move(engine));
+    };
 
     // CJK Family
-    registerEngine(std::make_unique<JapaneseCaptionEngine>());
-    registerEngine(std::make_unique<KoreanCaptionEngine>());
-    registerEngine(std::make_unique<ChineseCaptionEngine>(ChineseCaptionEngine::Variant::Simplified));
-    registerEngine(std::make_unique<ChineseCaptionEngine>(ChineseCaptionEngine::Variant::Traditional));
+    add(std::make_unique<JapaneseCaptionEngine>());
+    add(std::make_unique<KoreanCaptionEngine>());
+    add(std::make_unique<ChineseCaptionEngine>(ChineseCaptionEngine::Variant::Simplified));
+    add(std::make_unique<ChineseCaptionEngine>(ChineseCaptionEngine::Variant::Traditional));
 
     // Latin Family
-    registerEngine(std::make_unique<EnglishCaptionEngine>());
-    registerEngine(std::make_unique<SpanishCaptionEngine>());
-    registerEngine(std::make_unique<PortugueseCaptionEngine>());
-    registerEngine(std::make_unique<IndonesianCaptionEngine>());
-    registerEngine(std::make_unique<VietnameseCaptionEngine>());
+    add(std::make_unique<EnglishCaptionEngine>());
+    add(std::make_unique<SpanishCaptionEngine>());
+    add(std::make_unique<PortugueseCaptionEngine>());
+    add(std::make_unique<IndonesianCaptionEngine>());
+    add(std::make_unique<VietnameseCaptionEngine>());
 
     // Other Families
-    registerEngine(std::make_unique<RussianCaptionEngine>());
-    registerEngine(std::make_unique<ArabicCaptionEngine>());
-    registerEngine(std::make_unique<HindiCaptionEngine>());
-    registerEngine(std::make_unique<ThaiCaptionEngine>());
+    add(std::make_unique<RussianCaptionEngine>());
+    add(std::make_unique<ArabicCaptionEngine>());
+    add(std::make_unique<HindiCaptionEngine>());
+    add(std::make_unique<ThaiCaptionEngine>());
 }
 
 std::vector<std::string> CaptionRouter::supportedLanguages() const {
+    std::shared_lock lock(mutex_);
     std::vector<std::string> languages;
 
     for (const auto& engine : engines_) {
@@ -106,7 +129,9 @@ ICaptionEngine* CaptionRouter::getEngine(const LanguageInfo& langInfo) const {
 }
 
 ICaptionEngine* CaptionRouter::getEngine(const std::string& langCode) const {
-    // Find best matching engine
+    std::shared_lock lock(mutex_);
+
+    // Find best matching engine; the first one registered wins a tie.
     ICaptionEngine* bestEngine = nullptr;
     int bestScore = 0;
 
@@ -118,15 +143,8 @@ ICaptionEngine* CaptionRouter::getEngine(const std::string& langCode) const {
         }
     }
 
-    // Fallback to English engine
-    if (!bestEngine) {
-        if (!fallbackEngine_) {
-            fallbackEngine_ = std::make_unique<EnglishCaptionEngine>();
-        }
-        return fallbackEngine_.get();
-    }
-
-    return bestEngine;
+    // Fallback to English engine (made in the constructor, never changes)
+    return bestEngine ? bestEngine : fallbackEngine_.get();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -142,17 +160,17 @@ CaptionEngineOptions CaptionRouter::getPreset(const LanguageInfo& langInfo) cons
 // ═══════════════════════════════════════════════════════════════════════════
 
 CaptionDocument CaptionRouter::process(const std::vector<Segment>& segments,
-                                        const CaptionEngineOptions& userOptions) const {
+                                        const CaptionEngineOverrides& overrides) const {
     // Stage A: Language detection
     LanguageInfo detected = detectLanguage(segments);
-    LanguageInfo resolved = resolveLanguage(detected, userOptions.languageHint);
+    LanguageInfo resolved = resolveLanguage(detected, overrides.languageHint);
 
     // Stage B: Engine selection
     ICaptionEngine* engine = getEngine(resolved);
 
-    // Stage C: Preset selection + merge user options
+    // Stage C: Preset selection + the caller's overrides
     CaptionEngineOptions options = getPreset(resolved);
-    options.merge(userOptions);
+    options.merge(overrides);
 
     // Process through engine pipeline
     CaptionDocument doc = engine->process(segments, options);
@@ -162,6 +180,19 @@ CaptionDocument CaptionRouter::process(const std::vector<Segment>& segments,
     doc.metadata.script = resolved.script;
     doc.metadata.confidence = resolved.confidence;
 
+    return doc;
+}
+
+CaptionDocument CaptionRouter::processWithOptions(const std::vector<Segment>& segments,
+                                                   const CaptionEngineOptions& options) const {
+    LanguageInfo detected = detectLanguage(segments);
+    LanguageInfo resolved = resolveLanguage(detected, options.languageHint);
+
+    CaptionDocument doc = getEngine(resolved)->process(segments, options);
+
+    doc.metadata.language = resolved.langCode;
+    doc.metadata.script = resolved.script;
+    doc.metadata.confidence = resolved.confidence;
     return doc;
 }
 

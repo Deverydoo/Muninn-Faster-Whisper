@@ -2,6 +2,7 @@
 
 #include "export.h"
 #include "caption_types.h"
+#include <optional>
 #include <string>
 
 namespace muninn {
@@ -26,14 +27,13 @@ struct MUNINN_API PresentationOptions {
     float phraseLeadInMs = 220.0f;      // Show caption before first word (150-300ms)
     float tokenRevealMs = 60.0f;        // Per-token reveal lead time (0-120ms)
 
-    // === Hold/Clear Timing ===
+    // === Hold/Fade Timing ===
+    // The hold and fade never run past the moment the next cue appears.
     float minHoldAfterSpeechS = 1.4f;   // Minimum hold after last word (1-2s)
-    float clearAfterSilenceS = 4.5f;    // Clear captions after silence (3-6s)
     float fadeOutMs = 250.0f;           // Fade out duration (200-350ms)
 
     // === Pause Behavior ===
-    float pauseBreakThresholdMs = 320.0f;  // Break phrases on pauses > this (250-400ms)
-    float silenceHideThresholdS = 1.0f;    // Hide caption during gaps > this
+    float pauseBreakThresholdMs = 320.0f;  // Start a new cue on pauses > this (250-400ms)
 
     PresentationOptions() = default;
 
@@ -42,7 +42,6 @@ struct MUNINN_API PresentationOptions {
         PresentationOptions opts;
         opts.phraseLeadInMs = 150.0f;
         opts.minHoldAfterSpeechS = 1.0f;
-        opts.clearAfterSilenceS = 3.0f;
         opts.pauseBreakThresholdMs = 250.0f;
         return opts;
     }
@@ -52,42 +51,45 @@ struct MUNINN_API PresentationOptions {
         PresentationOptions opts;
         opts.phraseLeadInMs = 300.0f;
         opts.minHoldAfterSpeechS = 2.0f;
-        opts.clearAfterSilenceS = 6.0f;
         opts.pauseBreakThresholdMs = 400.0f;
         return opts;
     }
 };
+
+struct CaptionEngineOverrides;
 
 /**
  * @brief Caption engine configuration
  *
  * Engine-agnostic options that apply to all languages.
  * Language-specific tuning is handled by engine presets.
+ *
+ * Line-break rules (kinsoku, geumchik, Russian prepositions) are part of
+ * each language engine and always apply. Token granularity (word,
+ * character, syllable) is also the engine's: see tokenGranularity().
  */
 struct MUNINN_API CaptionEngineOptions {
     // === Layout Constraints ===
     int maxCharsPerLine = 42;           // Max characters per line
-    int maxLines = 2;                   // Max lines per cue
+    int maxLines = 2;                   // Max lines per cue (text past this
+                                        // starts a new cue; nothing is dropped)
     float maxDuration = 7.0f;           // Max cue duration (seconds)
-    float minDuration = 1.0f;           // Min cue duration (seconds)
+    float minDuration = 1.0f;           // Min cue duration (seconds); never
+                                        // runs into the next cue
 
     // === Reading Speed (CPS) ===
     float maxCps = 17.0f;               // Characters per second limit
-    float minCps = 0.0f;                // Min CPS (for pacing, 0 = no min)
 
     // === Break Behavior ===
     bool breakOnSentence = true;        // Break at sentence-ending punctuation
-    bool breakOnPause = true;           // Break on pauses > threshold
-    float pauseThresholdMs = 320.0f;    // Pause threshold (ms)
+    bool breakOnPause = true;           // Break on pauses longer than
+                                        // presentation.pauseBreakThresholdMs
 
     // === Typography Rules ===
-    bool applyLineBreakRules = true;    // Apply language-specific line-break rules
-    bool avoidOrphanWords = true;       // Avoid single words on last line
-    bool balanceLines = false;          // Try to balance line lengths
-
-    // === Karaoke Options ===
-    bool enableKaraoke = false;         // Enable per-token highlighting
-    TokenGranularity karaokeGranularity = TokenGranularity::Word;
+    bool avoidOrphanWords = true;       // Don't leave one word alone on the last
+                                        // line: pull one down from the line above
+    bool balanceLines = false;          // Split two-line cues where the lines
+                                        // come out closest in length
 
     // === Presentation ===
     PresentationOptions presentation;
@@ -97,13 +99,48 @@ struct MUNINN_API CaptionEngineOptions {
     std::string scriptHint;             // ISO 15924 (e.g., "Hans", "Hant")
 
     // === Output Format ===
-    bool includeWordTimestamps = true;  // Include word timing in output
     bool generatePresentationEvents = true;  // Generate karaoke events
 
     CaptionEngineOptions() = default;
 
-    // Merge user overrides (non-default values take priority)
-    void merge(const CaptionEngineOptions& overrides);
+    /**
+     * @brief Apply user overrides on top of these options (usually a preset)
+     *
+     * Every field that is set in `overrides` replaces the value here, even
+     * when it equals the built-in default. Unset fields leave the value alone.
+     */
+    void merge(const CaptionEngineOverrides& overrides);
+};
+
+/**
+ * @brief Options a caller wants to change, on top of a language preset
+ *
+ * Each field is optional: set only what you want to change. A value that
+ * happens to equal the default still counts (asking for 42 characters on a
+ * Japanese preset of 22 gives 42).
+ */
+struct MUNINN_API CaptionEngineOverrides {
+    std::optional<int> maxCharsPerLine;
+    std::optional<int> maxLines;
+    std::optional<float> maxDuration;
+    std::optional<float> minDuration;
+    std::optional<float> maxCps;
+    std::optional<bool> breakOnSentence;
+    std::optional<bool> breakOnPause;
+    std::optional<bool> avoidOrphanWords;
+    std::optional<bool> balanceLines;
+    std::optional<bool> generatePresentationEvents;
+
+    // Presentation timing
+    std::optional<float> phraseLeadInMs;
+    std::optional<float> tokenRevealMs;
+    std::optional<float> minHoldAfterSpeechS;
+    std::optional<float> fadeOutMs;
+    std::optional<float> pauseBreakThresholdMs;
+
+    // Routing: empty = detect from the segments
+    std::string languageHint;
+    std::string scriptHint;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace muninn {
@@ -46,6 +47,9 @@ struct MUNINN_API LanguageInfo {
  * @brief Caption Router singleton
  *
  * Manages engine registration, language routing, and caption processing.
+ * The default engines are registered when the router is first used.
+ * Registration and lookups are thread-safe, and engines are never removed,
+ * so a pointer from getEngine() stays valid for the life of the program.
  */
 class MUNINN_API CaptionRouter {
 public:
@@ -64,19 +68,27 @@ public:
 
     /**
      * @brief Register a caption engine
+     *
+     * When two engines score the same for a language, the one registered
+     * first is used.
+     *
      * @param engine Engine to register (router takes ownership)
      */
     void registerEngine(std::unique_ptr<ICaptionEngine> engine);
 
     /**
      * @brief Register all default engines
+     *
+     * The constructor already does this, so there is no need to call it.
+     * Calling it again does nothing: it never clears engines (which would
+     * leave dangling pointers in other threads).
      */
     void registerDefaultEngines();
 
     /**
      * @brief Get number of registered engines
      */
-    size_t engineCount() const { return engines_.size(); }
+    size_t engineCount() const;
 
     /**
      * @brief Get list of supported language codes
@@ -148,18 +160,31 @@ public:
      * 4. Token → Cue → Event pipeline
      *
      * @param segments ASR transcription segments
-     * @param userOptions User options (merged with preset)
+     * @param overrides Options to change on top of the language preset
      * @return Complete caption document
      */
     CaptionDocument process(const std::vector<Segment>& segments,
-                            const CaptionEngineOptions& userOptions = {}) const;
+                            const CaptionEngineOverrides& overrides = {}) const;
+
+    /**
+     * @brief Process with complete options of your own (no preset)
+     *
+     * The engine is chosen from options.languageHint, or detected from the
+     * segments when the hint is empty.
+     */
+    CaptionDocument processWithOptions(const std::vector<Segment>& segments,
+                                       const CaptionEngineOptions& options) const;
 
 private:
-    CaptionRouter() = default;
+    CaptionRouter();
     ~CaptionRouter() = default;
 
+    void registerDefaultEnginesLocked();
+
+    mutable std::shared_mutex mutex_;
     std::vector<std::unique_ptr<ICaptionEngine>> engines_;
-    mutable std::unique_ptr<ICaptionEngine> fallbackEngine_;
+    bool defaultsRegistered_ = false;
+    const std::unique_ptr<ICaptionEngine> fallbackEngine_;  // English, made up front
 };
 
 } // namespace muninn
