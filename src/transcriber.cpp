@@ -1762,6 +1762,9 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         for (const auto& mel : batch_mel_features) {
             max_frames = std::max(max_frames, static_cast<int>(mel.size()));
         }
+        // Every item padded to 30 s, as a single window is: a short unpadded
+        // one makes Whisper stop early or invent text.
+        max_frames = std::max(max_frames, 3000);
 
         // Build batched features tensor [batch_size, n_mels, max_frames]
         // Pad shorter sequences with zeros
@@ -1819,9 +1822,23 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         whisper_options.suppress_blank = options.suppress_blank;
         whisper_options.suppress_tokens = options.suppress_tokens;
 
+        // The initial prompt goes in front, as token ids, like a single window's.
+        std::vector<size_t> prompt_ids;
+        if (!options.initial_prompt.empty() && vocabulary && startofprev_id) {
+            std::vector<size_t> context = encode_text(" " + options.initial_prompt);
+            if (context.size() > 223) context.erase(context.begin(), context.end() - 223);
+            if (!context.empty()) {
+                prompt_ids.push_back(startofprev_id);
+                prompt_ids.insert(prompt_ids.end(), context.begin(), context.end());
+                for (const auto& t : sot_sequence(options)) prompt_ids.push_back(vocabulary->to_id(t));
+            }
+        }
+
         // Run batched Whisper generation
         Logger::info("Calling CTranslate2 batch generate() with batch_size=" + std::to_string(batch_size));
-        auto future_results = model->generate(features, prompts, whisper_options);
+        auto future_results = prompt_ids.empty()
+            ? model->generate(features, prompts, whisper_options)
+            : model->generate(features, std::vector<std::vector<size_t>>(batch_size, prompt_ids), whisper_options);
         Logger::info("CTranslate2 batch returned " + std::to_string(future_results.size()) + " futures");
 
         // ───────────────────────────────────────────────────────────────────
@@ -1859,6 +1876,7 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                 }
             } catch (const std::exception& e) {
                 Logger::error("Batch item " + std::to_string(b) + " generate EXCEPTION: " + std::string(e.what()));
+                note_failure(e.what());
             }
         }
 
@@ -1941,6 +1959,21 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                 float cum_logprob = result.scores[0] *
                     std::pow(static_cast<float>(seq_len), options.length_penalty);
                 avg_logprob = cum_logprob / static_cast<float>(seq_len + 1);
+            }
+
+            if (result.sequences.empty() || result.sequences_ids.empty()) continue;
+
+            // A decode that failed the checks gets the single-window path,
+            // which has the temperature fallback (the batched decode had none).
+            {
+                const float ratio = compression_ratio_of(extract_text(result.sequences[0]));
+                const bool silence = result.no_speech_prob > options.no_speech_threshold &&
+                                     avg_logprob < options.log_prob_threshold;
+                if (!silence && options.temperature_fallback.size() > 1 &&
+                    needs_temperature_fallback(ratio, avg_logprob, options)) {
+                    all_segments[b] = transcribe_chunk(batch_mel_features[b], chunk_start_time, options);
+                    continue;
+                }
             }
 
             // Extract text with timestamps
@@ -2431,29 +2464,31 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
     muninn::mlog() << "[Muninn] Audio: " << audio_samples.size() << " samples, duration: "
               << original_duration << "s\n";
 
-    // Apply clip timestamps if specified
-    std::vector<float> clipped_samples;
+    // Apply clip timestamps if specified. Without a clip the caller's samples
+    // are used as they are (they used to be copied whole, a track's worth).
+    std::vector<float> clip_storage;
     float clip_offset = 0.0f;
     if (options.clip_start > 0.0f || (options.clip_end >= 0.0f && options.clip_end < original_duration)) {
         float clip_start = std::max(0.0f, options.clip_start);
         float clip_end = (options.clip_end < 0.0f) ? original_duration : std::min(original_duration, options.clip_end);
 
         if (clip_start < clip_end) {
-            size_t start_sample = static_cast<size_t>(clip_start * 16000.0f);
+            size_t start_sample = std::min(static_cast<size_t>(clip_start * 16000.0f), audio_samples.size());
             size_t end_sample = static_cast<size_t>(clip_end * 16000.0f);
             end_sample = std::min(end_sample, audio_samples.size());
 
-            clipped_samples.assign(audio_samples.begin() + start_sample, audio_samples.begin() + end_sample);
+            clip_storage.assign(audio_samples.begin() + start_sample, audio_samples.begin() + end_sample);
             clip_offset = clip_start;
 
             muninn::mlog() << "[Muninn] Clipping audio: " << clip_start << "s - " << clip_end << "s ("
-                      << clipped_samples.size() << " samples)\n";
+                      << clip_storage.size() << " samples)\n";
         } else {
-            clipped_samples = audio_samples;
+            Logger::warn("Clip range ignored: start " + std::to_string(clip_start) +
+                         " s is not before end " + std::to_string(clip_end) + " s");
         }
-    } else {
-        clipped_samples = audio_samples;
     }
+    const bool clipped = clip_offset > 0.0f || !clip_storage.empty();
+    const std::vector<float>& clipped_samples = clipped ? clip_storage : audio_samples;
 
     original_duration = clipped_samples.size() / 16000.0f;
 
@@ -2481,6 +2516,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
 
     // VAD
     std::vector<float> processed_samples;
+    bool vad_passthrough = false;   // no VAD ran: use clipped_samples as they are
     std::vector<SpeechSegment> speech_segments;
 
     auto perf_t0 = std::chrono::steady_clock::now();
@@ -2663,7 +2699,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
 
             case VADType::None:
             default:
-                processed_samples = clipped_samples;
+                vad_passthrough = true;   // no copy: the mel reads clipped_samples
                 break;
         }
 
@@ -2678,10 +2714,11 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
             }
         }
     } else {
-        processed_samples = clipped_samples;
-        Logger::info("VAD disabled, using all " + std::to_string(processed_samples.size()) + " samples");
+        vad_passthrough = true;
+        Logger::info("VAD disabled, using all " + std::to_string(clipped_samples.size()) + " samples");
     }
     perf_log("VAD");
+    const std::vector<float>& mel_input = vad_passthrough ? clipped_samples : processed_samples;
 
     if (cancelled.load(std::memory_order_acquire)) {
         prepared.original_duration = original_duration;
@@ -2694,8 +2731,8 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
     if (progress_callback) {
         progress_callback(track_id, total_tracks, 0.07f, "Computing mel-spectrogram...");
     }
-    Logger::info("Converting to mel-spectrogram from " + std::to_string(processed_samples.size()) + " samples");
-    auto mel_features = compute_mel(processed_samples);
+    Logger::info("Converting to mel-spectrogram from " + std::to_string(mel_input.size()) + " samples");
+    auto mel_features = compute_mel(mel_input);
 
     int n_frames = static_cast<int>(mel_features.size());
     Logger::info("Mel-spectrogram: " + std::to_string(n_frames) + " frames x " +
@@ -2981,11 +3018,13 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
             int num_chunks = static_cast<int>(chunk_ranges.size());
             muninn::mlog() << "[Muninn] Processing " << num_chunks << " chunk(s) with batch size " << BATCH_SIZE << "\n";
 
-            // Prepare all chunks upfront
+            // Prepare all chunks upfront (batched mode only: sequential mode
+            // reads windows straight from mel_features, and this second full
+            // copy of the mel was built for nothing)
             std::vector<std::vector<std::vector<float>>> all_chunk_features;
             std::vector<float> all_chunk_start_times;
 
-            for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+            for (int chunk_idx = 0; chunk_idx < (effective_options.sequential ? 0 : num_chunks); ++chunk_idx) {
                 int start_frame = chunk_ranges[chunk_idx].first;
                 int end_frame = chunk_ranges[chunk_idx].second;
                 float chunk_start_time = start_frame * 0.01f;
