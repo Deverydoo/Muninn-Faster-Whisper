@@ -9,6 +9,46 @@
 
 namespace muninn {
 
+namespace {
+
+// Replace every occurrence of `from` in `text`, scanning left to right.
+void replace_all(std::string& text, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+// WebVTT and HTML: & < > are markup, so they must be written as entities.
+// Escaping > also takes care of a "-->" inside the text.
+std::string escape_markup(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            default:  out += c;
+        }
+    }
+    return out;
+}
+
+// SRT has no escaping. A "-->" in the text would read as a timing line,
+// so it becomes "->" (repeated, since "--->" contains it twice over).
+std::string escape_srt_text(const std::string& text) {
+    std::string out = text;
+    while (out.find("-->") != std::string::npos) {
+        replace_all(out, "-->", "->");
+    }
+    return out;
+}
+
+}  // namespace
+
 // ═══════════════════════════════════════════════════════════
 // High-level Export
 // ═══════════════════════════════════════════════════════════
@@ -280,7 +320,7 @@ std::string SubtitleExporter::format_srt_entry(const SubtitleEntry& entry) {
         << format_srt_timestamp(entry.end) << "\n";
 
     // Text
-    oss << entry.text << "\n";
+    oss << escape_srt_text(entry.text) << "\n";
 
     return oss.str();
 }
@@ -335,7 +375,7 @@ std::string SubtitleExporter::format_vtt_entry(const SubtitleEntry& entry,
         oss << "<v " << voice_tag << ">";
 
         for (const auto& word : entry.words) {
-            oss << word.word;
+            oss << escape_markup(word.word);
             if (&word != &entry.words.back()) {
                 oss << " ";
             }
@@ -346,11 +386,11 @@ std::string SubtitleExporter::format_vtt_entry(const SubtitleEntry& entry,
     } else if (options.vtt_include_speaker_colors && entry.speaker_id >= 0) {
         // Speaker voice tag (for styling)
         std::string voice_tag = "Speaker" + std::to_string(entry.speaker_id);
-        oss << "<v " << voice_tag << ">" << entry.text << "</v>\n";
+        oss << "<v " << voice_tag << ">" << escape_markup(entry.text) << "</v>\n";
 
     } else {
         // Plain text
-        oss << entry.text << "\n";
+        oss << escape_markup(entry.text) << "\n";
     }
 
     return oss.str();

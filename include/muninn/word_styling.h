@@ -144,7 +144,28 @@ public:
 class HTMLFormatter {
 public:
     /**
-     * @brief Format a word with HTML styling
+     * @brief Escape text for HTML (& < > " ')
+     *
+     * Transcribed words can contain markup characters ("<3", "AT&T").
+     */
+    static std::string escape(const std::string& text) {
+        std::string out;
+        out.reserve(text.size());
+        for (char c : text) {
+            switch (c) {
+                case '&':  out += "&amp;"; break;
+                case '<':  out += "&lt;"; break;
+                case '>':  out += "&gt;"; break;
+                case '"':  out += "&quot;"; break;
+                case '\'': out += "&#39;"; break;
+                default:   out += c;
+            }
+        }
+        return out;
+    }
+
+    /**
+     * @brief Format a word with HTML styling (the word is escaped)
      */
     static std::string format_word(const std::string& word, const WordStyle& style) {
         std::ostringstream html;
@@ -171,7 +192,7 @@ public:
         if (style.italic) html << "<i>";
 
         // Word text
-        html << word;
+        html << escape(word);
 
         // Close tags
         if (style.italic) html << "</i>";
