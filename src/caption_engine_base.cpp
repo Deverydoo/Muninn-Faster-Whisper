@@ -583,14 +583,16 @@ std::vector<CaptionToken> CaptionEngineBase::splitHangulSyllables(
 // ═══════════════════════════════════════════════════════════════════════════
 // Line Splitting Helpers
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// The splitters return every line, even past maxLines. buildCues starts a new
+// cue before the text would need more lines than that, so text is never lost.
 
 std::string CaptionEngineBase::splitLinesAtWords(const std::string& text,
                                                   int maxChars,
-                                                  int maxLines) const {
-    if (static_cast<int>(countCharacters(text)) <= maxChars) {
-        return text;
-    }
-
+                                                  int /* maxLines: never truncates */) const {
+    // No early return on countCharacters(text): it leaves out spaces, so a
+    // line of short words could pass it and still be wider than maxChars.
+    // The loop below counts a space between words, as a reader sees them.
     std::vector<std::string> lines;
     std::string currentLine;
     size_t currentCount = 0;
@@ -618,7 +620,7 @@ std::string CaptionEngineBase::splitLinesAtWords(const std::string& text,
     }
 
     // Build lines
-    for (size_t i = 0; i < words.size() && static_cast<int>(lines.size()) < maxLines; ++i) {
+    for (size_t i = 0; i < words.size(); ++i) {
         const std::string& word = words[i];
         size_t wordLen = countCharacters(word);
 
@@ -629,19 +631,16 @@ std::string CaptionEngineBase::splitLinesAtWords(const std::string& text,
 
         bool shouldBreak = (newCount > static_cast<size_t>(maxChars) && !currentLine.empty());
 
-        // Check short word rules
-        if (shouldBreak && isShortWordNoBreak(word)) {
-            // Don't break if this word is a short preposition
-            // Check if we can move the last word to the new line
+        // Don't leave a short no-break word (preposition, article) at the end
+        // of the line: move it down with this word.
+        if (shouldBreak) {
             size_t lastSpace = currentLine.rfind(' ');
             if (lastSpace != std::string::npos) {
                 std::string lastWord = currentLine.substr(lastSpace + 1);
                 if (isShortWordNoBreak(lastWord)) {
-                    // Move last word to next line with this word
-                    currentLine = currentLine.substr(0, lastSpace);
-                    lines.push_back(currentLine);
+                    lines.push_back(currentLine.substr(0, lastSpace));
                     currentLine = lastWord + " " + word;
-                    currentCount = countCharacters(currentLine);
+                    currentCount = countCharacters(lastWord) + 1 + wordLen;
                     continue;
                 }
             }
@@ -662,7 +661,7 @@ std::string CaptionEngineBase::splitLinesAtWords(const std::string& text,
     }
 
     // Add remaining
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines) {
+    if (!currentLine.empty()) {
         lines.push_back(currentLine);
     }
 
@@ -680,7 +679,7 @@ std::string CaptionEngineBase::splitLinesAtWords(const std::string& text,
 
 std::string CaptionEngineBase::splitLinesAtCharacters(const std::string& text,
                                                        int maxChars,
-                                                       int maxLines) const {
+                                                       int /* maxLines: never truncates */) const {
     if (static_cast<int>(countCharacters(text)) <= maxChars) {
         return text;
     }
@@ -690,7 +689,7 @@ std::string CaptionEngineBase::splitLinesAtCharacters(const std::string& text,
     std::string currentLine;
     int currentCount = 0;
 
-    for (size_t i = 0; i < chars.size() && static_cast<int>(lines.size()) < maxLines; ++i) {
+    for (size_t i = 0; i < chars.size(); ++i) {
         const std::string& ch = chars[i];
 
         // Check if we can break here
@@ -714,7 +713,7 @@ std::string CaptionEngineBase::splitLinesAtCharacters(const std::string& text,
         currentLine += ch;
 
         // Check if we should break
-        if (currentCount >= maxChars && canBreakHere) {
+        if (currentCount >= maxChars && canBreakHere && i + 1 < chars.size()) {
             lines.push_back(currentLine);
             currentLine.clear();
             currentCount = 0;
@@ -722,7 +721,7 @@ std::string CaptionEngineBase::splitLinesAtCharacters(const std::string& text,
     }
 
     // Add remaining
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines) {
+    if (!currentLine.empty()) {
         lines.push_back(currentLine);
     }
 
@@ -739,6 +738,121 @@ std::string CaptionEngineBase::splitLinesAtCharacters(const std::string& text,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Line Layout (avoidOrphanWords, balanceLines)
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+std::vector<std::string> wordsOf(const std::string& line) {
+    std::vector<std::string> words;
+    std::string word;
+    for (char c : line) {
+        if (c == ' ') {
+            if (!word.empty()) words.push_back(word);
+            word.clear();
+        } else {
+            word += c;
+        }
+    }
+    if (!word.empty()) words.push_back(word);
+    return words;
+}
+
+std::string joinWords(const std::vector<std::string>& words, size_t first, size_t last) {
+    std::string out;
+    for (size_t i = first; i < last; ++i) {
+        if (i > first) out += ' ';
+        out += words[i];
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::string> CaptionEngineBase::layoutLines(std::vector<std::string> lines,
+                                                         const CaptionEngineOptions& options) const {
+    const size_t maxChars = static_cast<size_t>(std::max(1, options.maxCharsPerLine));
+    bool spaced = false;
+    for (const auto& line : lines) {
+        if (line.find(' ') != std::string::npos) spaced = true;
+    }
+
+    // Length of words[first, last) on one line, as splitLinesAtWords measures it.
+    auto lineLength = [this](const std::vector<std::string>& words, size_t first, size_t last) {
+        size_t length = 0;
+        for (size_t i = first; i < last; ++i) length += countCharacters(words[i]);
+        return length + (last > first ? last - first - 1 : 0);
+    };
+
+    // balanceLines: re-split a two-line cue where the lines come out closest
+    // in length, keeping both within maxChars and the line-break rules.
+    if (options.balanceLines && lines.size() == 2) {
+        if (spaced) {
+            std::vector<std::string> words = wordsOf(lines[0]);
+            const std::vector<std::string> second = wordsOf(lines[1]);
+            words.insert(words.end(), second.begin(), second.end());
+
+            size_t bestSplit = 0;
+            size_t bestScore = static_cast<size_t>(-1);
+            for (size_t k = 1; k < words.size(); ++k) {
+                const size_t a = lineLength(words, 0, k);
+                const size_t b = lineLength(words, k, words.size());
+                if (a > maxChars || b > maxChars) continue;
+                size_t score = (a > b) ? a - b : b - a;
+                if (isShortWordNoBreak(words[k - 1])) score += 1000;  // last resort only
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestSplit = k;
+                }
+            }
+            if (bestSplit > 0) {
+                lines = {joinWords(words, 0, bestSplit), joinWords(words, bestSplit, words.size())};
+            }
+        } else {
+            const std::vector<std::string> chars = utf8ToChars(lines[0] + lines[1]);
+            size_t bestSplit = 0;
+            size_t bestScore = static_cast<size_t>(-1);
+            for (size_t k = 1; k < chars.size(); ++k) {
+                if (!canEndLine(chars[k - 1]) || !canStartLine(chars[k])) continue;
+                std::string a, b;
+                for (size_t i = 0; i < k; ++i) a += chars[i];
+                for (size_t i = k; i < chars.size(); ++i) b += chars[i];
+                const size_t la = countCharacters(a);
+                const size_t lb = countCharacters(b);
+                if (la > maxChars || lb > maxChars) continue;
+                const size_t score = (la > lb) ? la - lb : lb - la;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestSplit = k;
+                }
+            }
+            if (bestSplit > 0) {
+                std::string a, b;
+                for (size_t i = 0; i < bestSplit; ++i) a += chars[i];
+                for (size_t i = bestSplit; i < chars.size(); ++i) b += chars[i];
+                lines = {a, b};
+            }
+        }
+    }
+
+    // avoidOrphanWords: one word alone on the last line takes the last word
+    // of the line above with it, when that still fits.
+    if (options.avoidOrphanWords && spaced && lines.size() >= 2) {
+        std::vector<std::string> last = wordsOf(lines.back());
+        std::vector<std::string> prev = wordsOf(lines[lines.size() - 2]);
+        if (last.size() == 1 && prev.size() >= 2) {
+            std::vector<std::string> newLast = {prev.back(), last[0]};
+            if (lineLength(newLast, 0, 2) <= maxChars) {
+                lines[lines.size() - 2] = joinWords(prev, 0, prev.size() - 1);
+                lines.back() = joinWords(newLast, 0, 2);
+            }
+        }
+    }
+
+    return lines;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Generic Cue Builder (Template Method Pattern)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -752,52 +866,63 @@ std::vector<CaptionCue> CaptionEngineBase::buildCues(
         return cues;
     }
 
-    int cueIndex = 1;
+    const int maxChars = std::max(1, options.maxCharsPerLine);
+    const int maxLines = std::max(1, options.maxLines);
+
     std::string currentText;
     std::vector<CaptionToken> currentTokens;
+    std::vector<int> currentIndices;
     float cueStart = -1.0f;
     float cueEnd = 0.0f;
     float lastTokenEnd = 0.0f;
 
     float pauseThresholdS = options.presentation.pauseBreakThresholdMs / 1000.0f;
 
+    auto linesNeeded = [&](const std::string& text) {
+        const std::string split = splitLines(text, maxChars, maxLines);
+        return 1 + static_cast<int>(std::count(split.begin(), split.end(), '\n'));
+    };
+
     auto flushCue = [&]() {
         if (currentText.empty() || cueStart < 0) {
             return;
         }
 
-        // Enforce minimum duration
-        float duration = cueEnd - cueStart;
-        if (duration < options.minDuration) {
-            cueEnd = cueStart + options.minDuration;
-        }
+        const float speechDuration = cueEnd - cueStart;
 
         CaptionCue cue;
-        cue.index = cueIndex++;
         cue.start = cueStart;
-        cue.end = cueEnd;
+        // Enforce minimum duration (the overlap pass below keeps it from
+        // running into the next cue)
+        cue.end = std::max(cueEnd, cueStart + options.minDuration);
         cue.tokens = currentTokens;
+        cue.tokenIndices = currentIndices;
 
-        // Split text into lines if needed
-        cue.text = splitLines(currentText, options.maxCharsPerLine, options.maxLines);
-
-        // Split into lines array
-        std::istringstream stream(cue.text);
+        // Split text into lines, then apply the layout options
+        std::vector<std::string> lines;
+        std::istringstream stream(splitLines(currentText, maxChars, maxLines));
         std::string line;
         while (std::getline(stream, line)) {
-            cue.lines.push_back(line);
+            if (!line.empty()) lines.push_back(line);
         }
+        cue.lines = layoutLines(lines, options);
         cue.lineCount = static_cast<int>(cue.lines.size());
+        for (size_t i = 0; i < cue.lines.size(); ++i) {
+            if (i > 0) cue.text += "\n";
+            cue.text += cue.lines[i];
+        }
 
         // Calculate metrics
         cue.characterCount = static_cast<int>(countCharacters(currentText));
-        cue.cps = (duration > 0) ? static_cast<float>(cue.characterCount) / duration : 0.0f;
+        cue.cps = (speechDuration > 0) ? static_cast<float>(cue.characterCount) / speechDuration : 0.0f;
 
         cues.push_back(cue);
 
         // Reset
         currentText.clear();
         currentTokens.clear();
+        currentIndices.clear();
+        cueEnd = 0.0f;
         cueStart = -1.0f;
     };
 
@@ -812,22 +937,38 @@ std::vector<CaptionCue> CaptionEngineBase::buildCues(
             }
         }
 
+        // Word tokens are separated by a space (none before punctuation).
+        // Syllable tokens get one only where a new source word starts, so
+        // Korean keeps its word spacing. Character tokens (CJK, Thai) none.
+        std::string piece = token.text;
+        std::string separator;
+        if (token.granularity != TokenGranularity::Character) {
+            piece = trim(piece);
+            if (!currentTokens.empty() && !token.isPunctuation) {
+                const bool newWord = token.granularity == TokenGranularity::Word ||
+                                     token.sourceWordIndex != currentTokens.back().sourceWordIndex;
+                if (newWord) separator = " ";
+            }
+        }
+        if (piece.empty()) {
+            continue;
+        }
+
+        // If this token would push the cue past maxLines, it starts the next cue.
+        if (!currentText.empty() && linesNeeded(currentText + separator + piece) > maxLines) {
+            flushCue();
+            separator.clear();
+        }
+
         // Start new cue if needed
         if (cueStart < 0) {
             cueStart = token.start;
         }
 
-        // Add token to current cue
-        // Add space/separator based on granularity
-        if (!currentText.empty() && token.granularity == TokenGranularity::Word) {
-            // Word-based: add space unless token is punctuation
-            if (!token.isPunctuation) {
-                currentText += " ";
-            }
-        }
-        currentText += token.text;
+        currentText += separator + piece;
         currentTokens.push_back(token);
-        cueEnd = token.end;
+        currentIndices.push_back(static_cast<int>(i));
+        cueEnd = std::max(cueEnd, token.end);
         lastTokenEnd = token.end;
 
         // Check if we should break this cue
@@ -839,6 +980,17 @@ std::vector<CaptionCue> CaptionEngineBase::buildCues(
 
     // Flush any remaining content
     flushCue();
+
+    // No cue may still be showing when the next one starts.
+    for (size_t i = 0; i + 1 < cues.size(); ++i) {
+        if (cues[i].end > cues[i + 1].start) {
+            cues[i].end = std::max(cues[i].start, cues[i + 1].start);
+        }
+    }
+
+    for (size_t i = 0; i < cues.size(); ++i) {
+        cues[i].index = static_cast<int>(i + 1);
+    }
 
     return cues;
 }

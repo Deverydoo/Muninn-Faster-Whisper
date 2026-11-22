@@ -63,6 +63,10 @@ public:
      * Calls hooks for language-specific decisions:
      * - shouldBreakCue()
      * - canStartLine() / canEndLine()
+     *
+     * Never drops text: a token that would need more than maxLines lines
+     * starts a new cue. Cues never overlap (an end is clamped to the next
+     * start, min-duration padding included).
      */
     std::vector<CaptionCue> buildCues(
         const std::vector<CaptionToken>& tokens,
@@ -332,7 +336,8 @@ protected:
     /**
      * @brief Split text at word boundaries (space-delimited)
      *
-     * For word-based languages.
+     * For word-based languages. Returns every line, even past maxLines:
+     * buildCues makes sure a cue never needs more than that.
      */
     std::string splitLinesAtWords(const std::string& text,
                                   int maxChars,
@@ -343,10 +348,22 @@ protected:
      *
      * For character-based languages (CJK, Thai).
      * Respects canStartLine() / canEndLine() rules.
+     * Like splitLinesAtWords, returns every line (never truncates).
      */
     std::string splitLinesAtCharacters(const std::string& text,
                                        int maxChars,
                                        int maxLines) const;
+
+    /**
+     * @brief Apply balanceLines and avoidOrphanWords to a cue's lines
+     *
+     * balanceLines re-splits a two-line cue where the lines come out closest
+     * in length (both within maxCharsPerLine, line-break rules respected).
+     * avoidOrphanWords moves the last word of the line above down when the
+     * last line holds a single word and the pair still fits.
+     */
+    std::vector<std::string> layoutLines(std::vector<std::string> lines,
+                                         const CaptionEngineOptions& options) const;
 };
 
 } // namespace muninn

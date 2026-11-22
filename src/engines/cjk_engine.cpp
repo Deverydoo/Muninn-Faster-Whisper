@@ -215,7 +215,8 @@ std::string KoreanCaptionEngine::splitLines(const std::string& text,
     std::string currentLine;
     size_t currentCount = 0;
 
-    for (size_t i = 0; i < chars.size() && static_cast<int>(lines.size()) < maxLines; ++i) {
+    (void)maxLines;  // every line is returned; buildCues keeps cues within maxLines
+    for (size_t i = 0; i < chars.size(); ++i) {
         const std::string& ch = chars[i];
 
         // Check if we can break here
@@ -253,7 +254,7 @@ std::string KoreanCaptionEngine::splitLines(const std::string& text,
     }
 
     // Add remaining
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines) {
+    if (!currentLine.empty()) {
         while (!currentLine.empty() && currentLine.back() == ' ') {
             currentLine.pop_back();
         }
