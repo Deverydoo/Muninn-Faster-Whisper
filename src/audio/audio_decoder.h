@@ -98,11 +98,11 @@ public:
 
 private:
     struct StreamInfo {
-        int stream_index;
-        AVCodecContext* codec_ctx;
-        SwrContext* swr_ctx;
-        int sample_rate;
-        int channels;
+        int stream_index = -1;
+        AVCodecContext* codec_ctx = nullptr;   // null: the stream couldn't be opened (kept so track numbers don't shift)
+        SwrContext* swr_ctx = nullptr;
+        int sample_rate = 0;
+        int channels = 0;
     };
 
     AVFormatContext* format_ctx_;

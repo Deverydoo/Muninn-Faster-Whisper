@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <cmath>
 
 extern "C" {
     #include <libavutil/opt.h>
@@ -78,8 +79,27 @@ bool AudioDecoder::open(const std::string& filename, int target_sample_rate) {
                     << get_sample_rate(audio_streams_.size() - 1) << "Hz, "
                     << get_channels(audio_streams_.size() - 1) << " channels";
                 TS_PRINT(oss.str());
+            } else {
+                // Keep its place: a stream that can't be opened used to be
+                // left out, so every later track number moved down by one
+                // and skip_tracks / track_id pointed at the wrong track.
+                StreamInfo dead;
+                dead.stream_index = static_cast<int>(i);
+                audio_streams_.push_back(dead);
+                muninn::mlog_warn() << "[Muninn Audio] Audio stream " << audio_streams_.size() - 1
+                                    << " can't be decoded; it will come back empty" << std::endl;
             }
         }
+    }
+
+    bool any_usable = false;
+    for (const auto& s : audio_streams_) any_usable = any_usable || s.codec_ctx;
+    if (!any_usable) {
+        for (auto& s : audio_streams_) {
+            if (s.swr_ctx) swr_free(&s.swr_ctx);
+            if (s.codec_ctx) avcodec_free_context(&s.codec_ctx);
+        }
+        audio_streams_.clear();
     }
 
     if (audio_streams_.empty()) {
@@ -176,7 +196,7 @@ int AudioDecoder::get_stream_count() const {
 }
 
 int64_t AudioDecoder::get_duration_ms() const {
-    if (!format_ctx_) return 0;
+    if (!format_ctx_ || format_ctx_->duration == AV_NOPTS_VALUE || format_ctx_->duration < 0) return 0;
     return format_ctx_->duration / 1000;  // Convert from microseconds
 }
 
@@ -200,6 +220,7 @@ int AudioDecoder::decode_samples(int stream_index, std::vector<float>& output, i
     }
 
     StreamInfo& stream_info = audio_streams_[stream_index];
+    if (!stream_info.codec_ctx) return 0;
     int total_samples = 0;
     bool decode_all = (max_samples < 0);
 
@@ -292,9 +313,10 @@ int AudioDecoder::extract_streams(
         if (logical_idx < 0 || logical_idx >= static_cast<int>(audio_streams_.size())) {
             continue;
         }
+        outputs[logical_idx] = std::vector<float>();
+        if (!audio_streams_[logical_idx].codec_ctx) continue;   // couldn't be opened: stays empty
         int file_idx = audio_streams_[logical_idx].stream_index;
         file_index_to_logical[file_idx] = logical_idx;
-        outputs[logical_idx] = std::vector<float>();
     }
 
     if (file_index_to_logical.empty()) {
@@ -307,12 +329,56 @@ int AudioDecoder::extract_streams(
 
     // Flush all codec buffers
     for (auto& stream : audio_streams_) {
-        avcodec_flush_buffers(stream.codec_ctx);
+        if (stream.codec_ctx) avcodec_flush_buffers(stream.codec_ctx);
     }
 
     int packets_read = 0;
     std::map<int, int> samples_per_stream;
     std::map<int, int> stream_packet_counters;
+
+    // Where the file's timeline starts: a stream that starts later than that,
+    // or has a gap in it, gets silence there, so sample N is still at N/rate
+    // seconds of the video. Frames used to be joined end to end, and a gap
+    // moved every later word earlier. (Only at full quality: the skipping
+    // preview mode leaves gaps on purpose.)
+    const double container_start = format_ctx_->start_time != AV_NOPTS_VALUE
+        ? format_ctx_->start_time / static_cast<double>(AV_TIME_BASE) : 0.0;
+
+    // Convert one decoded frame and append it to its stream's output.
+    auto append_frame = [&](int logical_idx, StreamInfo& stream_info, AVFrame* frame) {
+        std::vector<float>& out = outputs[logical_idx];
+        if (full_quality && frame) {
+            const int64_t pts = frame->best_effort_timestamp;
+            if (pts != AV_NOPTS_VALUE) {
+                const AVRational tb = format_ctx_->streams[stream_info.stream_index]->time_base;
+                const double at = pts * av_q2d(tb) - container_start;
+                const int64_t expected = static_cast<int64_t>(std::llround(at * target_sample_rate_));
+                const int64_t have = static_cast<int64_t>(out.size());
+                // Fill gaps of 10 ms or more (smaller ones are timestamp rounding).
+                if (expected - have >= target_sample_rate_ / 100 &&
+                    expected - have < static_cast<int64_t>(target_sample_rate_) * 3600) {
+                    out.insert(out.end(), static_cast<size_t>(expected - have), 0.0f);
+                    samples_per_stream[logical_idx] += static_cast<int>(expected - have);
+                }
+            }
+        }
+        const int in_samples = frame ? frame->nb_samples : 0;
+        int out_samples = swr_get_out_samples(stream_info.swr_ctx, in_samples);
+        if (out_samples <= 0) {
+            if (!frame) return;
+            out_samples = in_samples;
+        }
+        uint8_t* out_buffer = nullptr;
+        av_samples_alloc(&out_buffer, nullptr, 1, out_samples, AV_SAMPLE_FMT_FLT, 0);
+        const int converted = swr_convert(stream_info.swr_ctx, &out_buffer, out_samples,
+                                          frame ? (const uint8_t**)frame->data : nullptr, in_samples);
+        if (converted > 0) {
+            float* samples = reinterpret_cast<float*>(out_buffer);
+            out.insert(out.end(), samples, samples + converted);
+            samples_per_stream[logical_idx] += converted;
+        }
+        av_freep(&out_buffer);
+    };
 
     // Single pass through file
     while (av_read_frame(format_ctx_, packet_) >= 0) {
@@ -331,58 +397,24 @@ int AudioDecoder::extract_streams(
 
             if (avcodec_send_packet(stream_info.codec_ctx, packet_) >= 0) {
                 while (avcodec_receive_frame(stream_info.codec_ctx, frame_) >= 0) {
-                    // Calculate output samples after resampling
-                    int out_samples = swr_get_out_samples(stream_info.swr_ctx, frame_->nb_samples);
-                    if (out_samples <= 0) {
-                        out_samples = frame_->nb_samples;
-                    }
-
-                    uint8_t* out_buffer = nullptr;
-                    av_samples_alloc(&out_buffer, nullptr, 1, out_samples, AV_SAMPLE_FMT_FLT, 0);
-
-                    int converted = swr_convert(
-                        stream_info.swr_ctx,
-                        &out_buffer,
-                        out_samples,
-                        (const uint8_t**)frame_->data,
-                        frame_->nb_samples
-                    );
-
-                    if (converted > 0) {
-                        float* samples = reinterpret_cast<float*>(out_buffer);
-                        outputs[logical_idx].insert(outputs[logical_idx].end(), samples, samples + converted);
-                        samples_per_stream[logical_idx] += converted;
-                    }
-
-                    av_freep(&out_buffer);
+                    append_frame(logical_idx, stream_info, frame_);
                 }
             }
         }
         av_packet_unref(packet_);
     }
 
-    // Flush remaining samples from resampler (important for full quality)
-    if (full_quality) {
-        for (int logical_idx : indices_to_use) {
-            if (logical_idx < 0 || logical_idx >= static_cast<int>(audio_streams_.size())) {
-                continue;
-            }
-            StreamInfo& stream_info = audio_streams_[logical_idx];
-
-            int out_samples = swr_get_out_samples(stream_info.swr_ctx, 0);
-            if (out_samples > 0) {
-                uint8_t* out_buffer = nullptr;
-                av_samples_alloc(&out_buffer, nullptr, 1, out_samples, AV_SAMPLE_FMT_FLT, 0);
-
-                int converted = swr_convert(stream_info.swr_ctx, &out_buffer, out_samples, nullptr, 0);
-                if (converted > 0) {
-                    float* samples = reinterpret_cast<float*>(out_buffer);
-                    outputs[logical_idx].insert(outputs[logical_idx].end(), samples, samples + converted);
-                    samples_per_stream[logical_idx] += converted;
-                }
-                av_freep(&out_buffer);
+    // End of file: drain each decoder (it holds the last frames back until
+    // told there are no more packets; they used to be lost), then the
+    // resampler.
+    for (const auto& [file_idx, logical_idx] : file_index_to_logical) {
+        StreamInfo& stream_info = audio_streams_[logical_idx];
+        if (avcodec_send_packet(stream_info.codec_ctx, nullptr) >= 0) {
+            while (avcodec_receive_frame(stream_info.codec_ctx, frame_) >= 0) {
+                append_frame(logical_idx, stream_info, frame_);
             }
         }
+        if (full_quality) append_frame(logical_idx, stream_info, nullptr);
     }
 
     oss.str("");
