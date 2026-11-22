@@ -114,8 +114,12 @@ public:
         // changed: callers that treat one utterance as one session would
         // otherwise pay an ONNX session creation on every turn. Its recurrent
         // state is cleared instead, which is what actually has to be per-session.
+        // A session without a model path leaves the cached instance alone (it is
+        // simply not used); only a different model path replaces it.
         vad_.reset();
-        if (silero_vad_ && silero_loaded_path_ != options_.vad_model_path) {
+        use_silero_ = false;
+        if (silero_vad_ && !options_.vad_model_path.empty() &&
+            silero_loaded_path_ != options_.vad_model_path) {
             silero_vad_.reset();
         }
         if (silero_vad_) {
@@ -147,6 +151,8 @@ public:
                     wanted = VADType::Energy;
                 } else if (silero_vad_) {
                     // Reused from a previous session; state already cleared above.
+                    std::cout << "[Muninn] Streaming VAD: Silero (reused, "
+                              << options_.vad_model_path << ")\n";
                 } else {
                     try {
                         SileroVADOptions silero_opts;
@@ -194,7 +200,12 @@ public:
                 }
             }
 
-            if (!silero_vad_ && wanted != VADType::None) {
+            // The cached Silero instance may outlive the session that loaded it,
+            // so its existence says nothing about this session: only a session
+            // that resolved to Silero (and has the instance) uses it.
+            use_silero_ = (wanted == VADType::Silero && silero_vad_ != nullptr);
+
+            if (!use_silero_ && wanted != VADType::None) {
                 VADOptions vad_opts;
                 vad_opts.threshold = 0.02f;
                 vad_opts.min_speech_duration_ms = 200;
@@ -387,12 +398,13 @@ private:
                                        : process_count;
             std::vector<float> chunk(audio_buffer_.begin(), audio_buffer_.begin() + process_count);
 
-            // Apply VAD if enabled. start() guarantees at most one detector is
-            // live, so this picks whichever was successfully constructed.
+            // Apply VAD if enabled. start() picks one detector per session:
+            // Silero when use_silero_ is set, otherwise vad_ (or none).
             std::vector<float> processed_audio;
-            if (options_.enable_vad && (silero_vad_ || vad_)) {
+            const bool silero_active = use_silero_ && silero_vad_;
+            if (options_.enable_vad && (silero_active || vad_)) {
                 std::vector<SpeechSegment> speech_segs;
-                if (silero_vad_) {
+                if (silero_active) {
                     try {
                         processed_audio = silero_vad_->filter_silence(chunk, SAMPLE_RATE, speech_segs);
                     } catch (const std::exception& e) {
@@ -400,6 +412,7 @@ private:
                         // take the session down; drop to energy for the rest of it.
                         std::cerr << "[Muninn] Silero VAD failed mid-stream (" << e.what()
                                   << ") - switching to energy VAD\n";
+                        use_silero_ = false;
                         silero_vad_.reset();
                         VADOptions vad_opts;
                         vad_opts.threshold = 0.02f;
@@ -622,12 +635,15 @@ private:
     std::unique_ptr<ctranslate2::models::Whisper> model_;
     MelSpectrogram mel_converter_;
 
-    // Exactly one of these is live per session. VAD and SileroVAD expose the same
+    // One detector per session. VAD and SileroVAD expose the same
     // filter_silence/detect_speech surface but share no base class, so the choice
-    // is held as two members and resolved at the call site.
+    // is held as two members and resolved at the call site. silero_vad_ is a
+    // cache that can outlive the session that loaded it; use_silero_ says
+    // whether the current session uses it.
     std::unique_ptr<VAD> vad_;
     std::unique_ptr<SileroVAD> silero_vad_;
     std::string silero_loaded_path_;   // guards reuse across sessions
+    bool use_silero_ = false;
 
     // Threading
     mutable std::mutex mutex_;
