@@ -286,6 +286,7 @@ set(MUNINN_SOURCES
     src/mel_spectrogram.cpp
     src/transcriber.cpp
     src/streaming_transcriber.cpp
+    src/text_decode.cpp
     src/translator.cpp
     src/audio_extractor.cpp
     src/audio/audio_decoder.cpp

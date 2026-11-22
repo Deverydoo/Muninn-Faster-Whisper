@@ -10,6 +10,7 @@
 #include "muninn/mel_spectrogram.h"
 #include "muninn/vad.h"
 #include "muninn/silero_vad.h"
+#include "text_decode.h"
 #include <ctranslate2/models/whisper.h>
 #include <ctranslate2/storage_view.h>
 
@@ -24,45 +25,9 @@
 
 namespace muninn {
 
-namespace {
-
-// GPT-2 BPE space marker (U+0120)
-const std::string GPT2_SPACE = "\xC4\xA0";
-
-// Clean token by replacing BPE markers with spaces
-std::string clean_token(const std::string& token) {
-    std::string processed = token;
-    size_t pos = 0;
-    while ((pos = processed.find(GPT2_SPACE, pos)) != std::string::npos) {
-        processed.replace(pos, 2, " ");
-        pos += 1;
-    }
-    return processed;
-}
-
-// Check if token is a special token (<|...|>)
-bool is_special_token(const std::string& token) {
-    return token.size() >= 4 &&
-           token.substr(0, 2) == "<|" &&
-           token.substr(token.size() - 2) == "|>";
-}
-
-// Extract text from tokens, filtering special tokens
-std::string extract_text(const std::vector<std::string>& tokens) {
-    std::string text;
-    for (const auto& token : tokens) {
-        if (!is_special_token(token)) {
-            text += clean_token(token);
-        }
-    }
-    // Trim whitespace
-    size_t start = text.find_first_not_of(" \t\n\r");
-    size_t end = text.find_last_not_of(" \t\n\r");
-    if (start == std::string::npos) return "";
-    return text.substr(start, end - start + 1);
-}
-
-} // anonymous namespace
+// Token text goes through the shared GPT-2 byte decoder (text_decode.h), so
+// non-ASCII text comes out as UTF-8 instead of byte characters.
+using text::extract_text;
 
 // =======================
 // StreamingTranscriber::Impl
