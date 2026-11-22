@@ -86,7 +86,13 @@ int main(int argc, char** argv)
         for (size_t i = 0; i < result.segments.size(); ++i) {
             const auto& s = result.segments[i];
             out << "  {\"start\": " << s.start << ", \"end\": " << s.end
-                << ", \"text\": \"" << jsonEscape(s.text) << "\"}" << (i + 1 < result.segments.size() ? "," : "") << "\n";
+                << ", \"text\": \"" << jsonEscape(s.text) << "\", \"words\": [";
+            for (size_t w = 0; w < s.words.size(); ++w) {
+                const auto& wd = s.words[w];
+                out << (w ? ", " : "") << "{\"start\": " << wd.start << ", \"end\": " << wd.end
+                    << ", \"word\": \"" << jsonEscape(wd.word) << "\"}";
+            }
+            out << "]}" << (i + 1 < result.segments.size() ? "," : "") << "\n";
         }
         out << "]}\n";
         out.close();

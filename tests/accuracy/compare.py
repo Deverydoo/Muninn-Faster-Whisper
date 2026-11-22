@@ -78,7 +78,10 @@ def cut(clip):
 
 
 def reference(clip, wav):
-    path = os.path.join(CACHE, clip["name"] + ".faster-whisper.json")
+    # v2 (Nov 2026): Loki's settings on both sides - word timestamps on, 500 ms
+    # speech padding - so the reference keeps word timings to compare against.
+    # (v1, ".faster-whisper.json", had neither.)
+    path = os.path.join(CACHE, clip["name"] + ".faster-whisper.v2.json")
     if os.path.exists(path):
         return json.load(open(path, encoding="utf-8"))
     # CTranslate2 and NumPy each ship Intel OpenMP in this env; the reference run only.
@@ -96,13 +99,43 @@ def reference(clip, wav):
     t0 = time.time()
     segments, _ = model.transcribe(
         wav, language="en", beam_size=10, patience=2.0,
-        vad_filter=True, vad_parameters={"threshold": 0.35},
+        vad_filter=True, vad_parameters={"threshold": 0.35, "speech_pad_ms": 500},
         compression_ratio_threshold=2.4, log_prob_threshold=-1.0, no_speech_threshold=0.6,
-        condition_on_previous_text=True)
-    segs = [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments]
+        condition_on_previous_text=True, word_timestamps=True)
+    segs = [{"start": s.start, "end": s.end, "text": s.text.strip(),
+             "words": [{"start": w.start, "end": w.end, "word": w.word} for w in (s.words or [])]}
+            for s in segments]
     out = {"seconds": time.time() - t0, "segments": segs}
     json.dump(out, open(path, "w", encoding="utf-8"), indent=1)
     return out
+
+
+def word_timing(ref, hyp):
+    """How far Muninn's word start times are from the reference's, over the
+    words both transcripts share (matched in order). None without words."""
+    import difflib
+    def flat(result):
+        out = []
+        for s in result["segments"]:
+            for w in s.get("words", []):
+                ws = words(w["word"])
+                if ws:
+                    out.append((ws[0], w["start"]))
+        return out
+    a, b = flat(ref), flat(hyp)
+    if not a or not b:
+        return None
+    sm = difflib.SequenceMatcher(None, [x[0] for x in a], [x[0] for x in b], autojunk=False)
+    diffs = []
+    for block in sm.get_matching_blocks():
+        for k in range(block.size):
+            diffs.append(abs(a[block.a + k][1] - b[block.b + k][1]))
+    if not diffs:
+        return None
+    diffs.sort()
+    pick = lambda q: round(diffs[min(len(diffs) - 1, int(q * len(diffs)))], 3)
+    return {"matched": len(diffs), "median_s": pick(0.5), "p90_s": pick(0.9),
+            "over_0_5s": sum(1 for d in diffs if d > 0.5)}
 
 
 def stats(result):
@@ -158,13 +191,18 @@ def main():
         rate, sub, dele, ins = wer(ref_words, hyp_words)
         row = {"clip": clip["name"], "wer": round(rate * 100, 1), "sub": sub, "del": dele, "ins": ins,
                "reference": stats(ref), "muninn": stats(hyp),
-               "muninn_seconds": round(hyp["seconds"], 1), "reference_seconds": round(ref["seconds"], 1)}
+               "muninn_seconds": round(hyp["seconds"], 1), "reference_seconds": round(ref["seconds"], 1),
+               "word_timing": word_timing(ref, hyp)}
         report["clips"].append(row)
         print("%-22s WER %5.1f%%  (sub %d, missing %d, extra %d)  words %d vs ref %d  "
               "repeats %d vs %d  short %d vs %d  %.0fs" % (
                   clip["name"], row["wer"], sub, dele, ins, row["muninn"]["words"], row["reference"]["words"],
                   row["muninn"]["repeated_lines"], row["reference"]["repeated_lines"],
                   row["muninn"]["short_lines"], row["reference"]["short_lines"], hyp["seconds"]), flush=True)
+        if row["word_timing"]:
+            wt = row["word_timing"]
+            print("%-22s word starts: median %.3fs, p90 %.3fs, %d of %d off by more than 0.5s" % (
+                "", wt["median_s"], wt["p90_s"], wt["over_0_5s"], wt["matched"]), flush=True)
     json.dump(report, open(os.path.join(RESULTS, "%s_%s.json" % (time.strftime("%Y-%m-%d"), args.label)), "w"),
               indent=1)
 
