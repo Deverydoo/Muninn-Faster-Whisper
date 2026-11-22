@@ -18,10 +18,47 @@
  */
 
 #include <muninn/transcriber.h>
+#include <muninn/audio_extractor.h>
 #include <muninn/diarization.h>
 #include <muninn/subtitle_export.h>
 #include <iostream>
 #include <iomanip>
+#include <map>
+#include <string>
+#include <vector>
+
+/**
+ * @brief Diarize a file's audio and put speaker labels on its segments
+ *
+ * Custom names go onto the diarization result first: assign_speakers_to_segments
+ * copies the labels as they are at that moment, so names set afterwards never
+ * reach the segments.
+ */
+bool label_speakers(const std::string& video_path,
+                    std::vector<muninn::Segment>& segments,
+                    const std::map<int, std::string>& names = {}) {
+    // 16 kHz mono float samples
+    muninn::AudioExtractor extractor;
+    std::vector<float> audio_samples;
+    float duration = 0.0f;
+    if (!extractor.extract_audio(video_path, audio_samples, duration)) {
+        std::cerr << "Could not read the audio: " << extractor.get_last_error() << "\n";
+        return false;
+    }
+
+    muninn::DiarizationOptions diar_options;
+    diar_options.device = "cpu";  // the ONNX Runtime Muninn ships is CPU-only
+    muninn::Diarizer diarizer("models/pyannote-embedding.onnx", diar_options);
+
+    auto diarization = diarizer.diarize(audio_samples.data(), audio_samples.size(), 16000);
+    std::cout << "Found " << diarization.num_speakers << " speaker(s)\n";
+
+    if (!names.empty()) {
+        muninn::Diarizer::set_speaker_labels(diarization, names);  // before assigning
+    }
+    muninn::Diarizer::assign_speakers_to_segments(segments, diarization);
+    return true;
+}
 
 /**
  * @brief Example 1: Basic SRT export (simple transcription)
@@ -60,25 +97,12 @@ void example_speaker_srt(const std::string& video_path) {
     muninn::Transcriber transcriber("models/faster-whisper-large-v3-turbo");
     auto result = transcriber.transcribe(video_path);
 
-    // Run diarization
-    muninn::Diarizer diarizer("models/pyannote-embedding.onnx");
-
-    // Load audio (simplified - in real code, use audio extraction)
-    std::vector<float> audio_samples;
-    // auto audio_samples = load_audio(video_path);
-
-    auto diarization = diarizer.diarize(audio_samples.data(),
-                                       audio_samples.size(), 16000);
-
-    // Assign speakers
-    muninn::Diarizer::assign_speakers_to_segments(result.segments, diarization);
-
-    // Custom speaker labels
+    // Diarize and label: speaker 0 (the one who talks most) is the host
     std::map<int, std::string> speaker_names = {
         {0, "Host"},
         {1, "Guest"}
     };
-    muninn::Diarizer::set_speaker_labels(diarization, speaker_names);
+    if (!label_speakers(video_path, result.segments, speaker_names)) return;
 
     // Export with speaker labels
     muninn::SubtitleExportOptions options;
@@ -100,9 +124,10 @@ void example_vtt_with_colors(const std::string& video_path) {
     std::cout << "Example 3: VTT with Speaker Colors\n";
     std::cout << "═══════════════════════════════════════════════════════════\n\n";
 
-    // Transcribe + diarize (same as example 2)
+    // Transcribe + diarize (same as example 2, default "Speaker N" labels)
     muninn::Transcriber transcriber("models/faster-whisper-large-v3-turbo");
     auto result = transcriber.transcribe(video_path);
+    if (!label_speakers(video_path, result.segments)) return;
 
     // Configure VTT export with speaker colors
     muninn::SubtitleExportOptions options;
