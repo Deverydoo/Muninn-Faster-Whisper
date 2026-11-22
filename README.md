@@ -147,28 +147,20 @@ int main() {
     // Initialize streaming transcriber
     StreamingTranscriber stream("models/faster-whisper-large-v3-turbo");
 
-    // Configure for low latency with intensity-based coloring
+    // Configure for low latency
     StreamingOptions options;
     options.chunk_length_s = 1.5f;      // Process every 1.5 seconds
-    options.word_timestamps = true;     // Enable word-level timing + intensity
+    options.word_timestamps = true;     // Enable word-level timing
 
     // Start with callback for new segments
     stream.start(options, [](const Segment& seg) {
         std::cout << "[" << seg.start << "s] " << seg.text << std::endl;
 
-        // Word-level details with intensity
+        // Word-level details
         for (const auto& word : seg.words) {
-            const char* emphasis_str = "";
-            switch (word.emphasis) {
-                case EmphasisLevel::VeryLow: emphasis_str = "whispered"; break;
-                case EmphasisLevel::Low: emphasis_str = "quiet"; break;
-                case EmphasisLevel::Normal: emphasis_str = "normal"; break;
-                case EmphasisLevel::High: emphasis_str = "emphasized"; break;
-                case EmphasisLevel::VeryHigh: emphasis_str = "SHOUTED"; break;
-            }
-            printf("  %s (%.2f-%.2fs, %s, %.0f%% confident)\n",
+            printf("  %s (%.2f-%.2fs, %.0f%% confident)\n",
                    word.word.c_str(), word.start, word.end,
-                   emphasis_str, word.probability * 100);
+                   word.probability * 100);
         }
 
         return true;  // Continue transcription

@@ -1,20 +1,17 @@
 /**
  * @file karaoke_captions.cpp
- * @brief Example: Karaoke-style word highlighting with intensity-based coloring
+ * @brief Example: Karaoke-style word highlighting
  *
  * This example demonstrates how to use Muninn's streaming API with word timestamps
- * and audio intensity analysis to create dynamic karaoke-style captions where:
+ * to create karaoke-style captions where:
  * - Words light up as they're spoken
- * - Color changes based on volume/emphasis:
- *   - Whispered words: dim gray
- *   - Normal speech: white/yellow
- *   - Shouted words: bright red
+ * - Past words are dimmed, the current word is bold yellow
  *
  * Perfect for:
  * - Live streaming captions with visual dynamics
  * - Video subtitles with word highlighting
  * - Language learning applications
- * - Accessibility features with emphasis indication
+ * - Accessibility features
  */
 
 #include <muninn/streaming_transcriber.h>
@@ -25,7 +22,7 @@
 #include <iomanip>
 
 /**
- * @brief Render a caption line with intensity-based karaoke highlighting
+ * @brief Render a caption line with karaoke highlighting
  *
  * @param segment The transcription segment with word timestamps
  * @param current_time Current playback time in seconds
@@ -37,7 +34,7 @@ void render_karaoke_caption(const muninn::Segment& segment, float current_time) 
         return;
     }
 
-    // Use the built-in ANSI formatter with intensity-based coloring
+    // Use the built-in ANSI karaoke formatter
     std::string formatted = muninn::ANSIFormatter::build_karaoke_ansi(segment, current_time);
 
     // Render the caption line

@@ -23,7 +23,9 @@ struct WordStyle {
 class StylingPresets {
 public:
     /**
-     * @brief Intensity-based color scheme (volume/loudness)
+     * @brief Emphasis-based color scheme (volume/loudness)
+     *
+     * Muninn doesn't measure emphasis; pass a level you worked out yourself.
      *
      * VeryLow (whispered):  Dim gray (#888888)
      * Low (quiet):          Light gray (#AAAAAA)
@@ -85,9 +87,9 @@ public:
     }
 
     /**
-     * @brief Combined intensity + confidence scheme
+     * @brief Combined emphasis + confidence scheme
      *
-     * Uses intensity for color, confidence for styling effects
+     * Uses your emphasis level for color, confidence for styling effects
      */
     static WordStyle combined_scheme(EmphasisLevel emphasis, float probability, bool is_current = false) {
         WordStyle style = intensity_color_scheme(emphasis, is_current);
@@ -207,7 +209,7 @@ public:
     }
 
     /**
-     * @brief Build karaoke HTML with intensity-based coloring
+     * @brief Build karaoke HTML (past dimmed, current highlighted)
      */
     static std::string build_karaoke_html(const Segment& seg, float current_time) {
         std::ostringstream html;
@@ -222,8 +224,8 @@ public:
                 // Past words - dimmed
                 style = StylingPresets::karaoke_scheme(StylingPresets::Position::Past);
             } else if (is_current) {
-                // Current word - intensity-based color
-                style = StylingPresets::intensity_color_scheme(word.emphasis, true);
+                // Current word - highlighted
+                style = StylingPresets::karaoke_scheme(StylingPresets::Position::Current);
             } else {
                 // Future words - normal
                 style = StylingPresets::karaoke_scheme(StylingPresets::Position::Future);
@@ -250,28 +252,6 @@ public:
         return html.str();
     }
 
-    /**
-     * @brief Build HTML with combined intensity + confidence
-     */
-    static std::string build_combined_html(const Segment& seg, float current_time) {
-        std::ostringstream html;
-
-        for (const auto& word : seg.words) {
-            bool is_current = (current_time >= word.start && current_time < word.end);
-
-            if (current_time > word.end) {
-                // Past words - always dimmed
-                WordStyle style = StylingPresets::karaoke_scheme(StylingPresets::Position::Past);
-                html << format_word(word.word, style) << " ";
-            } else {
-                // Current/future - use combined scheme
-                WordStyle style = StylingPresets::combined_scheme(word.emphasis, word.probability, is_current);
-                html << format_word(word.word, style) << " ";
-            }
-        }
-
-        return html.str();
-    }
 };
 
 /**
@@ -293,7 +273,7 @@ public:
     static constexpr const char* GREEN = "\033[92m";
 
     /**
-     * @brief Build karaoke output with ANSI colors (intensity-based)
+     * @brief Build karaoke output with ANSI colors (past dimmed, current highlighted)
      */
     static std::string build_karaoke_ansi(const Segment& seg, float current_time) {
         std::ostringstream out;
@@ -306,24 +286,8 @@ public:
                 // Past - dimmed
                 out << DIM << word.word << RESET << " ";
             } else if (is_current) {
-                // Current - intensity-based color
-                switch (word.emphasis) {
-                    case EmphasisLevel::VeryLow:
-                        out << DIM << GRAY << word.word << RESET << " ";
-                        break;
-                    case EmphasisLevel::Low:
-                        out << WHITE << word.word << RESET << " ";
-                        break;
-                    case EmphasisLevel::Normal:
-                        out << BOLD << WHITE << word.word << RESET << " ";
-                        break;
-                    case EmphasisLevel::High:
-                        out << BOLD << YELLOW << word.word << RESET << " ";
-                        break;
-                    case EmphasisLevel::VeryHigh:
-                        out << BOLD << RED << word.word << RESET << " ";
-                        break;
-                }
+                // Current - highlighted
+                out << BOLD << YELLOW << word.word << RESET << " ";
             } else {
                 // Future - normal
                 out << word.word << " ";

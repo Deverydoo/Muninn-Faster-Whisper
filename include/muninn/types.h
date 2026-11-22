@@ -60,6 +60,10 @@ enum class DeviceType {
 
 /**
  * @brief Word emphasis level for styling
+ *
+ * Muninn does not measure loudness, so it never sets this. It stays for
+ * callers who work out emphasis themselves and pass it to the styling
+ * presets in word_styling.h.
  */
 enum class EmphasisLevel {
     VeryLow,        // Whispered/very quiet (< 20% intensity)
@@ -70,7 +74,7 @@ enum class EmphasisLevel {
 };
 
 /**
- * @brief Word-level timestamp information with styling metadata
+ * @brief Word-level timestamp information
  */
 struct Word {
     float start;             // Start time in seconds
@@ -78,12 +82,7 @@ struct Word {
     std::string word;        // The word text
     float probability;       // Confidence score (0.0-1.0)
 
-    // Audio characteristics for styling
-    float intensity;         // Audio intensity/volume (0.0-1.0, normalized RMS)
-    EmphasisLevel emphasis;  // Emphasis level (derived from intensity)
-
-    Word() : start(0.0f), end(0.0f), probability(1.0f),
-             intensity(0.5f), emphasis(EmphasisLevel::Normal) {}
+    Word() : start(0.0f), end(0.0f), probability(1.0f) {}
 };
 
 /**

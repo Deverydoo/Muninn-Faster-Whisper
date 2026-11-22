@@ -408,22 +408,16 @@ static bool export_srt_callback(obs_properties_t* props, obs_property_t* propert
 
 ## Styling Options
 
-Muninn provides built-in styling presets with `word_styling.h` for dynamic, intensity-based word highlighting.
+`word_styling.h` has ready-made formatters. Muninn doesn't measure how loud a word is, so the styles go by timing and confidence. Word text is HTML-escaped by `format_word`.
 
-### Option 1: Intensity-Based Coloring (Recommended)
+### Option 1: Karaoke Highlighting
 
-Words change color based on volume/emphasis - whispered words are dim, shouted words are bright red:
+Past words dimmed, the current word highlighted in bold yellow:
 
 ```cpp
 #include <muninn/word_styling.h>
 
 std::string build_karaoke_html(const muninn::Segment& seg, float time) {
-    // Built-in formatter with intensity-based colors:
-    // - Whispered (< 20% volume): dim gray
-    // - Quiet (20-40%): light gray
-    // - Normal (40-70%): white/yellow
-    // - Emphasized (70-90%): bright yellow
-    // - Shouted (> 90%): bright red
     return muninn::HTMLFormatter::build_karaoke_html(seg, time);
 }
 ```
@@ -442,17 +436,7 @@ std::string build_confidence_html(const muninn::Segment& seg, float time) {
 }
 ```
 
-### Option 3: Combined Intensity + Confidence
-
-```cpp
-std::string build_combined_html(const muninn::Segment& seg, float time) {
-    // Uses intensity for color, confidence for styling effects
-    // Low confidence words are italicized
-    return muninn::HTMLFormatter::build_combined_html(seg, time);
-}
-```
-
-### Option 4: Custom Manual Styling
+### Option 3: Custom Manual Styling
 
 For full control, use the WordStyle API:
 
@@ -463,32 +447,16 @@ std::string build_custom_html(const muninn::Segment& seg, float time) {
     for (const auto& word : seg.words) {
         bool is_current = (time >= word.start && time < word.end);
 
-        muninn::WordStyle style;
+        muninn::WordStyle style{};
 
         if (is_current) {
-            // Custom style for current word based on emphasis
-            switch (word.emphasis) {
-                case muninn::EmphasisLevel::VeryHigh:
-                    style.color = "#FF0000";      // Red for shouted
-                    style.bold = true;
-                    style.size_offset = 2;
-                    break;
-                case muninn::EmphasisLevel::High:
-                    style.color = "#FFFF00";      // Yellow for emphasized
-                    style.bold = true;
-                    style.size_offset = 1;
-                    break;
-                default:
-                    style.color = "#FFFFFF";      // White for normal
-                    style.bold = true;
-                    break;
-            }
+            style.color = "#FFFF00";                                  // Yellow for the current word
+            style.bold = true;
+            style.italic = word.probability < 0.6f;                   // Italic when unsure
         } else if (time > word.end) {
             style.color = "#888888";  // Dimmed for past words
-            style.bold = false;
         } else {
             style.color = "#FFFFFF";  // Normal for future words
-            style.bold = false;
         }
 
         html << muninn::HTMLFormatter::format_word(word.word, style) << " ";
@@ -498,10 +466,10 @@ std::string build_custom_html(const muninn::Segment& seg, float time) {
 }
 ```
 
-### Option 5: Simple Classic Karaoke
+### Option 4: Simple Classic Karaoke
 
 ```cpp
-// Classic 3-color scheme (no intensity)
+// Classic 3-color scheme (escape word.word with HTMLFormatter::escape if it can hold &, < or >)
 for (const auto& word : seg.words) {
     if (time > word.end) {
         html << "<font color='#888888'>" << word.word << "</font> ";  // Past
