@@ -204,14 +204,15 @@ public:
     // Start streaming with callback
     void start(const StreamingOptions& options, StreamingCallback callback);
 
-    // Push audio (thread-safe, call from audio thread)
-    void push_audio(const float* samples, size_t count,
+    // Push audio (any thread; never waits for a decode). count is the
+    // number of floats (frames x channels). False when nothing was taken.
+    bool push_audio(const float* samples, size_t count,
                     int sample_rate = 16000, int channels = 1);
 
     // Poll for new segments (alternative to callback)
     bool poll_segment(Segment& out_segment);
 
-    // Get current transcript text
+    // Get current transcript text (include_partial adds held-back words)
     std::string get_current_text(bool include_partial = true) const;
 
     // Get all segments so far
@@ -222,6 +223,10 @@ public:
 
     // Runtime stats
     Stats get_stats() const;
+
+    // Errors on the worker thread (a window that failed is skipped)
+    void set_error_callback(StreamingErrorCallback callback);
+    std::string last_error() const;
 
     // Control
     void reset();  // Clear buffers, start fresh
@@ -254,9 +259,11 @@ options.vad_type = muninn::VADType::Energy;  // Energy (fast) or Silero (accurat
 options.beam_size = 5;              // Beam search width
 options.filter_hallucinations = true;  // Skip low-quality segments
 
-// Performance
-options.batch_size = 1;             // Usually 1 for streaming (low latency)
+// Limits
+options.max_buffered_s = 60.0f;     // audio waiting beyond this is dropped, oldest first
 ```
+
+See [STREAMING_API.md](STREAMING_API.md) for the rest.
 
 ### Basic Streaming Usage
 
