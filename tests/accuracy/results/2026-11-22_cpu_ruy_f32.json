@@ -1,0 +1,26 @@
+{
+ "label": "cpu_ruy_f32",
+ "clips": [
+  {
+   "clip": "ricochet_a_intro",
+   "wer": 4.4,
+   "sub": 6,
+   "del": 24,
+   "ins": 5,
+   "reference": {
+    "segments": 46,
+    "words": 795,
+    "repeated_lines": 3,
+    "short_lines": 5
+   },
+   "muninn": {
+    "segments": 42,
+    "words": 776,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 864.4,
+   "reference_seconds": 16.0
+  }
+ ]
+}

@@ -38,7 +38,15 @@ int main(int argc, char** argv)
         return 2;
     }
     try {
-        muninn::Transcriber transcriber(argv[1], "cuda", "float16");
+        // MUNINN_DEVICE=cpu: the CPU path (Loki Studio's fallback when there is
+        // no RTX 20 series or newer GPU), in MUNINN_COMPUTE (default float32).
+        std::string device = "cuda", compute = "float16";
+        if (const char* d = std::getenv("MUNINN_DEVICE"); d && std::string(d) == "cpu") {
+            device = "cpu";
+            const char* c = std::getenv("MUNINN_COMPUTE");
+            compute = c ? c : "float32";
+        }
+        muninn::Transcriber transcriber(argv[1], device, compute);
 
         // As Loki Studio's GPU worker sends them, with the owner's settings
         // (app_settings.json, October 2026).
