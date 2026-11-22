@@ -460,6 +460,19 @@ if(BUILD_TESTS)
     add_test(NAME translate_text COMMAND test_translate_text)
     set_tests_properties(translate_text PROPERTIES LABELS "cpu")
 
+    # Translator checks against a real NLLB model. Registered only when the
+    # MUNINN_TEST_NLLB_MODEL environment variable (or cache entry) names the
+    # model folder at configure time. "test_translate_model <dir> --files-only"
+    # runs just the path checks, which never load the model.
+    add_executable(test_translate_model tests/test_translate_model.cpp)
+    target_link_libraries(test_translate_model PRIVATE muninn)
+    set(MUNINN_TEST_NLLB_MODEL "$ENV{MUNINN_TEST_NLLB_MODEL}" CACHE PATH
+        "NLLB model folder for the translator model test (empty = not registered)")
+    if(MUNINN_TEST_NLLB_MODEL)
+        add_test(NAME translate_model COMMAND test_translate_model "${MUNINN_TEST_NLLB_MODEL}" cuda)
+        set_tests_properties(translate_model PROPERTIES LABELS "model;gpu")
+    endif()
+
     set(MUNINN_TEST_MODEL "" CACHE PATH "Whisper model folder for the model tests (empty = not registered)")
     set(MUNINN_TEST_AUDIO "" CACHE FILEPATH "Audio or video file for the model tests")
     if(MUNINN_TEST_MODEL AND MUNINN_TEST_AUDIO)
