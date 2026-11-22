@@ -210,7 +210,10 @@ struct SubtitleExportOptions {
     // ═══════════════════════════════════════════════════════════
     float min_duration = 0.3f;             // Minimum subtitle duration (seconds)
     float max_duration = 7.0f;             // Maximum subtitle duration (seconds)
-    float gap_threshold = 0.1f;            // Merge segments closer than this (seconds)
+    float gap_threshold = 0.0f;            // Merge a segment into the cue before it when the gap is
+                                           // shorter than this (seconds). 0 = never merge. Merges stay
+                                           // within one track and one speaker, and never go past
+                                           // max_duration or max_chars_per_line x max_lines.
 
     // ═══════════════════════════════════════════════════════════
     // VTT-specific (WebVTT with styling)
@@ -240,6 +243,7 @@ struct SubtitleEntry {
     std::string text;                      // Subtitle text
 
     // Optional metadata
+    int track_id = 0;                      // Audio track the text came from
     int speaker_id = -1;                   // Speaker ID (-1 = no speaker)
     std::string speaker_label;             // Speaker label
     std::vector<Word> words;               // Word-level timing (for VTT)
@@ -333,6 +337,17 @@ public:
     // ═══════════════════════════════════════════════════════════
 
     /**
+     * @brief Build the subtitle entries the exporters write
+     *
+     * Picks the segmenter from the options (karaoke, a language mode, or the
+     * standard segment-based one). The result never drops text, has at most
+     * max_lines lines per entry, is sorted by start time, has no overlapping
+     * entries, and is numbered from 1.
+     */
+    static std::vector<SubtitleEntry> build_entries(const std::vector<Segment>& segments,
+                                                    const SubtitleExportOptions& options);
+
+    /**
      * @brief Convert segments to subtitle entries
      *
      * Applies text splitting, timing adjustments, speaker formatting.
@@ -378,11 +393,16 @@ public:
                                            SubtitleFormat format);
 
     /**
-     * @brief Split long text into multiple lines
+     * @brief Split long text into lines at spaces
+     *
+     * Line length is counted in characters (UTF-8 code points), not bytes.
+     * No text is ever dropped: when the text needs more than max_lines lines,
+     * all of them are returned, and the exporters turn the extra lines into
+     * another cue. A single word longer than a line gets a line of its own.
      *
      * @param text Text to split
      * @param max_chars_per_line Max characters per line
-     * @param max_lines Max number of lines
+     * @param max_lines Lines per cue (kept for the callers; never truncates)
      * @return Split text with newlines
      */
     static std::string split_text(const std::string& text,

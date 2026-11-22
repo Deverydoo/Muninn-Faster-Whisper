@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <chrono>
+#include <map>
+#include <optional>
 
 namespace muninn {
 
@@ -59,6 +61,223 @@ std::string path_to_utf8(const std::filesystem::path& path) {
     return std::string(u8.begin(), u8.end());
 }
 
+// Bytes in the UTF-8 sequence that starts with `lead` (1 for a stray byte).
+size_t utf8_sequence_length(unsigned char lead) {
+    if ((lead & 0x80) == 0x00) return 1;
+    if ((lead & 0xE0) == 0xC0) return 2;
+    if ((lead & 0xF0) == 0xE0) return 3;
+    if ((lead & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+// Code points on a line, as a reader counts characters. Line breaks are not
+// counted. "Ñandú" is 5, not 7; "привет" is 6, not 12.
+size_t count_code_points(const std::string& text) {
+    size_t count = 0;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c != '\n' && c != '\r') ++count;
+        i += utf8_sequence_length(c);
+    }
+    return count;
+}
+
+// Code points that aren't whitespace: used to share a cue's time between the
+// pieces it is split into, in proportion to how much text each piece holds.
+size_t count_visible_code_points(const std::string& text) {
+    size_t count = 0;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        const size_t len = utf8_sequence_length(c);
+        const bool ascii_space = (c == ' ' || c == '\n' || c == '\r' || c == '\t');
+        const bool ideographic_space = (len == 3 && i + 2 < text.size() && c == 0xE3 &&
+                                        static_cast<unsigned char>(text[i + 1]) == 0x80 &&
+                                        static_cast<unsigned char>(text[i + 2]) == 0x80);
+        if (!ascii_space && !ideographic_space) ++count;
+        i += len;
+    }
+    return count;
+}
+
+std::vector<std::string> split_on_newlines(const std::string& text) {
+    std::vector<std::string> lines;
+    std::string line;
+    for (char c : text) {
+        if (c == '\n') {
+            lines.push_back(line);
+            line.clear();
+        } else if (c != '\r') {
+            line += c;
+        }
+    }
+    lines.push_back(line);
+    return lines;
+}
+
+std::string join_lines(const std::vector<std::string>& lines, size_t first, size_t last) {
+    std::string out;
+    for (size_t i = first; i < last; ++i) {
+        if (i > first) out += '\n';
+        out += lines[i];
+    }
+    return out;
+}
+
+// Lines of a cue without empty ones. A blank line ends a cue in SRT and VTT,
+// so text must never contain one.
+std::vector<std::string> non_empty_lines(const std::string& text) {
+    std::vector<std::string> lines;
+    for (auto& line : split_on_newlines(text)) {
+        const bool blank = line.find_first_not_of(" \t") == std::string::npos;
+        if (!blank) lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+// A cue whose text has more lines than max_lines becomes several cues of at
+// most max_lines lines each, so no text is ever dropped. When the cue has word
+// timings, each piece takes the time of the words it holds; otherwise the
+// cue's time is shared in proportion to each piece's characters.
+std::vector<SubtitleEntry> split_overflowing_entry(const SubtitleEntry& entry, int max_lines) {
+    const std::vector<std::string> lines = non_empty_lines(entry.text);
+    const size_t per_cue = static_cast<size_t>(std::max(1, max_lines));
+
+    if (lines.size() <= per_cue) {
+        SubtitleEntry copy = entry;
+        copy.text = join_lines(lines, 0, lines.size());
+        return {copy};
+    }
+
+    // Group the lines.
+    struct Piece { size_t first, last, chars; };
+    std::vector<Piece> pieces;
+    size_t total_chars = 0;
+    for (size_t i = 0; i < lines.size(); i += per_cue) {
+        Piece p{i, std::min(lines.size(), i + per_cue), 0};
+        for (size_t j = p.first; j < p.last; ++j) p.chars += count_visible_code_points(lines[j]);
+        total_chars += p.chars;
+        pieces.push_back(p);
+    }
+    if (total_chars == 0) total_chars = 1;
+
+    const double start = entry.start;
+    const double duration = std::max(0.0, static_cast<double>(entry.end) - start);
+
+    // Hand the words out by their share of the text, measured at each word's
+    // middle character.
+    std::vector<std::vector<Word>> piece_words(pieces.size());
+    if (!entry.words.empty()) {
+        size_t word_chars_total = 0;
+        for (const auto& w : entry.words) word_chars_total += count_visible_code_points(w.word);
+        if (word_chars_total == 0) word_chars_total = entry.words.size();
+
+        size_t before = 0;
+        for (const auto& w : entry.words) {
+            const size_t chars = count_visible_code_points(w.word);
+            const double middle = (before + chars / 2.0) / static_cast<double>(word_chars_total);
+            before += chars;
+
+            double boundary = 0.0;
+            size_t target = pieces.size() - 1;
+            for (size_t k = 0; k < pieces.size(); ++k) {
+                boundary += pieces[k].chars / static_cast<double>(total_chars);
+                if (middle < boundary) { target = k; break; }
+            }
+            piece_words[target].push_back(w);
+        }
+    }
+
+    // Start of each piece: its first word, or its share of the duration.
+    std::vector<double> starts(pieces.size(), start);
+    size_t chars_before = 0;
+    for (size_t k = 0; k < pieces.size(); ++k) {
+        double candidate = start + duration * (chars_before / static_cast<double>(total_chars));
+        chars_before += pieces[k].chars;
+        if (k == 0) continue;  // the first piece keeps the cue's start
+        if (!piece_words[k].empty()) candidate = piece_words[k].front().start;
+        starts[k] = std::min(std::max(candidate, starts[k - 1]), start + duration);
+    }
+
+    std::vector<SubtitleEntry> out;
+    for (size_t k = 0; k < pieces.size(); ++k) {
+        SubtitleEntry piece = entry;
+        piece.text = join_lines(lines, pieces[k].first, pieces[k].last);
+        piece.words = piece_words[k];
+        piece.start = static_cast<float>(starts[k]);
+        piece.end = (k + 1 < pieces.size()) ? static_cast<float>(starts[k + 1]) : entry.end;
+        if (piece.end < piece.start) piece.end = piece.start;
+        out.push_back(std::move(piece));
+    }
+    return out;
+}
+
+// The last step for every way of building entries: no cue has more than
+// max_lines lines, entries are in time order, and they are numbered 1..N.
+std::vector<SubtitleEntry> finalize_entries(std::vector<SubtitleEntry> entries,
+                                            const SubtitleExportOptions& options) {
+    std::vector<SubtitleEntry> out;
+    out.reserve(entries.size());
+    for (auto& entry : entries) {
+        if (!std::isfinite(entry.start) || entry.start < 0.0f) entry.start = 0.0f;
+        if (!std::isfinite(entry.end) || entry.end < entry.start) entry.end = entry.start;
+        for (auto& piece : split_overflowing_entry(entry, options.max_lines)) {
+            if (piece.text.empty()) continue;
+            out.push_back(std::move(piece));
+        }
+    }
+
+    std::stable_sort(out.begin(), out.end(),
+                     [](const SubtitleEntry& a, const SubtitleEntry& b) { return a.start < b.start; });
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i].index = static_cast<int>(i + 1);
+    }
+    return out;
+}
+
+// All words of the segments in time order (segments sorted by start first).
+std::vector<Word> collect_words(const std::vector<Segment>& segments) {
+    std::vector<const Segment*> ordered;
+    ordered.reserve(segments.size());
+    for (const auto& seg : segments) ordered.push_back(&seg);
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const Segment* a, const Segment* b) { return a->start < b->start; });
+
+    std::vector<Word> words;
+    for (const Segment* seg : ordered) {
+        words.insert(words.end(), seg->words.begin(), seg->words.end());
+    }
+    return words;
+}
+
+using Segmenter = std::vector<SubtitleEntry> (*)(const std::vector<Segment>&,
+                                                  const SubtitleExportOptions&);
+
+// Word-based segmenters must never join words from different audio tracks
+// into one cue. When the segments come from more than one track, run the
+// segmenter once per track and combine the results. Returns nothing when
+// there is only one track, so the caller carries on as normal.
+std::optional<std::vector<SubtitleEntry>> segment_per_track(const std::vector<Segment>& segments,
+                                                            const SubtitleExportOptions& options,
+                                                            Segmenter segmenter) {
+    std::map<int, std::vector<Segment>> by_track;
+    for (const auto& seg : segments) by_track[seg.track_id].push_back(seg);
+    if (by_track.size() <= 1) return std::nullopt;
+
+    std::vector<SubtitleEntry> all;
+    for (const auto& [track, track_segments] : by_track) {
+        for (auto entry : segmenter(track_segments, options)) {
+            entry.track_id = track;
+            all.push_back(std::move(entry));
+        }
+    }
+    return finalize_entries(std::move(all), options);
+}
+
+int single_track_id(const std::vector<Segment>& segments) {
+    return segments.empty() ? 0 : segments.front().track_id;
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════
@@ -78,56 +297,34 @@ std::string SubtitleExporter::export_subtitles(const std::vector<Segment>& segme
     }
 }
 
+std::vector<SubtitleEntry> SubtitleExporter::build_entries(const std::vector<Segment>& segments,
+                                                           const SubtitleExportOptions& options) {
+    // Specialised modes give better timing when word timestamps exist.
+    if (options.enable_karaoke_mode)    return build_karaoke_captions(segments, options);
+    if (options.enable_thai_mode)       return segment_thai(segments, options);
+    if (options.enable_vietnamese_mode) return segment_vietnamese(segments, options);
+    if (options.enable_indonesian_mode) return segment_indonesian(segments, options);
+    if (options.enable_hindi_mode)      return segment_hindi(segments, options);
+    if (options.enable_arabic_mode)     return segment_arabic(segments, options);
+    if (options.enable_spanish_mode)    return segment_spanish(segments, options);
+    if (options.enable_russian_mode)    return segment_russian(segments, options);
+    if (options.enable_chinese_mode)    return segment_chinese(segments, options);
+    if (options.enable_korean_mode)     return segment_korean(segments, options);
+    if (options.enable_japanese_mode)   return segment_japanese(segments, options);
+
+    // Standard segment-based subtitles
+    return segments_to_entries(segments, options);
+}
+
 std::string SubtitleExporter::export_srt(const std::vector<Segment>& segments,
                                         const std::string& video_path,
                                         const SubtitleExportOptions& options) {
-    // Generate output path
-    std::string output_path = options.output_path.empty() ?
+    const std::string output_path = options.output_path.empty() ?
         generate_output_path(video_path, SubtitleFormat::SRT) :
         options.output_path;
 
-    // Convert segments to entries
-    // Use specialized modes for better timing when enabled
-    std::vector<SubtitleEntry> entries;
-    if (options.enable_karaoke_mode) {
-        // AAA English karaoke-style captioning
-        entries = build_karaoke_captions(segments, options);
-    } else if (options.enable_thai_mode) {
-        // Thai-specific segmentation (no spaces, like Japanese)
-        entries = segment_thai(segments, options);
-    } else if (options.enable_vietnamese_mode) {
-        // Vietnamese-specific segmentation
-        entries = segment_vietnamese(segments, options);
-    } else if (options.enable_indonesian_mode) {
-        // Indonesian-specific segmentation
-        entries = segment_indonesian(segments, options);
-    } else if (options.enable_hindi_mode) {
-        // Hindi/Devanagari-specific segmentation
-        entries = segment_hindi(segments, options);
-    } else if (options.enable_arabic_mode) {
-        // Arabic-specific segmentation (RTL, ligature-safe)
-        entries = segment_arabic(segments, options);
-    } else if (options.enable_spanish_mode) {
-        // Spanish/Portuguese-specific segmentation
-        entries = segment_spanish(segments, options);
-    } else if (options.enable_russian_mode) {
-        // Russian-specific segmentation with CPS control and preposition rules
-        entries = segment_russian(segments, options);
-    } else if (options.enable_chinese_mode) {
-        // Chinese-specific segmentation with CPS control
-        entries = segment_chinese(segments, options);
-    } else if (options.enable_korean_mode) {
-        // Korean-specific segmentation with geumchik rules
-        entries = segment_korean(segments, options);
-    } else if (options.enable_japanese_mode) {
-        // Japanese-specific segmentation
-        entries = segment_japanese(segments, options);
-    } else {
-        // Standard segment-based subtitles
-        entries = segments_to_entries(segments, options);
-    }
+    const std::vector<SubtitleEntry> entries = build_entries(segments, options);
 
-    // Write SRT file
     std::ofstream file(utf8_path(output_path));
     if (!file.is_open()) {
         throw std::runtime_error("Failed to create SRT file: " + output_path);
@@ -145,53 +342,12 @@ std::string SubtitleExporter::export_srt(const std::vector<Segment>& segments,
 std::string SubtitleExporter::export_vtt(const std::vector<Segment>& segments,
                                         const std::string& video_path,
                                         const SubtitleExportOptions& options) {
-    // Generate output path
-    std::string output_path = options.output_path.empty() ?
+    const std::string output_path = options.output_path.empty() ?
         generate_output_path(video_path, SubtitleFormat::VTT) :
         options.output_path;
 
-    // Convert segments to entries
-    // Use specialized modes for better timing when enabled
-    std::vector<SubtitleEntry> entries;
-    if (options.enable_karaoke_mode) {
-        // AAA English karaoke-style captioning
-        entries = build_karaoke_captions(segments, options);
-    } else if (options.enable_thai_mode) {
-        // Thai-specific segmentation (no spaces, like Japanese)
-        entries = segment_thai(segments, options);
-    } else if (options.enable_vietnamese_mode) {
-        // Vietnamese-specific segmentation
-        entries = segment_vietnamese(segments, options);
-    } else if (options.enable_indonesian_mode) {
-        // Indonesian-specific segmentation
-        entries = segment_indonesian(segments, options);
-    } else if (options.enable_hindi_mode) {
-        // Hindi/Devanagari-specific segmentation
-        entries = segment_hindi(segments, options);
-    } else if (options.enable_arabic_mode) {
-        // Arabic-specific segmentation (RTL, ligature-safe)
-        entries = segment_arabic(segments, options);
-    } else if (options.enable_spanish_mode) {
-        // Spanish/Portuguese-specific segmentation
-        entries = segment_spanish(segments, options);
-    } else if (options.enable_russian_mode) {
-        // Russian-specific segmentation with CPS control and preposition rules
-        entries = segment_russian(segments, options);
-    } else if (options.enable_chinese_mode) {
-        // Chinese-specific segmentation with CPS control
-        entries = segment_chinese(segments, options);
-    } else if (options.enable_korean_mode) {
-        // Korean-specific segmentation with geumchik rules
-        entries = segment_korean(segments, options);
-    } else if (options.enable_japanese_mode) {
-        // Japanese-specific segmentation
-        entries = segment_japanese(segments, options);
-    } else {
-        // Standard segment-based subtitles
-        entries = segments_to_entries(segments, options);
-    }
+    const std::vector<SubtitleEntry> entries = build_entries(segments, options);
 
-    // Write VTT file
     std::ofstream file(utf8_path(output_path));
     if (!file.is_open()) {
         throw std::runtime_error("Failed to create VTT file: " + output_path);
@@ -232,89 +388,94 @@ std::vector<SubtitleEntry> SubtitleExporter::segments_to_entries(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    // 1. One entry per segment, in time order, with its text unsplit.
     std::vector<SubtitleEntry> entries;
-    int entry_index = 1;
-
+    entries.reserve(segments.size());
     for (const auto& seg : segments) {
         SubtitleEntry entry;
-        entry.index = entry_index++;
         entry.start = seg.start;
         entry.end = seg.end;
+        entry.track_id = seg.track_id;
         entry.speaker_id = seg.speaker_id;
         entry.speaker_label = seg.speaker_label;
         entry.words = seg.words;
-
-        // Apply speaker formatting
-        if (options.include_speakers && seg.speaker_id >= 0) {
-            std::string speaker_label = seg.speaker_label.empty() ?
-                ("Speaker " + std::to_string(seg.speaker_id)) : seg.speaker_label;
-
-            entry.text = apply_speaker_format(
-                options.speaker_format,
-                seg.speaker_id,
-                speaker_label,
-                seg.text
-            );
-        } else {
-            entry.text = seg.text;
-        }
-
-        // Split long text if needed
-        if (options.auto_split_long_text) {
-            entry.text = split_text(entry.text,
-                                   options.max_chars_per_line,
-                                   options.max_lines);
-        }
-
-        // Apply timing constraints
-        float duration = entry.end - entry.start;
-        if (duration < options.min_duration) {
-            entry.end = entry.start + options.min_duration;
-        }
-        if (duration > options.max_duration) {
-            entry.end = entry.start + options.max_duration;
-        }
-
-        entries.push_back(entry);
+        const size_t first = seg.text.find_first_not_of(" \t\r\n");
+        const size_t last = seg.text.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        entry.text = seg.text.substr(first, last - first + 1);
+        entries.push_back(std::move(entry));
     }
+    std::stable_sort(entries.begin(), entries.end(),
+                     [](const SubtitleEntry& a, const SubtitleEntry& b) { return a.start < b.start; });
 
-    // Merge close segments if requested
+    // 2. Optionally merge a segment into the cue just before it. Only within
+    //    one track and one speaker, and never past max_duration or past what
+    //    fits on max_lines lines.
     if (options.gap_threshold > 0.0f && entries.size() > 1) {
+        const size_t max_chars = static_cast<size_t>(std::max(1, options.max_chars_per_line)) *
+                                 static_cast<size_t>(std::max(1, options.max_lines));
         std::vector<SubtitleEntry> merged;
         merged.push_back(entries[0]);
 
         for (size_t i = 1; i < entries.size(); ++i) {
-            auto& last = merged.back();
-            const auto& curr = entries[i];
+            SubtitleEntry& last = merged.back();
+            const SubtitleEntry& curr = entries[i];
 
-            float gap = curr.start - last.end;
+            const float gap = curr.start - last.end;
+            const std::string joined = last.text + " " + curr.text;
+            const bool can_merge =
+                gap < options.gap_threshold &&
+                curr.track_id == last.track_id &&
+                curr.speaker_id == last.speaker_id &&
+                std::max(last.end, curr.end) - last.start <= options.max_duration &&
+                count_code_points(joined) <= max_chars;
 
-            // Merge if gap is small and same speaker
-            if (gap < options.gap_threshold &&
-                curr.speaker_id == last.speaker_id) {
-                last.end = curr.end;
-                last.text += " " + curr.text;
-
-                // Re-split if needed
-                if (options.auto_split_long_text) {
-                    last.text = split_text(last.text,
-                                          options.max_chars_per_line,
-                                          options.max_lines);
-                }
+            if (can_merge) {
+                last.end = std::max(last.end, curr.end);
+                last.text = joined;
+                last.words.insert(last.words.end(), curr.words.begin(), curr.words.end());
             } else {
                 merged.push_back(curr);
             }
         }
-
-        // Re-index
-        for (size_t i = 0; i < merged.size(); ++i) {
-            merged[i].index = i + 1;
-        }
-
-        entries = merged;
+        entries = std::move(merged);
     }
 
-    return entries;
+    // 3. Speaker labels, line splitting, more cues for text that doesn't fit,
+    //    then the duration limits.
+    std::vector<SubtitleEntry> out;
+    out.reserve(entries.size());
+    for (auto& entry : entries) {
+        if (options.include_speakers && entry.speaker_id >= 0) {
+            std::string label;
+            const auto named = options.speaker_names.find(entry.speaker_id);
+            if (named != options.speaker_names.end()) {
+                label = named->second;
+            } else if (!entry.speaker_label.empty()) {
+                label = entry.speaker_label;
+            } else {
+                label = "Speaker " + std::to_string(entry.speaker_id);
+            }
+            entry.text = apply_speaker_format(options.speaker_format, entry.speaker_id, label, entry.text);
+        }
+
+        if (options.auto_split_long_text) {
+            entry.text = split_text(entry.text, options.max_chars_per_line, options.max_lines);
+        }
+
+        for (auto& piece : split_overflowing_entry(entry, options.max_lines)) {
+            const float duration = piece.end - piece.start;
+            if (duration < options.min_duration) {
+                piece.end = piece.start + options.min_duration;
+            }
+            if (duration > options.max_duration) {
+                piece.end = piece.start + options.max_duration;
+            }
+            out.push_back(std::move(piece));
+        }
+    }
+
+    return finalize_entries(std::move(out), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -439,45 +600,37 @@ std::string SubtitleExporter::generate_output_path(const std::string& video_path
 
 std::string SubtitleExporter::split_text(const std::string& text,
                                         int max_chars_per_line,
-                                        int max_lines) {
-    if (text.length() <= static_cast<size_t>(max_chars_per_line)) {
+                                        int /* max_lines: never truncates, see the header */) {
+    const size_t max_chars = static_cast<size_t>(std::max(1, max_chars_per_line));
+    if (count_code_points(text) <= max_chars && text.find('\n') == std::string::npos) {
         return text;
     }
 
     std::vector<std::string> lines;
     std::string current_line;
+    size_t current_chars = 0;
     std::istringstream words(text);
     std::string word;
 
     while (words >> word) {
+        const size_t word_chars = count_code_points(word);
         if (current_line.empty()) {
             current_line = word;
-        } else if (current_line.length() + word.length() + 1 <= static_cast<size_t>(max_chars_per_line)) {
+            current_chars = word_chars;
+        } else if (current_chars + 1 + word_chars <= max_chars) {
             current_line += " " + word;
+            current_chars += 1 + word_chars;
         } else {
             lines.push_back(current_line);
             current_line = word;
-
-            if (lines.size() >= static_cast<size_t>(max_lines)) {
-                break;  // Max lines reached
-            }
+            current_chars = word_chars;
         }
     }
-
-    if (!current_line.empty() && lines.size() < static_cast<size_t>(max_lines)) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
-    // Join with newlines
-    std::string result;
-    for (size_t i = 0; i < lines.size(); ++i) {
-        result += lines[i];
-        if (i < lines.size() - 1) {
-            result += "\n";
-        }
-    }
-
-    return result;
+    return join_lines(lines, 0, lines.size());
 }
 
 std::string SubtitleExporter::apply_speaker_format(const std::string& format_string,
@@ -581,7 +734,7 @@ std::string SubtitleExporter::split_japanese_text(const std::string& text,
     size_t current_char_count = 0;
     size_t i = 0;
 
-    while (i < text.size() && static_cast<int>(lines.size()) < max_lines) {
+    while (i < text.size()) {
         size_t char_len = utf8_char_length(static_cast<unsigned char>(text[i]));
 
         if (i + char_len > text.size()) break;
@@ -615,7 +768,7 @@ std::string SubtitleExporter::split_japanese_text(const std::string& text,
     }
 
     // Add remaining text
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
@@ -635,15 +788,14 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_japanese(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_japanese)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
     // Collect all words from all segments with timing
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         // No word-level timestamps - fall back to segment-based
@@ -736,7 +888,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_japanese(
     // Flush any remaining text
     flush_entry();
 
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -765,14 +918,16 @@ float SubtitleExporter::calculate_cps(const std::string& text, float duration) {
     size_t char_count = 0;
     bool in_word = false;
 
-    for (char c : text) {
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
         if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
-            char_count++;
+            char_count++;  // one per code point, not per byte
             in_word = true;
         } else if (in_word) {
             char_count++;  // Count one space between words
             in_word = false;
         }
+        i += utf8_sequence_length(c);
     }
 
     return static_cast<float>(char_count) / duration;
@@ -822,15 +977,14 @@ std::vector<SubtitleEntry> SubtitleExporter::build_karaoke_captions(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::build_karaoke_captions)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
     // Collect all words from all segments
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         // No word-level timestamps - fall back to segment-based
@@ -871,7 +1025,7 @@ std::vector<SubtitleEntry> SubtitleExporter::build_karaoke_captions(
             entry.end = phrase_end + options.min_hold_after_speech_s;
 
             // Split text if too long for display
-            if (current_text.length() > static_cast<size_t>(options.max_chars_per_line)) {
+            if (count_code_points(current_text) > static_cast<size_t>(options.max_chars_per_line)) {
                 entry.text = split_text(current_text, options.max_chars_per_line, options.max_lines);
             } else {
                 entry.text = current_text;
@@ -937,7 +1091,7 @@ std::vector<SubtitleEntry> SubtitleExporter::build_karaoke_captions(
         }
 
         // 3. Character limit per line (with some buffer for 2-line display)
-        if (current_text.length() >= static_cast<size_t>(options.max_chars_per_line * options.max_lines)) {
+        if (count_code_points(current_text) >= static_cast<size_t>(options.max_chars_per_line * options.max_lines)) {
             should_break = true;
         }
 
@@ -983,7 +1137,8 @@ std::vector<SubtitleEntry> SubtitleExporter::build_karaoke_captions(
         }
     }
 
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1166,7 +1321,7 @@ std::string SubtitleExporter::split_korean_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < chars.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < chars.size(); ++i) {
         const std::string& ch = chars[i];
 
         // Skip if adding this char would cause geumchik violation at line end
@@ -1220,7 +1375,7 @@ std::string SubtitleExporter::split_korean_text(const std::string& text,
     }
 
     // Add remaining text
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         while (!current_line.empty() && current_line.back() == ' ') {
             current_line.pop_back();
         }
@@ -1329,15 +1484,14 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_korean(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_korean)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
     // Collect all words from all segments with timing
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         // No word-level timestamps - fall back to segment-based
@@ -1459,7 +1613,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_korean(
     // Flush any remaining text
     flush_entry();
 
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1617,7 +1772,7 @@ std::string SubtitleExporter::split_chinese_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < chars.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < chars.size(); ++i) {
         const std::string& ch = chars[i];
 
         // Check if we can break here (punctuation rules)
@@ -1662,7 +1817,7 @@ std::string SubtitleExporter::split_chinese_text(const std::string& text,
     }
 
     // Add remaining text
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
@@ -1773,15 +1928,14 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_chinese(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_chinese)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
     // Collect all words from all segments with timing
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         // No word-level timestamps - fall back to segment-based
@@ -1905,7 +2059,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_chinese(
     // Flush any remaining text
     flush_entry();
 
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2065,7 +2220,7 @@ std::string SubtitleExporter::split_russian_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < words.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < words.size(); ++i) {
         const std::string& word = words[i];
         size_t word_len = count_russian_chars(word);
 
@@ -2076,42 +2231,43 @@ std::string SubtitleExporter::split_russian_text(const std::string& text,
         }
 
         bool should_break = (new_count > static_cast<size_t>(max_chars) && !current_line.empty());
+        std::string carried;  // a preposition moved down to the new line
 
         // Check line-break rules
         if (use_line_break_rules && should_break) {
-            // Don't leave single-letter prepositions at line end
-            if (!current_line.empty()) {
-                // Get last word on current line
-                size_t last_space = current_line.rfind(' ');
-                std::string last_word = (last_space != std::string::npos)
-                    ? current_line.substr(last_space + 1)
-                    : current_line;
-
-                if (is_russian_single_letter_preposition(last_word)) {
-                    // Move preposition to next line with current word
-                    if (last_space != std::string::npos) {
-                        current_line = current_line.substr(0, last_space);
-                    } else {
-                        // Line is just the preposition - don't break
-                        should_break = false;
-                    }
-                }
-            }
-
             // Don't start line with closing punctuation
-            if (should_break && !word.empty()) {
+            if (!word.empty()) {
                 std::string first_char = word.substr(0, utf8_char_length(static_cast<unsigned char>(word[0])));
                 if (is_russian_no_start(first_char)) {
                     // Don't break - keep punctuation with previous line
                     should_break = false;
                 }
             }
+
+            // Don't leave single-letter prepositions at line end
+            if (should_break) {
+                size_t last_space = current_line.rfind(' ');
+                std::string last_word = (last_space != std::string::npos)
+                    ? current_line.substr(last_space + 1)
+                    : current_line;
+
+                if (is_russian_single_letter_preposition(last_word)) {
+                    if (last_space != std::string::npos) {
+                        // Move the preposition to the next line with this word
+                        current_line = current_line.substr(0, last_space);
+                        carried = last_word;
+                    } else {
+                        // Line is just the preposition - don't break
+                        should_break = false;
+                    }
+                }
+            }
         }
 
         if (should_break) {
             lines.push_back(current_line);
-            current_line = word;
-            current_char_count = word_len;
+            current_line = carried.empty() ? word : carried + " " + word;
+            current_char_count = count_russian_chars(current_line) + (carried.empty() ? 0 : 1);
         } else {
             if (!current_line.empty()) {
                 current_line += " ";
@@ -2123,7 +2279,7 @@ std::string SubtitleExporter::split_russian_text(const std::string& text,
     }
 
     // Add remaining text
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
@@ -2150,15 +2306,14 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_russian(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_russian)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
     // Collect all words from all segments with timing
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         // No word-level timestamps - fall back to segment-based
@@ -2284,7 +2439,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_russian(
     // Flush any remaining text
     flush_entry();
 
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2396,7 +2552,7 @@ std::string SubtitleExporter::split_spanish_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < words.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < words.size(); ++i) {
         const std::string& word = words[i];
         size_t word_len = count_spanish_chars(word);
 
@@ -2406,6 +2562,7 @@ std::string SubtitleExporter::split_spanish_text(const std::string& text,
         }
 
         bool should_break = (new_count > static_cast<size_t>(max_chars) && !current_line.empty());
+        std::string carried;  // a short word moved down to the new line
 
         // Check line-break rules
         if (use_line_break_rules && should_break && !current_line.empty()) {
@@ -2416,9 +2573,10 @@ std::string SubtitleExporter::split_spanish_text(const std::string& text,
                 : current_line;
 
             if (is_spanish_short_word(last_word)) {
-                // Move short word to next line
                 if (last_space != std::string::npos) {
+                    // Move the short word to the next line with this word
                     current_line = current_line.substr(0, last_space);
+                    carried = last_word;
                 } else {
                     should_break = false;
                 }
@@ -2427,8 +2585,8 @@ std::string SubtitleExporter::split_spanish_text(const std::string& text,
 
         if (should_break) {
             lines.push_back(current_line);
-            current_line = word;
-            current_char_count = word_len;
+            current_line = carried.empty() ? word : carried + " " + word;
+            current_char_count = count_spanish_chars(current_line) + (carried.empty() ? 0 : 1);
         } else {
             if (!current_line.empty()) {
                 current_line += " ";
@@ -2439,7 +2597,7 @@ std::string SubtitleExporter::split_spanish_text(const std::string& text,
         }
     }
 
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
@@ -2465,15 +2623,14 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_spanish(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_spanish)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
     // Collect all words
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         return segments_to_entries(segments, options);
@@ -2579,7 +2736,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_spanish(
     }
 
     flush_entry();
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2677,7 +2835,7 @@ std::string SubtitleExporter::split_arabic_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < words.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < words.size(); ++i) {
         const std::string& word = words[i];
         size_t word_len = count_arabic_chars(word);
 
@@ -2700,7 +2858,7 @@ std::string SubtitleExporter::split_arabic_text(const std::string& text,
         }
     }
 
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
@@ -2725,14 +2883,13 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_arabic(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_arabic)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         return segments_to_entries(segments, options);
@@ -2825,7 +2982,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_arabic(
     }
 
     flush_entry();
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2915,7 +3073,7 @@ std::string SubtitleExporter::split_hindi_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < words.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < words.size(); ++i) {
         const std::string& word = words[i];
         size_t word_len = count_hindi_chars(word);
 
@@ -2938,7 +3096,7 @@ std::string SubtitleExporter::split_hindi_text(const std::string& text,
         }
     }
 
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         lines.push_back(current_line);
     }
 
@@ -2963,14 +3121,13 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_hindi(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_hindi)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         return segments_to_entries(segments, options);
@@ -3062,7 +3219,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_hindi(
     }
 
     flush_entry();
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3084,14 +3242,13 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_indonesian(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_indonesian)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         return segments_to_entries(segments, options);
@@ -3181,7 +3338,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_indonesian(
     }
 
     flush_entry();
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3231,14 +3389,13 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_vietnamese(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_vietnamese)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         return segments_to_entries(segments, options);
@@ -3329,7 +3486,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_vietnamese(
     }
 
     flush_entry();
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3393,7 +3551,7 @@ std::string SubtitleExporter::split_thai_text(const std::string& text,
     std::string current_line;
     size_t current_char_count = 0;
 
-    for (size_t i = 0; i < chars.size() && static_cast<int>(lines.size()) < max_lines; ++i) {
+    for (size_t i = 0; i < chars.size(); ++i) {
         const std::string& ch = chars[i];
 
         bool is_space = (ch == " " || ch == "\n" || ch == "\r");
@@ -3427,7 +3585,7 @@ std::string SubtitleExporter::split_thai_text(const std::string& text,
         }
     }
 
-    if (!current_line.empty() && static_cast<int>(lines.size()) < max_lines) {
+    if (!current_line.empty()) {
         while (!current_line.empty() && current_line.back() == ' ') {
             current_line.pop_back();
         }
@@ -3457,14 +3615,13 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_thai(
     const std::vector<Segment>& segments,
     const SubtitleExportOptions& options) {
 
+    if (auto per_track = segment_per_track(segments, options, &SubtitleExporter::segment_thai)) {
+        return std::move(*per_track);
+    }
+
     std::vector<SubtitleEntry> entries;
 
-    std::vector<Word> all_words;
-    for (const auto& seg : segments) {
-        for (const auto& word : seg.words) {
-            all_words.push_back(word);
-        }
-    }
+    std::vector<Word> all_words = collect_words(segments);
 
     if (all_words.empty()) {
         return segments_to_entries(segments, options);
@@ -3554,7 +3711,8 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_thai(
     }
 
     flush_entry();
-    return entries;
+    for (auto& entry : entries) entry.track_id = single_track_id(segments);
+    return finalize_entries(std::move(entries), options);
 }
 
 // ═══════════════════════════════════════════════════════════
