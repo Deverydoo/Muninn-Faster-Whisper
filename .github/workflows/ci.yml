@@ -154,8 +154,10 @@ jobs:
           $base = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
           $zip = "$env:RUNNER_TEMP/$env:FFMPEG_NAME.zip"
           Invoke-WebRequest -Uri "$base/$env:FFMPEG_NAME.zip" -OutFile $zip
-          $sums = (Invoke-WebRequest -Uri "$base/checksums.sha256").Content
-          $line = ($sums -split "`n") | Where-Object { $_ -match "\s$([regex]::Escape($env:FFMPEG_NAME)).zip\s*$" }
+          # Served as application/octet-stream, so save it rather than read .Content.
+          Invoke-WebRequest -Uri "$base/checksums.sha256" -OutFile "$env:RUNNER_TEMP/checksums.sha256"
+          $line = Get-Content "$env:RUNNER_TEMP/checksums.sha256" |
+            Where-Object { $_ -match "\s$([regex]::Escape($env:FFMPEG_NAME))\.zip\s*$" }
           if (-not $line) { throw "No checksum listed for $env:FFMPEG_NAME.zip" }
           $want = ($line -split '\s+')[0].ToLower()
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
