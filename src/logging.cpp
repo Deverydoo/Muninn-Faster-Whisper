@@ -4,10 +4,13 @@
  */
 
 #include "muninn/logging.h"
-#include <iostream>
+#include <atomic>
 #include <chrono>
-#include <iomanip>
+#include <cstdio>
 #include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <memory>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -20,27 +23,47 @@
 
 namespace muninn {
 
-// Static member initialization
-LogCallback Logger::callback_ = nullptr;
-std::ofstream Logger::log_file_;
-std::mutex Logger::file_mutex_;
-bool Logger::file_logging_enabled_ = false;
-std::string Logger::log_directory_;
+namespace {
+
+// The callback is held through a shared_ptr: log() copies the pointer under
+// the lock and calls it outside, so set_callback() can swap it while other
+// threads are mid-call, and a callback that logs doesn't deadlock.
+std::mutex g_callback_mutex;
+std::shared_ptr<const LogCallback> g_callback;
+
+std::mutex g_file_mutex;
+std::ofstream g_log_file;
+std::string g_log_directory;
+std::atomic<bool> g_file_logging_enabled{false};
+
+// One whole line per write, so lines from different threads never mix.
+std::mutex g_console_mutex;
+
+std::shared_ptr<const LogCallback> current_callback() {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    return g_callback;
+}
+
+} // namespace
 
 void Logger::set_callback(LogCallback callback) {
-    callback_ = callback;
+    std::shared_ptr<const LogCallback> next;
+    if (callback) next = std::make_shared<const LogCallback>(std::move(callback));
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    g_callback = std::move(next);
 }
 
 LogCallback Logger::get_callback() {
-    return callback_;
+    auto cb = current_callback();
+    return cb ? *cb : LogCallback();
 }
 
 bool Logger::set_log_directory(const std::string& directory) {
-    std::lock_guard<std::mutex> lock(file_mutex_);
+    std::lock_guard<std::mutex> lock(g_file_mutex);
 
     // Close existing file if open
-    if (log_file_.is_open()) {
-        log_file_.close();
+    if (g_log_file.is_open()) {
+        g_log_file.close();
     }
 
     // Create directory if it doesn't exist (best effort)
@@ -54,39 +77,40 @@ bool Logger::set_log_directory(const std::string& directory) {
     log_path += "muninn.log";
 
     // Open file in append mode
-    log_file_.open(log_path, std::ios::app);
-    if (!log_file_.is_open()) {
+    g_log_file.open(log_path, std::ios::app);
+    if (!g_log_file.is_open()) {
+        g_file_logging_enabled.store(false);
+        std::lock_guard<std::mutex> console(g_console_mutex);
         std::cerr << "[Muninn] Failed to open log file: " << log_path << "\n";
-        file_logging_enabled_ = false;
         return false;
     }
 
-    log_directory_ = directory;
-    file_logging_enabled_ = true;
+    g_log_directory = directory;
 
     // Write session header
-    log_file_ << "\n";
-    log_file_ << "═══════════════════════════════════════════════════════════\n";
-    log_file_ << "  Muninn Transcription Engine - Session Started\n";
-    log_file_ << "  " << get_timestamp() << "\n";
-    log_file_ << "═══════════════════════════════════════════════════════════\n";
-    log_file_.flush();
+    g_log_file << "\n";
+    g_log_file << "═══════════════════════════════════════════════════════════\n";
+    g_log_file << "  Muninn Transcription Engine - Session Started\n";
+    g_log_file << "  " << get_timestamp() << "\n";
+    g_log_file << "═══════════════════════════════════════════════════════════\n";
+    g_log_file.flush();
 
+    g_file_logging_enabled.store(true);
     return true;
 }
 
 void Logger::disable_file_logging() {
-    std::lock_guard<std::mutex> lock(file_mutex_);
-    if (log_file_.is_open()) {
-        log_file_ << "[" << get_timestamp() << "] Session ended\n";
-        log_file_.close();
+    std::lock_guard<std::mutex> lock(g_file_mutex);
+    g_file_logging_enabled.store(false);
+    if (g_log_file.is_open()) {
+        g_log_file << "[" << get_timestamp() << "] Session ended\n";
+        g_log_file.close();
     }
-    file_logging_enabled_ = false;
-    log_directory_.clear();
+    g_log_directory.clear();
 }
 
 bool Logger::is_file_logging_enabled() {
-    return file_logging_enabled_;
+    return g_file_logging_enabled.load();
 }
 
 void Logger::debug(const std::string& message) {
@@ -107,43 +131,42 @@ void Logger::error(const std::string& message) {
 
 void Logger::log(LogLevel level, const std::string& message) {
     // Always write to file if enabled
-    if (file_logging_enabled_) {
+    if (g_file_logging_enabled.load(std::memory_order_relaxed)) {
         write_to_file(level, message);
     }
 
-    // Use callback if set, otherwise default to stdout/stderr
-    if (callback_) {
-        callback_(level, message);
-    } else {
-        // Default to stdout/stderr
-        const char* prefix = "[Muninn] ";
-        switch (level) {
-            case LogLevel::Debug:
-                std::cout << prefix << "[DEBUG] " << message << "\n";
-                break;
-            case LogLevel::Info:
-                std::cout << prefix << message << "\n";
-                break;
-            case LogLevel::Warning:
-                std::cerr << prefix << "[WARN] " << message << "\n";
-                break;
-            case LogLevel::Error:
-                std::cerr << prefix << "[ERROR] " << message << "\n";
-                break;
-        }
-        std::cout.flush();
-        std::cerr.flush();
+    if (auto cb = current_callback()) {
+        (*cb)(level, message);
+        return;
     }
+
+    // Default: stderr at every level. stdout belongs to the host (Loki
+    // Studio's worker speaks JSON on it).
+    const char* tag = "";
+    switch (level) {
+        case LogLevel::Debug:   tag = "[DEBUG] "; break;
+        case LogLevel::Info:    tag = ""; break;
+        case LogLevel::Warning: tag = "[WARN] "; break;
+        case LogLevel::Error:   tag = "[ERROR] "; break;
+    }
+    std::string line = "[Muninn] ";
+    line += tag;
+    line += message;
+    line += '\n';
+
+    std::lock_guard<std::mutex> lock(g_console_mutex);
+    std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
+    std::cerr.flush();
 }
 
 void Logger::write_to_file(LogLevel level, const std::string& message) {
-    std::lock_guard<std::mutex> lock(file_mutex_);
-    if (!log_file_.is_open()) return;
+    std::lock_guard<std::mutex> lock(g_file_mutex);
+    if (!g_log_file.is_open()) return;
 
-    log_file_ << "[" << get_timestamp() << "] "
-              << "[" << level_to_string(level) << "] "
-              << message << "\n";
-    log_file_.flush();
+    g_log_file << "[" << get_timestamp() << "] "
+               << "[" << level_to_string(level) << "] "
+               << message << "\n";
+    g_log_file.flush();
 }
 
 std::string Logger::get_timestamp() {

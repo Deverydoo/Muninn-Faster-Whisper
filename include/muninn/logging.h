@@ -32,18 +32,27 @@ using LogCallback = std::function<void(LogLevel level, const std::string& messag
  * @brief Global logging configuration for Muninn
  *
  * This allows the host application (e.g., Loki Studio) to redirect
- * Muninn's logs to its own logging system instead of stdout/stderr.
+ * Muninn's logs to its own logging system.
+ *
+ * Without a callback, every level goes to stderr, never stdout: a host may use
+ * stdout for its own protocol (Loki Studio's worker sends JSON there). Each
+ * line is written whole, so lines from different threads don't interleave.
  *
  * Additionally, file logging can be enabled by calling set_log_directory().
  * File logging works independently of the callback - both can be active.
+ *
+ * Thread safety: every function here may be called from any thread. The
+ * callback can be swapped while other threads are logging; a call already in
+ * progress finishes with the callback it started with. The callback may itself
+ * call Logger (it is invoked without Muninn's lock held).
  */
 class MUNINN_API Logger {
 public:
     /**
      * @brief Set a custom logging callback
      *
-     * When set, all Muninn log output goes to this callback instead of stdout/stderr.
-     * Set to nullptr to restore default stdout/stderr behavior.
+     * When set, all Muninn log output goes to this callback instead of stderr.
+     * Set to nullptr to restore the default (stderr).
      *
      * @param callback The logging callback function
      */
@@ -104,12 +113,7 @@ public:
     static void log(LogLevel level, const std::string& message);
 
 private:
-    static LogCallback callback_;
-    static std::ofstream log_file_;
-    static std::mutex file_mutex_;
-    static bool file_logging_enabled_;
-    static std::string log_directory_;
-
+    // The logger's state (callback, file, flags) lives in logging.cpp.
     static void write_to_file(LogLevel level, const std::string& message);
     static std::string get_timestamp();
     static std::string level_to_string(LogLevel level);
