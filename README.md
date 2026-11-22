@@ -2,7 +2,8 @@
 
 **Self-contained Pure C++ Whisper Transcription Suite - Production-ready alternative to Python faster-whisper**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/Deverydoo/Muninn-Faster-Whisper/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Deverydoo/Muninn-Faster-Whisper/actions/workflows/ci.yml)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-yellow.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
 [![CTranslate2](https://img.shields.io/badge/CTranslate2-Optimized-green.svg)](https://github.com/OpenNMT/CTranslate2)
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-Powered-orange.svg)](https://ffmpeg.org/)
@@ -303,7 +304,7 @@ cmake --build . --config Release -j
 ### Build from Source (Linux/Mac)
 
 ```bash
-git clone --recursive https://github.com/nordiq-ai/muninn-faster-whisper.git
+git clone --recursive https://github.com/Deverydoo/Muninn-Faster-Whisper.git
 cd muninn-faster-whisper
 
 # Install FFmpeg (system)
@@ -628,7 +629,7 @@ Muninn includes a **built-in FFmpeg-powered audio decoder** for self-contained o
 
 ## Project Status
 
-**Current Version**: 0.5.0-alpha
+**Current Version**: 0.5.0 ([release](https://github.com/Deverydoo/Muninn-Faster-Whisper/releases/tag/v0.5.0), Windows x64, CUDA 13)
 
 ### Implemented
 - [x] CTranslate2 Whisper integration
@@ -659,7 +660,7 @@ Muninn includes a **built-in FFmpeg-powered audio decoder** for self-contained o
 ### Planned
 - [ ] Hotwords/prefix support (logit bias)
 - [ ] Python bindings
-- [ ] Pre-built binaries
+- [x] Pre-built Windows binaries (since 0.5.0, see Releases)
 - [ ] ASS subtitle format (advanced styling)
 
 ## Contributing
@@ -668,7 +669,7 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Business Source License 1.1, with an additional grant for any non-commercial use (personal projects, research, education). Each release changes to the MIT License four years after it comes out. For commercial use, see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
@@ -679,8 +680,8 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/nordiq-ai/muninn-faster-whisper/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/nordiq-ai/muninn-faster-whisper/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Deverydoo/Muninn-Faster-Whisper/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Deverydoo/Muninn-Faster-Whisper/discussions)
 
 ---
 
