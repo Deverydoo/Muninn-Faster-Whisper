@@ -286,6 +286,7 @@ set(MUNINN_SOURCES
     src/mel_spectrogram.cpp
     src/transcriber.cpp
     src/streaming_transcriber.cpp
+    src/text_decode.cpp
     src/translator.cpp
     src/translate_text.cpp
     src/audio_extractor.cpp
@@ -444,6 +445,12 @@ if(BUILD_TESTS)
     add_executable(test_subtitles tests/test_subtitles.cpp)
     target_link_libraries(test_subtitles PRIVATE muninn)
 
+    # Streaming: the resampler, downmix, audio buffer, segment queue and text
+    # decoding without a model; a full session with one (see below).
+    add_executable(test_streaming tests/test_streaming.cpp)
+    target_include_directories(test_streaming PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_streaming PRIVATE muninn)
+
     # ctest labels:
     #   cpu    needs nothing but the build (CI runs: ctest -L cpu)
     #   model  needs a Whisper model; registered only when MUNINN_TEST_MODEL
@@ -480,11 +487,17 @@ if(BUILD_TESTS)
     add_test(NAME subtitles COMMAND test_subtitles)
     set_tests_properties(subtitles PROPERTIES LABELS "cpu")
 
+    add_test(NAME streaming COMMAND test_streaming)
+    set_tests_properties(streaming PROPERTIES LABELS "cpu")
+
     set(MUNINN_TEST_MODEL "" CACHE PATH "Whisper model folder for the model tests (empty = not registered)")
     set(MUNINN_TEST_AUDIO "" CACHE FILEPATH "Audio or video file for the model tests")
     if(MUNINN_TEST_MODEL AND MUNINN_TEST_AUDIO)
         add_test(NAME transcribe_file COMMAND muninn_test_app "${MUNINN_TEST_MODEL}" "${MUNINN_TEST_AUDIO}")
         set_tests_properties(transcribe_file PROPERTIES LABELS "model;gpu")
+        add_test(NAME streaming_session COMMAND test_streaming
+                 --model "${MUNINN_TEST_MODEL}" --audio "${MUNINN_TEST_AUDIO}" --seconds 60)
+        set_tests_properties(streaming_session PROPERTIES LABELS "model;gpu")
     endif()
 
     # A dynamic FFmpeg's DLLs live in FFMPEG_DIR/bin, not beside the tests.
@@ -525,13 +538,14 @@ if(BUILD_EXAMPLES)
     add_executable(translation_example examples/translation_example.cpp)
     target_link_libraries(translation_example PRIVATE muninn)
 
-    # Diarization example (requires ONNX Runtime and StreamingTranscriber)
-    if(SILERO_VAD_ENABLED)
-        # Note: diarization_streaming disabled until streaming_transcriber.cpp is fixed
-        # add_executable(diarization_streaming examples/diarization_streaming.cpp)
-        # target_include_directories(diarization_streaming PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        # target_link_libraries(diarization_streaming PRIVATE muninn ${ONNXRUNTIME_LIB})
+    # Streaming: live captions with word highlighting, and live translation to
+    # English. Both play an audio file in real time: <model> <audio> [device]
+    add_executable(karaoke_captions examples/karaoke_captions.cpp)
+    target_link_libraries(karaoke_captions PRIVATE muninn)
+    add_executable(translation_streaming examples/translation_streaming.cpp)
+    target_link_libraries(translation_streaming PRIVATE muninn)
 
+    if(SILERO_VAD_ENABLED)
         add_executable(subtitle_export examples/subtitle_export.cpp)
         target_include_directories(subtitle_export PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
         target_link_libraries(subtitle_export PRIVATE muninn ${ONNXRUNTIME_LIB})

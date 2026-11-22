@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     try {
         muninn::ModelOptions model_opts;
         model_opts.model_path = whisper;
-        model_opts.device = muninn::DeviceType::CUDA;
+        model_opts.device = muninn::DeviceType::Auto;
         model_opts.compute_type = muninn::ComputeType::Float16;
 
         muninn::StreamingTranscriber stream(model_opts);

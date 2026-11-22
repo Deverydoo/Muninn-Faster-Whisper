@@ -37,42 +37,38 @@ auto all_segments = stream.stop();
 
 ## API Reference
 
-### StreamingTranscriber
+The header, `include/muninn/streaming_transcriber.h`, is the full reference.
+In short:
 
 ```cpp
 class StreamingTranscriber {
 public:
-    // Initialize with model
+    // device: "cuda", "cpu" or "auto" (CUDA when it works, else CPU).
+    // On the CPU, float16 becomes float32 and int8_float16 becomes int8.
     StreamingTranscriber(const std::string& model_path,
                          const std::string& device = "cuda",
                          const std::string& compute_type = "float16");
+    // Uses device, compute_type, device_index and intra_threads.
+    explicit StreamingTranscriber(const ModelOptions& options);
 
-    // Start streaming session
     void start(const StreamingOptions& options = {},
                StreamingCallback callback = nullptr);
+    std::vector<Segment> stop();          // decodes what's buffered; returns every segment
+    bool is_active() const;
 
-    // Stop and flush
-    std::vector<Segment> stop();
+    // Never waits for a decode. Any channel count (averaged to mono), any
+    // sample rate > 0. Returns false when nothing was taken.
+    bool push_audio(const float* samples, size_t sample_count,
+                    int sample_rate = 16000, int channels = 1);
 
-    // Push audio (thread-safe)
-    void push_audio(const float* samples,
-                    size_t sample_count,
-                    int sample_rate = 16000,
-                    int channels = 1);
-
-    // Poll for results (thread-safe, non-blocking)
     bool poll_segment(Segment& out_segment);
-
-    // Get current text (last 5 segments)
-    std::string get_current_text(bool include_partial = true) const;
-
-    // Get all segments
     std::vector<Segment> get_all_segments() const;
+    // include_partial adds the words decoded but held back for the next window.
+    std::string get_current_text(bool include_partial = true) const;
+    void reset();                         // clears everything; timeline back to 0
 
-    // Reset state
-    void reset();
-
-    // Get stats
+    void set_error_callback(StreamingErrorCallback callback);
+    std::string last_error() const;
     Stats get_stats() const;
 };
 ```
@@ -81,35 +77,57 @@ public:
 
 ```cpp
 struct StreamingOptions {
-    std::string language = "auto";         // Language code or "auto"
-    int beam_size = 5;                     // Beam search width
-    float temperature = 0.0f;              // Sampling temperature
+    std::string language = "auto";     // detected on the first speech, or a code the model knows
+    std::string task = "transcribe";   // or "translate" (to English)
+    int beam_size = 5;
+    float temperature = 0.0f;
 
-    float chunk_length_s = 2.0f;           // Process audio every N seconds
-    float overlap_s = 0.5f;                // Overlap for context
-    bool enable_vad = true;                // Use VAD
-    VADType vad_type = VADType::Energy;    // VAD algorithm
+    float chunk_length_s = 2.0f;       // window length (at most 30 s)
+    float overlap_s = 0.5f;            // windows overlap by this (at most half a window)
+    bool enable_vad = true;
+    VADType vad_type = VADType::Energy;
+    std::string vad_model_path;        // silero_vad.onnx, for VADType::Silero
+    bool vad_fallback_to_energy = true;
 
-    float compression_ratio_threshold = 2.4f;  // Hallucination filter
-    float no_speech_threshold = 0.4f;          // Silence threshold
-    bool word_timestamps = true;               // Enable word timing
+    float compression_ratio_threshold = 2.4f;  // zlib ratio above this = decoding loop
+    float no_speech_threshold = 0.4f;          // silence = no_speech above this
+    float log_prob_threshold = -1.0f;          //   AND avg log-prob below this
+    bool word_timestamps = true;               // Segment::words, from CTranslate2's alignment
+    bool filter_hallucinations = true;         // drop windows that look like a loop
+    bool condition_on_previous_text = true;    // prompt each window with the text before it
+
+    float max_buffered_s = 60.0f;              // audio waiting beyond this is dropped, oldest first
+    size_t max_pending_segments = 1000;        // poll queue cap, oldest dropped first
 };
 ```
 
-### StreamingCallback
+### How windows are joined
+
+Each window starts `overlap_s` before the previous one ended. Every word gets a
+time from CTranslate2's alignment, and a word is emitted only by the window in
+which it sits furthest from an edge. Nothing is emitted twice, and a word cut by
+one window's edge is taken from the next window, which hears it whole. The cost
+is latency: the last `overlap_s / 2` seconds of a window wait for the next one.
+
+Timestamps are seconds of audio pushed since `start()` (or `reset()`). They stay
+right when decoding falls behind, and when audio is dropped because the buffer
+was full.
+
+### Callbacks
 
 ```cpp
 using StreamingCallback = std::function<bool(const Segment& segment)>;
-
-// Example:
-stream.start({}, [](const Segment& seg) {
-    // Process completed segment
-    std::cout << seg.text << std::endl;
-
-    // Return false to stop, true to continue
-    return !user_stopped;
-});
+using StreamingErrorCallback = std::function<void(const std::string& message)>;
 ```
+
+Both run on the worker thread with no lock held, so they may call any method
+except `start()` and `stop()`, which throw `std::logic_error` there (`stop()`
+would be waiting for itself). Return false from the segment callback to end the
+session, then call `stop()` from your own thread.
+
+A window that fails to decode (out of GPU memory, for example) is skipped and
+reported to the error callback and `last_error()`; streaming carries on. An
+exception from your segment callback is caught and reported the same way.
 
 ## Usage Patterns
 
@@ -205,13 +223,19 @@ stream.push_audio(samples_48000, count, 48000);  // 48kHz
 stream.push_audio(samples_16000, count, 16000);  // 16kHz (optimal)
 ```
 
-### Stereo to Mono Conversion
+### Any Channel Count
+
+Interleaved audio with any number of channels is averaged to mono.
+`sample_count` is the number of floats (frames x channels).
 
 ```cpp
-// Stereo audio (interleaved)
 float stereo_buffer[2048];  // L,R,L,R,...
-stream.push_audio(stereo_buffer, 2048, 48000, 2);  // channels=2
+stream.push_audio(stereo_buffer, 2048, 48000, 2);   // 1024 frames
+stream.push_audio(surround, 6 * 480, 48000, 6);     // 5.1, 10 ms
 ```
+
+The resampler keeps its position between calls, so audio pushed in small
+blocks comes out exactly as if it were pushed in one piece.
 
 ### Voice Activity Detection
 
@@ -250,11 +274,14 @@ std::cout << "Buffer: " << (stats.buffer_fill_ratio * 100) << "%\n";
 ## Performance
 
 - **Latency**: 500ms-2s depending on `chunk_length_s`
-- **Throughput**: 22x real-time on GPU (RTX 4090)
 - **Memory**: ~500MB model + buffers
 - **CPU Usage**: Minimal (most work on GPU)
 
 ### Tuning Latency
+
+Every window is padded to 30 s before decoding, as Whisper expects, so a short
+window costs a full encoder pass: halving `chunk_length_s` roughly doubles the
+GPU work.
 
 ```cpp
 muninn::StreamingOptions opts;
@@ -270,11 +297,12 @@ opts.overlap_s = 1.0f;          // 1s overlap for context
 
 ## Thread Safety
 
-- ✅ `push_audio()` - Thread-safe, can call from audio callback
-- ✅ `poll_segment()` - Thread-safe, can call from main thread
-- ✅ `get_current_text()` - Thread-safe
-- ✅ `get_stats()` - Thread-safe
-- ❌ `start()`/`stop()` - Must call from same thread
+- `push_audio()`: any thread, including audio callbacks. It never waits for a
+  decode; calls from several threads at once are serialised.
+- `poll_segment()`, `get_all_segments()`, `get_current_text()`, `get_stats()`,
+  `last_error()`, `reset()`, `set_error_callback()`: any thread, and from the
+  callbacks.
+- `start()` and `stop()`: any thread except the callbacks.
 
 ## Comparison: Streaming vs Batch
 
@@ -284,6 +312,7 @@ opts.overlap_s = 1.0f;          // 1s overlap for context
 | Use Case | Live captions, real-time | Post-production, archival |
 | Memory | Low (buffers chunks) | High (full audio) |
 | Word timestamps | Yes | Yes |
+| Language detection | First speech | Per file |
 | VAD | Yes | Yes |
 | Multi-track | No | Yes |
 | Quality | Good | Excellent |
@@ -291,34 +320,30 @@ opts.overlap_s = 1.0f;          // 1s overlap for context
 ## Example: Export SRT from Stream
 
 ```cpp
-// Collect segments during stream
-std::vector<muninn::Segment> all_segments;
+#include <muninn/subtitle_export.h>
 
-stream.start({}, [&](const muninn::Segment& seg) {
-    all_segments.push_back(seg);
-    return true;
-});
+stream.start(opts);
+// ... push audio ...
+auto segments = stream.stop();   // every segment of the session
 
-// ... record audio ...
-
-stream.stop();
-
-// Export to SRT
-export_srt(all_segments, "output.srt");
+muninn::SubtitleExporter exporter;
+exporter.export_srt(segments, "recording.mp4");   // writes recording.srt beside it
 ```
 
 ## Limitations
 
-1. **No multi-track support** - Single audio stream only
-2. **No file-based input** - Memory/stream only (use `Transcriber` for files)
-3. **Limited context** - Only `overlap_s` seconds of context
-4. **English bias** - Best for English; other languages may have higher latency
+1. **One audio stream.** Mix tracks before pushing, or run one transcriber per track.
+2. **The language is detected once**, on the first window with speech, and kept.
+3. **No temperature fallback.** A window that looks like a decoding loop is dropped rather than retried.
+4. **Latency** is about one window plus half the overlap, plus the decode time.
 
 ## Next Steps
 
-- See [OBS Integration Guide](obs_whisper_captions_design.md)
+- See [OBS Integration Guide](OBS_KARAOKE_CAPTIONS.md)
 - See [INTEGRATION.md](INTEGRATION.md) for batch API
-- Check [examples/streaming_captions.cpp](../examples/streaming_captions.cpp)
+- Examples: [karaoke_captions.cpp](../examples/karaoke_captions.cpp),
+  [translation_streaming.cpp](../examples/translation_streaming.cpp),
+  [streaming_vad_selection.cpp](../examples/streaming_vad_selection.cpp)
 
 ## License
 
