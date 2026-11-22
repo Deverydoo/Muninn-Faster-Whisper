@@ -25,6 +25,17 @@ struct StreamingOptions {
     bool enable_vad = true;                // Use VAD to detect speech boundaries
     VADType vad_type = VADType::Energy;    // VAD algorithm
 
+    // Path to silero_vad.onnx. Required when vad_type is Silero (or when Auto
+    // resolves to it); ignored otherwise. Without it the neural VAD cannot be
+    // constructed and the stream falls back to energy VAD.
+    std::string vad_model_path;
+
+    // Energy VAD is the safe default because it has no model dependency. When a
+    // neural VAD is requested but cannot be built — missing model, ONNX Runtime
+    // too old, load failure — falling back keeps transcription working instead
+    // of failing the session outright. Set false to surface the error instead.
+    bool vad_fallback_to_energy = true;
+
     // Quality
     float compression_ratio_threshold = 2.4f;
     float no_speech_threshold = 0.4f;

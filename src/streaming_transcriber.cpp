@@ -9,6 +9,7 @@
 #include "muninn/streaming_transcriber.h"
 #include "muninn/mel_spectrogram.h"
 #include "muninn/vad.h"
+#include "muninn/silero_vad.h"
 #include <ctranslate2/models/whisper.h>
 #include <ctranslate2/storage_view.h>
 
@@ -107,14 +108,101 @@ public:
         active_ = true;
         stop_requested_ = false;
 
-        // Initialize VAD if enabled
+        // Initialize VAD if enabled.
+        //
+        // A Silero instance is kept across sessions when the model path has not
+        // changed: callers that treat one utterance as one session would
+        // otherwise pay an ONNX session creation on every turn. Its recurrent
+        // state is cleared instead, which is what actually has to be per-session.
+        vad_.reset();
+        if (silero_vad_ && silero_loaded_path_ != options_.vad_model_path) {
+            silero_vad_.reset();
+        }
+        if (silero_vad_) {
+            silero_vad_->reset_state();
+        }
+
         if (options_.enable_vad) {
-            VADOptions vad_opts;
-            vad_opts.threshold = 0.02f;
-            vad_opts.min_speech_duration_ms = 200;
-            vad_opts.min_silence_duration_ms = 300;
-            vad_opts.speech_pad_ms = 50;
-            vad_ = std::make_unique<VAD>(vad_opts);
+            // Resolve Auto here rather than at the filter site; streaming has no
+            // track context, and picking once per session keeps the hot loop free
+            // of decisions. Silero is the better endpointer on clean speech, so
+            // Auto prefers it when a model is configured.
+            VADType wanted = options_.vad_type;
+            if (wanted == VADType::Auto) {
+                wanted = options_.vad_model_path.empty() ? VADType::Energy : VADType::Silero;
+            }
+
+            if (wanted == VADType::Silero || wanted == VADType::TEN) {
+                if (wanted == VADType::TEN) {
+                    // TEN has no streaming wiring yet; Silero covers the same need.
+                    std::cerr << "[Muninn] TEN VAD is not wired into streaming, using Silero\n";
+                    wanted = VADType::Silero;
+                }
+
+                if (!is_silero_vad_available()) {
+                    std::cerr << "[Muninn] Silero VAD not compiled in (MUNINN_USE_SILERO_VAD)\n";
+                    wanted = VADType::Energy;
+                } else if (options_.vad_model_path.empty()) {
+                    std::cerr << "[Muninn] Silero VAD requested but vad_model_path is empty\n";
+                    wanted = VADType::Energy;
+                } else if (silero_vad_) {
+                    // Reused from a previous session; state already cleared above.
+                } else {
+                    try {
+                        SileroVADOptions silero_opts;
+                        silero_opts.model_path = options_.vad_model_path;
+                        silero_opts.threshold = 0.25f;
+                        silero_opts.min_speech_duration_ms = 200;
+                        // Short, so the endpoint lands quickly after the speaker
+                        // stops — this is a live command loop, not a subtitle pass.
+                        silero_opts.min_silence_duration_ms = 100;
+                        silero_opts.speech_pad_ms = 100;
+                        // Streaming already chunks the audio, so the long-segment
+                        // splitting the file path needs would only fight it.
+                        silero_opts.max_speech_duration_s = 30;
+                        // No preamble. It exists so a file whose speech starts
+                        // immediately is not clipped, but every streaming chunk
+                        // looks like a fresh file to the detector, so a preamble
+                        // would be emitted for every chunk — including silent
+                        // ones. That makes filter_silence never return empty,
+                        // which is the signal this loop uses to skip silence, so
+                        // silence would be fed to Whisper forever.
+                        silero_opts.audio_preamble_ms = 0;
+                        // Kept on CPU: the model is ~1.8 MB and the GPU is busy
+                        // with the Whisper decode this VAD is feeding.
+                        silero_opts.use_gpu = false;
+
+                        silero_vad_ = std::make_unique<SileroVAD>(silero_opts);
+                        if (!silero_vad_->is_ready()) {
+                            silero_vad_.reset();
+                            throw std::runtime_error("model loaded but reported not ready");
+                        }
+                        // Only recorded once the instance is known good, so a
+                        // failed load cannot be mistaken for a reusable one.
+                        silero_loaded_path_ = options_.vad_model_path;
+                        std::cout << "[Muninn] Streaming VAD: Silero ("
+                                  << options_.vad_model_path << ")\n";
+                    } catch (const std::exception& e) {
+                        silero_vad_.reset();
+                        std::cerr << "[Muninn] Silero VAD init failed: " << e.what() << "\n";
+                        if (!options_.vad_fallback_to_energy) {
+                            active_ = false;
+                            throw;
+                        }
+                        wanted = VADType::Energy;
+                    }
+                }
+            }
+
+            if (!silero_vad_ && wanted != VADType::None) {
+                VADOptions vad_opts;
+                vad_opts.threshold = 0.02f;
+                vad_opts.min_speech_duration_ms = 200;
+                vad_opts.min_silence_duration_ms = 300;
+                vad_opts.speech_pad_ms = 50;
+                vad_ = std::make_unique<VAD>(vad_opts);
+                std::cout << "[Muninn] Streaming VAD: energy\n";
+            }
         }
 
         // Clear state
@@ -282,16 +370,55 @@ private:
 
             // Extract chunk
             size_t process_count = std::min(audio_buffer_.size(), chunk_samples);
+
+            // How far the buffer advances once this chunk is handled.
+            //
+            // The guard above only keeps overlap_samples below chunk_samples;
+            // process_count can still be smaller than the overlap, because the
+            // flush pass lowers the threshold to 250 ms while the overlap may be
+            // longer than that. `process_count - overlap_samples` then underflows
+            // to a huge size_t, every erase is rejected as out of range, and the
+            // loop spins on the same tail forever — stop() never returns.
+            //
+            // When the chunk is shorter than the overlap there is nothing left to
+            // keep for context, so consume it whole and guarantee progress.
+            const size_t advance = (process_count > overlap_samples)
+                                       ? (process_count - overlap_samples)
+                                       : process_count;
             std::vector<float> chunk(audio_buffer_.begin(), audio_buffer_.begin() + process_count);
 
-            // Apply VAD if enabled
+            // Apply VAD if enabled. start() guarantees at most one detector is
+            // live, so this picks whichever was successfully constructed.
             std::vector<float> processed_audio;
-            if (options_.enable_vad && vad_) {
+            if (options_.enable_vad && (silero_vad_ || vad_)) {
                 std::vector<SpeechSegment> speech_segs;
-                processed_audio = vad_->filter_silence(chunk, SAMPLE_RATE, speech_segs);
-                if (processed_audio.empty()) {
+                if (silero_vad_) {
+                    try {
+                        processed_audio = silero_vad_->filter_silence(chunk, SAMPLE_RATE, speech_segs);
+                    } catch (const std::exception& e) {
+                        // A neural VAD that starts throwing mid-stream must not
+                        // take the session down; drop to energy for the rest of it.
+                        std::cerr << "[Muninn] Silero VAD failed mid-stream (" << e.what()
+                                  << ") - switching to energy VAD\n";
+                        silero_vad_.reset();
+                        VADOptions vad_opts;
+                        vad_opts.threshold = 0.02f;
+                        vad_opts.min_speech_duration_ms = 200;
+                        vad_opts.min_silence_duration_ms = 300;
+                        vad_opts.speech_pad_ms = 50;
+                        vad_ = std::make_unique<VAD>(vad_opts);
+                        processed_audio = vad_->filter_silence(chunk, SAMPLE_RATE, speech_segs);
+                    }
+                } else {
+                    processed_audio = vad_->filter_silence(chunk, SAMPLE_RATE, speech_segs);
+                }
+                // Treat "no segments" as silence as well as "no samples". The two
+                // detectors disagree about padding — Silero can return padding
+                // samples for a chunk it found no speech in — and decoding those
+                // wastes a Whisper pass and invites hallucinated text.
+                if (processed_audio.empty() || speech_segs.empty()) {
                     // No speech detected - remove audio and continue
-                    size_t remove_count = process_count - overlap_samples;
+                    size_t remove_count = advance;
                     if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                         audio_buffer_.erase(audio_buffer_.begin(),
                                           audio_buffer_.begin() + remove_count);
@@ -307,7 +434,7 @@ private:
             int n_frames = mel_converter_.compute(processed_audio, mel_features);
 
             if (n_frames < 10) {  // Too short
-                size_t remove_count = process_count - overlap_samples;
+                size_t remove_count = advance;
                 if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                     audio_buffer_.erase(audio_buffer_.begin(),
                                       audio_buffer_.begin() + remove_count);
@@ -365,7 +492,7 @@ private:
             auto future_results = model_->generate(features, prompts, whisper_options);
 
             if (future_results.empty()) {
-                size_t remove_count = process_count - overlap_samples;
+                size_t remove_count = advance;
                 if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                     audio_buffer_.erase(audio_buffer_.begin(),
                                       audio_buffer_.begin() + remove_count);
@@ -378,7 +505,7 @@ private:
 
             // Check for no speech
             if (result.no_speech_prob > options_.no_speech_threshold) {
-                size_t remove_count = process_count - overlap_samples;
+                size_t remove_count = advance;
                 if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                     audio_buffer_.erase(audio_buffer_.begin(),
                                       audio_buffer_.begin() + remove_count);
@@ -388,7 +515,7 @@ private:
 
             // Extract text
             if (result.sequences.empty() || result.sequences[0].empty()) {
-                size_t remove_count = process_count - overlap_samples;
+                size_t remove_count = advance;
                 if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                     audio_buffer_.erase(audio_buffer_.begin(),
                                       audio_buffer_.begin() + remove_count);
@@ -400,7 +527,7 @@ private:
 
             // Skip empty or too short
             if (text.length() < 2) {
-                size_t remove_count = process_count - overlap_samples;
+                size_t remove_count = advance;
                 if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                     audio_buffer_.erase(audio_buffer_.begin(),
                                       audio_buffer_.begin() + remove_count);
@@ -422,7 +549,7 @@ private:
             // Check for hallucination
             if (options_.filter_hallucinations) {
                 if (compression_ratio > options_.compression_ratio_threshold || avg_logprob < -1.0f) {
-                    size_t remove_count = process_count - overlap_samples;
+                    size_t remove_count = advance;
                     if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                         audio_buffer_.erase(audio_buffer_.begin(),
                                           audio_buffer_.begin() + remove_count);
@@ -473,7 +600,7 @@ private:
             }
 
             // Remove processed audio (keep overlap for context)
-            size_t remove_count = process_count - overlap_samples;
+            size_t remove_count = advance;
             if (remove_count > 0 && remove_count <= audio_buffer_.size()) {
                 audio_buffer_.erase(audio_buffer_.begin(),
                                   audio_buffer_.begin() + remove_count);
@@ -494,7 +621,13 @@ private:
     // Model
     std::unique_ptr<ctranslate2::models::Whisper> model_;
     MelSpectrogram mel_converter_;
+
+    // Exactly one of these is live per session. VAD and SileroVAD expose the same
+    // filter_silence/detect_speech surface but share no base class, so the choice
+    // is held as two members and resolved at the call site.
     std::unique_ptr<VAD> vad_;
+    std::unique_ptr<SileroVAD> silero_vad_;
+    std::string silero_loaded_path_;   // guards reuse across sessions
 
     // Threading
     mutable std::mutex mutex_;

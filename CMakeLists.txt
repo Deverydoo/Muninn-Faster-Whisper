@@ -472,6 +472,11 @@ if(BUILD_EXAMPLES)
         add_executable(subtitle_export examples/subtitle_export.cpp)
         target_include_directories(subtitle_export PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
         target_link_libraries(subtitle_export PRIVATE muninn ${ONNXRUNTIME_LIB})
+
+        # StreamingTranscriber VAD selection: Silero, fallback to energy, reuse.
+        # Needs a Whisper model and silero_vad.onnx: streaming_vad_selection <model> <silero.onnx>
+        add_executable(streaming_vad_selection examples/streaming_vad_selection.cpp)
+        target_link_libraries(streaming_vad_selection PRIVATE muninn)
     else()
         message(STATUS "Skipping diarization examples (ONNX Runtime not found)")
     endif()
