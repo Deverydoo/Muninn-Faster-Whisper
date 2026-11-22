@@ -438,6 +438,10 @@ if(BUILD_TESTS)
         target_compile_definitions(test_core PRIVATE MUNINN_TEST_EXPECT_SILERO)
     endif()
 
+    # Subtitle export and caption engine checks (no model, no GPU).
+    add_executable(test_subtitles tests/test_subtitles.cpp)
+    target_link_libraries(test_subtitles PRIVATE muninn)
+
     # ctest labels:
     #   cpu    needs nothing but the build (CI runs: ctest -L cpu)
     #   model  needs a Whisper model; registered only when MUNINN_TEST_MODEL
@@ -446,6 +450,8 @@ if(BUILD_TESTS)
     enable_testing()
     add_test(NAME core COMMAND test_core)
     set_tests_properties(core PROPERTIES LABELS "cpu")
+    add_test(NAME subtitles COMMAND test_subtitles)
+    set_tests_properties(subtitles PROPERTIES LABELS "cpu")
 
     set(MUNINN_TEST_MODEL "" CACHE PATH "Whisper model folder for the model tests (empty = not registered)")
     set(MUNINN_TEST_AUDIO "" CACHE FILEPATH "Audio or video file for the model tests")
