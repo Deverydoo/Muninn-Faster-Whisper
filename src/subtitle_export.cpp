@@ -1522,17 +1522,22 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_korean(
         return segments_to_entries(segments, options);
     }
 
-    // If syllable karaoke is enabled, split words into syllables
+    // If syllable karaoke is enabled, split words into syllables. Remember
+    // which pieces start an original word: only there does the text get a
+    // space, so "안녕하세요" stays one word instead of "안 녕 하 세 요".
     std::vector<Word> processed_words;
+    std::vector<bool> starts_word;
     if (options.korean_syllable_karaoke) {
         for (const auto& word : all_words) {
             auto syllables = split_hangul_syllables(word, 60.0f);
-            for (const auto& syl : syllables) {
-                processed_words.push_back(syl);
+            for (size_t k = 0; k < syllables.size(); ++k) {
+                processed_words.push_back(syllables[k]);
+                starts_word.push_back(k == 0);
             }
         }
     } else {
         processed_words = all_words;
+        starts_word.assign(processed_words.size(), true);
     }
 
     // Build subtitles from words using Korean rules
@@ -1594,18 +1599,20 @@ std::vector<SubtitleEntry> SubtitleExporter::segment_korean(
             current_start = word.start;
         }
 
-        // Add word to current subtitle (Korean typically has spaces between words)
-        // Check if word starts with Hangul and current text ends with Hangul
-        bool need_space = !current_text.empty() && !word.word.empty();
+        // Add word to current subtitle. Korean puts spaces between words,
+        // never inside one, and none before punctuation.
+        const size_t text_begin = word.word.find_first_not_of(' ');
+        const std::string word_text =
+            (text_begin == std::string::npos) ? std::string() : word.word.substr(text_begin);
+        bool need_space = !current_text.empty() && !word_text.empty() && starts_word[i];
         if (need_space) {
-            // Add space unless word is punctuation
-            char first_char = word.word[0];
+            char first_char = word_text[0];
             if (first_char != '.' && first_char != ',' && first_char != '!' &&
                 first_char != '?' && first_char != ':' && first_char != ';') {
                 current_text += " ";
             }
         }
-        current_text += word.word;
+        current_text += word_text;
         current_words.push_back(word);
         current_end = word.end;
         last_word_end = word.end;
