@@ -47,6 +47,18 @@ std::string escape_srt_text(const std::string& text) {
     return out;
 }
 
+// Paths in the API are UTF-8. On Windows, std::filesystem::path(std::string)
+// reads the bytes as the ANSI code page, so "José" or "田中" in a folder name
+// would fail or come out garbled. u8path and u8string keep them intact.
+std::filesystem::path utf8_path(const std::string& path) {
+    return std::filesystem::u8path(path);
+}
+
+std::string path_to_utf8(const std::filesystem::path& path) {
+    const auto u8 = path.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════
@@ -116,7 +128,7 @@ std::string SubtitleExporter::export_srt(const std::vector<Segment>& segments,
     }
 
     // Write SRT file
-    std::ofstream file(output_path);
+    std::ofstream file(utf8_path(output_path));
     if (!file.is_open()) {
         throw std::runtime_error("Failed to create SRT file: " + output_path);
     }
@@ -180,7 +192,7 @@ std::string SubtitleExporter::export_vtt(const std::vector<Segment>& segments,
     }
 
     // Write VTT file
-    std::ofstream file(output_path);
+    std::ofstream file(utf8_path(output_path));
     if (!file.is_open()) {
         throw std::runtime_error("Failed to create VTT file: " + output_path);
     }
@@ -406,23 +418,23 @@ std::string SubtitleExporter::format_vtt_timestamp(float seconds) {
 
 std::string SubtitleExporter::generate_output_path(const std::string& video_path,
                                                   SubtitleFormat format) {
-    std::filesystem::path video(video_path);
-    std::filesystem::path output = video.parent_path();
-
-    std::string stem = video.stem().string();
+    std::filesystem::path output = utf8_path(video_path);
 
     switch (format) {
         case SubtitleFormat::SRT:
-            output /= stem + ".srt";
+            output.replace_extension(".srt");
             break;
         case SubtitleFormat::VTT:
-            output /= stem + ".vtt";
+            output.replace_extension(".vtt");
+            break;
+        case SubtitleFormat::ASS:
+            output.replace_extension(".ass");
             break;
         default:
-            output /= stem + ".sub";
+            output.replace_extension(".sub");
     }
 
-    return output.string();
+    return path_to_utf8(output);
 }
 
 std::string SubtitleExporter::split_text(const std::string& text,
@@ -3585,9 +3597,10 @@ std::string generate_metadata_json(const std::vector<Segment>& segments,
                                    const std::string& language,
                                    float duration) {
     // Generate output path
-    std::filesystem::path video(video_path);
+    const std::filesystem::path video = utf8_path(video_path);
     std::filesystem::path metadata_path = video.parent_path();
-    metadata_path /= video.stem().string() + "_metadata.json";
+    metadata_path /= video.stem();
+    metadata_path += "_metadata.json";
 
     // Build full transcript text
     std::string full_text;
@@ -3604,7 +3617,7 @@ std::string generate_metadata_json(const std::vector<Segment>& segments,
     json << std::setprecision(2) << std::fixed;
 
     json << "{\n";
-    json << "  \"video_file\": \"" << escape_json_string(video.filename().string()) << "\",\n";
+    json << "  \"video_file\": \"" << escape_json_string(path_to_utf8(video.filename())) << "\",\n";
     json << "  \"processed_date\": " << timestamp << ",\n";
     json << "  \"whisper_model\": \"" << escape_json_string(whisper_model) << "\",\n";
     json << "  \"engine\": \"muninn-faster-whisper\",\n";
@@ -3656,13 +3669,13 @@ std::string generate_metadata_json(const std::vector<Segment>& segments,
     // Write to file
     std::ofstream file(metadata_path);
     if (!file.is_open()) {
-        throw std::runtime_error("Failed to create metadata JSON: " + metadata_path.string());
+        throw std::runtime_error("Failed to create metadata JSON: " + path_to_utf8(metadata_path));
     }
 
     file << json.str();
     file.close();
 
-    return metadata_path.string();
+    return path_to_utf8(metadata_path);
 }
 
 std::vector<Segment> load_from_metadata_json(const std::string& metadata_json_path) {
