@@ -109,6 +109,8 @@ public:
     std::atomic<bool> cancelled{false};
     // Set by unload_model() so a running batch stops at its next chunk.
     std::atomic<bool> unload_requested{false};
+    // The models were detached by unload_model(); guarded by model_mutex.
+    bool models_detached = false;
 
     // translate_batch holds this shared for the whole decode; unload and
     // shutdown take it exclusively.
@@ -272,8 +274,8 @@ bool Translator::unload_model(int timeout_ms) {
         return false;
     }
 
-    if (!pimpl_->model) {
-        return true;
+    if (!pimpl_->model || pimpl_->models_detached) {
+        return true;  // nothing loaded, or already unloaded
     }
 
     // These were "TEMPORARY:" info lines from tracking down the VRAM leak; they
@@ -286,14 +288,23 @@ bool Translator::unload_model(int timeout_ms) {
     Logger::debug("NLLB unload: detached " + std::to_string(detached_models.size()) + " model(s)");
 
     for (auto& model : detached_models) {
-        const_cast<ctranslate2::models::Model*>(model.get())->release_gpu_memory();
+        if (model) {  // null if a worker had no model left
+            const_cast<ctranslate2::models::Model*>(model.get())->release_gpu_memory();
+        }
     }
     detached_models.clear();
+    // A second detach hands back null models; the destructor's unload_model
+    // after an explicit one used to dereference them and crash.
+    pimpl_->models_detached = true;
 
-    try {
-        ctranslate2::get_allocator(ctranslate2::Device::CUDA).clear_cache();
-    } catch (...) {
-        Logger::debug("NLLB unload: allocator cache clear failed (non-fatal)");
+    // Only a CUDA model has a CUDA cache to clear; on a CPU translator this
+    // would start a CUDA context for nothing.
+    if (pimpl_->device_str == "cuda") {
+        try {
+            ctranslate2::get_allocator(ctranslate2::Device::CUDA).clear_cache();
+        } catch (...) {
+            Logger::debug("NLLB unload: allocator cache clear failed (non-fatal)");
+        }
     }
 
     // DO NOT call model.reset() — corrupts CUDA context for subsequent operations.
@@ -304,7 +315,8 @@ bool Translator::unload_model(int timeout_ms) {
     // destroyed, not here. Unloading frees the VRAM but leaves the threads
     // parked until the Translator itself goes away.
 
-    Logger::info("NLLB translator unloaded (VRAM released)");
+    Logger::info(pimpl_->device_str == "cuda" ? "NLLB translator unloaded (VRAM released)"
+                                                : "NLLB translator unloaded");
     return true;
 }
 
