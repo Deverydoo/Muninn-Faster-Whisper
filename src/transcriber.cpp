@@ -276,8 +276,9 @@ public:
         const std::vector<size_t>& previous_tokens = {},
         float previous_temperature = 0.0f,
         float* out_temperature = nullptr,
-        std::vector<size_t>* out_tokens = nullptr
-    );
+        std::vector<size_t>* out_tokens = nullptr,
+        int* out_advance_frames = nullptr,
+        bool use_initial_prompt = true);
 
     // Text to token ids: GPT-2 byte-level characters, then the longest
     // vocabulary entry at each position. Not always the canonical BPE split,
@@ -821,6 +822,22 @@ std::vector<Segment> extract_timestamped_segments(
     int timestamp_count = 0;
     int text_token_count = 0;
 
+    // faster-whisper's two cases. With a pair of consecutive timestamps
+    // somewhere (the usual "<|1.50|><|1.50|>" between segments), text after
+    // the last closing timestamp is unfinished: it's left out here, and the
+    // caller seeks back to decode it again with the next window. Without any
+    // pair, the whole output is one segment, closed at the last timestamp or
+    // the window's end (it used to be dropped when it didn't end on one).
+    bool has_timestamp_pair = false;
+    {
+        bool prev_ts = false;
+        for (const auto& t : tokens) {
+            const bool ts = parse_timestamp_token(t) >= 0.0f;
+            if (ts && prev_ts) { has_timestamp_pair = true; break; }
+            prev_ts = ts;
+        }
+    }
+
     // Word buffer now stores (word_text, token_indices) for alignment lookup
     std::vector<std::pair<std::string, std::vector<size_t>>> word_buffer;
 
@@ -848,10 +865,13 @@ std::vector<Segment> extract_timestamped_segments(
                 absolute_time = chunk_end_time;
             }
 
-            if (current_start < 0.0f) {
-                // First timestamp - marks start of first segment
+            if (current_start < 0.0f || current_text.empty()) {
+                // First timestamp, or the second of a pair: the segment starts
+                // here. ("<|2.40|><|3.10|> text" starts at 3.10, as in
+                // faster-whisper; the second timestamp used to be ignored and
+                // the caption came up 0.7 s early.)
                 current_start = absolute_time;
-            } else if (!current_text.empty()) {
+            } else {
                 // End of segment - create it
                 Segment seg;
                 seg.start = current_start;
@@ -969,6 +989,27 @@ std::vector<Segment> extract_timestamped_segments(
         }
     }
 
+    // No timestamp pair anywhere: the output is one segment, and text after
+    // its last timestamp belongs to it (closed at the window's end).
+    if (!has_timestamp_pair) {
+        std::string tail = current_text;
+        tail.erase(0, tail.find_first_not_of(" \t\n\r"));
+        if (!tail.empty()) tail.erase(tail.find_last_not_of(" \t\n\r") + 1);
+        if (!tail.empty()) {
+            Segment seg;
+            seg.start = current_start >= 0.0f ? current_start : chunk_start_time;
+            seg.end = chunk_end_time;
+            seg.text = tail;
+            if (word_timestamps && !word_buffer.empty() && has_alignment) {
+                extract_words_from_alignment(seg, alignment, token_ids, tokens,
+                                              word_buffer, chunk_start_time, seg.start, seg.end);
+                if (!seg.words.empty()) seg.end = std::max(seg.start, seg.words.back().end);
+            }
+            segments.push_back(seg);
+            current_text.clear();
+        }
+    }
+
     // DIAGNOSTIC: Summary of what we found
     Logger::info("extract_timestamped_segments RESULT: " + std::to_string(timestamp_count) + " timestamps, " +
                  std::to_string(text_token_count) + " text tokens, " + std::to_string(segments.size()) + " segments created");
@@ -1054,73 +1095,13 @@ bool Transcriber::Impl::is_hallucination(
     //    characters or fewer - "Ow!", "No.", "Go!". faster-whisper has none,
     //    and short reactions are real speech in gaming commentary.)
 
-    // 3. Skip very low token count with poor confidence
-    if (num_tokens <= 2 && avg_logprob < options.log_prob_threshold) {
-        Logger::warn("FILTERED: low-token (tokens=" + std::to_string(num_tokens) + ", logprob=" + std::to_string(avg_logprob) + ")");
-        return true;
-    }
-
-    // 4. Repetition detection - catch patterns like "Thank you Thank you" or "A A A A"
-    std::vector<std::string> words;
-    std::istringstream iss(segment.text);
-    std::string word;
-    while (iss >> word) {
-        words.push_back(word);
-    }
-
-    if (words.size() >= 3) {
-        // Check if same word repeated multiple times consecutively
-        int max_repeat_count = 1;
-        for (size_t i = 0; i < words.size(); i++) {
-            int repeat_count = 1;
-            for (size_t j = i + 1; j < words.size() && words[j] == words[i]; j++) {
-                repeat_count++;
-            }
-            max_repeat_count = std::max(max_repeat_count, repeat_count);
-        }
-
-        // If MORE THAN half the words are one word repeated back-to-back,
-        // it's a hallucination loop ("go go go", "A A A A").
-        //
-        // This was `>=  words.size() / 2` and deleted every three-word segment
-        // ever produced: max_repeat_count is 1 at minimum (a word always
-        // "repeats" itself once), and integer division makes 3/2 == 1, so the
-        // test read `1 >= 1` — always true. Measured on one 40-minute video:
-        // 61 of 63 segments killed by this filter had max_repeat_count == 1,
-        // i.e. no repetition whatsoever ("I don't care.", "Where is it?",
-        // "with Conan Exiles"). Strict `>` restores the documented intent and
-        // still catches genuine loops (3 identical words gives 3 > 1).
-        if (max_repeat_count * 2 > static_cast<int>(words.size())) {
-            muninn::mlog_warn() << "[Muninn] Skipping repetitive hallucination: '"
-                      << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
-                      << "' (repeat: " << max_repeat_count << "/" << words.size() << " words)\n";
-            return true;
-        }
-
-        // Check for phrase repetition (e.g., "I'm going to be like" repeated)
-        // Look for repeating n-grams where n = 3-6 words
-        for (int ngram_size = 3; ngram_size <= 6 && ngram_size <= static_cast<int>(words.size()) / 2; ngram_size++) {
-            std::map<std::string, int> ngram_counts;
-            for (size_t i = 0; i + ngram_size <= words.size(); i++) {
-                std::string ngram;
-                for (int j = 0; j < ngram_size; j++) {
-                    if (j > 0) ngram += " ";
-                    ngram += words[i + j];
-                }
-                ngram_counts[ngram]++;
-            }
-
-            // If any n-gram appears 3+ times, it's a hallucination
-            for (const auto& [ngram, count] : ngram_counts) {
-                if (count >= 3) {
-                    muninn::mlog_warn() << "[Muninn] Skipping phrase-repetition hallucination: '"
-                              << ngram << "' repeated " << count << " times\n";
-                    return true;
-                }
-            }
-        }
-    }
-
+    // 3. and 4. (Removed, November 2026 audit T2: a low-token rule, a "one word
+    //    is half the segment" rule and a "three-word phrase three times" rule.
+    //    faster-whisper has none of them. They dropped "Ow!", "go go go go",
+    //    "run, run, run!" and "you need to... you need to... you need to"
+    //    whatever the model's confidence, which in gaming commentary is real
+    //    speech. Real loops are caught by the window's compression ratio and
+    //    the temperature fallback.)
 
     // 5. Character-level repetition detection for CJK text (e.g., "ぃぃぃぃぃぃぃぃ")
     // CJK text doesn't use spaces, so word-based detection misses these patterns
@@ -1153,8 +1134,18 @@ bool Transcriber::Impl::is_hallucination(
             codepoints.push_back(cp);
         }
 
+        // Only for text that is mostly CJK (Han, kana, Hangul): those loops
+        // ("ぃぃぃぃぃぃ") have no spaces for a word check, while a Latin
+        // "Noooooo!" or "AAAAAH" is someone shouting (audit T2).
+        size_t cjk = 0;
+        for (uint32_t cp : codepoints) {
+            if ((cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7AF) ||
+                (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFF00 && cp <= 0xFFEF)) ++cjk;
+        }
+        const bool mostly_cjk = cjk * 2 > codepoints.size();
+
         // Check for consecutive character repetition
-        if (codepoints.size() >= 6) {
+        if (mostly_cjk && codepoints.size() >= 6) {
             int max_char_repeat = 1;
             int current_repeat = 1;
 
@@ -1194,17 +1185,10 @@ bool Transcriber::Impl::is_hallucination(
         }
     }
 
-    // 6. Compression ratio check (like faster-whisper). Muninn's own checks
-    //    compare with log_prob_threshold: their old -0.5 was tuned against the
-    //    avg_logprob that was len x too close to 0.
-    float compression_ratio = compression_ratio_of(segment.text);
-
-    if (compression_ratio > options.compression_ratio_threshold && avg_logprob < options.log_prob_threshold) {
-        muninn::mlog_warn() << "[Muninn] Skipping high-compression hallucination: '"
-                  << segment.text.substr(0, std::min(size_t(50), segment.text.length()))
-                  << "' (ratio: " << compression_ratio << ", logprob: " << avg_logprob << ")\n";
-        return true;
-    }
+    // 6. (Removed, audit T2: a per-segment compression check in a
+    //    low-confidence window. faster-whisper measures compression per window
+    //    and answers with the temperature fallback, which Muninn does too; this
+    //    second, per-segment check dropped segments faster-whisper keeps.)
 
     return false;
 }
@@ -1382,9 +1366,13 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
     const std::vector<size_t>& previous_tokens,
     float previous_temperature,
     float* out_temperature,
-    std::vector<size_t>* out_tokens
+    std::vector<size_t>* out_tokens,
+    int* out_advance_frames,
+    bool use_initial_prompt
 ) {
     std::vector<Segment> segments;
+    if (out_advance_frames) *out_advance_frames = static_cast<int>(mel_features.size());
+    if (out_tokens) out_tokens->clear();
 
     try {
         int n_frames = mel_features.size();
@@ -1435,9 +1423,10 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
         if (vocabulary && startofprev_id) {
             if (should_use_context) {
                 context_ids = previous_tokens;
-            } else if (!options.initial_prompt.empty()) {
-                // faster-whisper uses the initial prompt only until there is
-                // earlier output to condition on.
+            } else if (use_initial_prompt && !options.initial_prompt.empty()) {
+                // A single window (the batched path's fallback, streaming-style
+                // callers): the initial prompt is the context. The sequential
+                // loop keeps the prompt in its own running context instead.
                 context_ids = encode_text(" " + options.initial_prompt);
             }
             // The last 223 tokens: half of Whisper's 448-token text context.
@@ -1577,11 +1566,42 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
             // Use this result (good enough, or the best of all attempts)
             used_temperature = current_temp;
             if (out_temperature) *out_temperature = used_temperature;
-            if (out_tokens && !result.sequences_ids.empty()) {
-                out_tokens->clear();
+
+            // Where the next window starts, and what this one passes on as
+            // context: faster-whisper's rule. Text after the last closing
+            // timestamp is unfinished, so the next window starts at that
+            // timestamp and decodes it again (it used to be dropped, and the
+            // last words of a recording with it); output that ends on a lone
+            // timestamp, or has no timestamp pair, used the whole window. A
+            // silent window passes nothing on. Only the tokens of what's kept
+            // become context (filtered and unfinished text used to as well).
+            if (!result.sequences_ids.empty()) {
+                std::vector<size_t> ids;
                 for (size_t id : result.sequences_ids[0]) {
-                    if (id != eot_id) out_tokens->push_back(id);
+                    if (id != eot_id) ids.push_back(id);
                 }
+                const size_t n = ids.size();
+                auto is_ts = [&](size_t i) { return ids[i] >= timestamp_begin; };
+                const bool single_ending = n >= 2 && !is_ts(n - 2) && is_ts(n - 1);
+                size_t last_pair = 0;
+                for (size_t i = 1; i < n; ++i) {
+                    if (is_ts(i) && is_ts(i - 1)) last_pair = i;
+                }
+                size_t kept_end = n;
+                int advance = n_frames;
+                if (last_pair > 0 && !single_ending) {
+                    kept_end = last_pair;
+                    advance = static_cast<int>(ids[last_pair - 1] - timestamp_begin) * 2;   // 20 ms steps -> 10 ms frames
+                }
+                const bool silent = result.no_speech_prob > options.no_speech_threshold &&
+                                    avg_logprob < options.log_prob_threshold;
+                if (silent) {
+                    kept_end = 0;
+                    advance = n_frames;
+                }
+                if (advance <= 0 || advance > n_frames) advance = n_frames;
+                if (out_advance_frames) *out_advance_frames = advance;
+                if (out_tokens) out_tokens->assign(ids.begin(), ids.begin() + static_cast<long>(kept_end));
             }
 
             // Extract text from sequences with proper timestamps
@@ -2950,7 +2970,10 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
         // the caller asked for; capped so a large setting can't exhaust VRAM.
         const int BATCH_SIZE = std::clamp(effective_options.batch_size, 1, 32);
 
-        if (n_frames > MAX_FRAMES) {
+        // Sequential mode runs its window loop for any length: a single pass
+        // used to drop the unfinished last sentence of audio up to 30 s long
+        // (including a long track with under 30 s of speech after VAD).
+        if (n_frames > MAX_FRAMES || effective_options.sequential) {
             // ── VAD-aware chunking ────────────────────────────────────────────
             // Fixed 30s chunk boundaries cut sentences mid-word, which hurts
             // both transcription accuracy (Whisper hates partial context) and
@@ -3057,7 +3080,15 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                 // phrase compresses too well and is retried hotter, and a decode
                 // that needed a high temperature drops the context it would
                 // otherwise pass on (faster-whisper's prompt_reset_on_temperature).
-                std::vector<size_t> prev_tokens;
+                // The running context, as faster-whisper keeps it: the initial
+                // prompt first, then every kept window's tokens. A decode that
+                // needed a high temperature starts the context over from that
+                // point (prompt included: it isn't put back, it ages out).
+                std::vector<size_t> all_tokens;
+                if (!effective_options.initial_prompt.empty() && vocabulary && startofprev_id) {
+                    all_tokens = encode_text(" " + effective_options.initial_prompt);
+                }
+                size_t prompt_reset_since = 0;
                 float prev_temperature = 0.0f;
                 int seek = 0;
                 while (seek < n_frames) {
@@ -3070,30 +3101,26 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
                                                            mel_features.begin() + window_end);
                     float used_temperature = 0.0f;
                     std::vector<size_t> new_tokens;
+                    int advance = window_end - seek;
+                    const std::vector<size_t> context(all_tokens.begin() + static_cast<long>(prompt_reset_since),
+                                                      all_tokens.end());
                     auto window_segments = transcribe_chunk(window, seek * 0.01f, effective_options,
-                                                            prev_tokens, prev_temperature,
-                                                            &used_temperature, &new_tokens);
+                                                            context, prev_temperature,
+                                                            &used_temperature, &new_tokens, &advance,
+                                                            /*use_initial_prompt=*/false);
                     prev_temperature = used_temperature;
-                    if (used_temperature > effective_options.prompt_reset_on_temperature) {
-                        prev_tokens.clear();
-                    } else {
-                        prev_tokens.insert(prev_tokens.end(), new_tokens.begin(), new_tokens.end());
-                        if (prev_tokens.size() > 1000) {
-                            prev_tokens.erase(prev_tokens.begin(), prev_tokens.end() - 500);  // transcribe_chunk uses the last 223
-                        }
+                    all_tokens.insert(all_tokens.end(), new_tokens.begin(), new_tokens.end());
+                    if (!effective_options.condition_on_previous ||
+                        used_temperature > effective_options.prompt_reset_on_temperature) {
+                        prompt_reset_since = all_tokens.size();
                     }
                     for (auto& seg : window_segments) {
                         result.segments.push_back(seg);
                     }
 
-                    // Next window starts where Whisper's last segment ended, unless
-                    // that is (nearly) the end of this window, or no progress.
-                    int next = window_end;
-                    if (!window_segments.empty() && window_end < n_frames) {
-                        const int last_end = static_cast<int>(std::lround(window_segments.back().end * 100.0f));
-                        if (last_end > seek + 100 && last_end < window_end - 50) next = last_end;
-                    }
-                    seek = next;
+                    // faster-whisper's seek: to the last closing timestamp when
+                    // the window ended mid-sentence, else the whole window.
+                    seek += std::max(1, advance);
 
                     if (progress_callback) {
                         float chunk_progress = 0.10f + (static_cast<float>(seek) / n_frames) * 0.80f;
