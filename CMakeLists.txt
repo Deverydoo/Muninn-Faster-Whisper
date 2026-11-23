@@ -232,7 +232,7 @@ if(SENTENCEPIECE_LIB)
     set(SENTENCEPIECE_ENABLED ON)
     add_compile_definitions(MUNINN_USE_SENTENCEPIECE)
 else()
-    message(WARNING "SentencePiece not found. Translation will use basic tokenization.")
+    message(WARNING "SentencePiece not found: muninn::Translator will refuse to load NLLB models.")
     set(SENTENCEPIECE_ENABLED OFF)
 endif()
 
@@ -375,6 +375,35 @@ target_link_libraries(muninn
 
 if(SILERO_VAD_ENABLED)
     target_link_libraries(muninn PRIVATE ${ONNXRUNTIME_LIB})
+endif()
+
+# zlib, for faster-whisper's compression ratio (text_decode.cpp), which drives
+# the temperature fallback. It used to come in only with static FFmpeg, so the
+# FFmpeg-DLL build (the one that ships) fell back to an estimate. From vcpkg's
+# /MD static triplet (zs.lib), or any zlib CMake can find.
+set(MUNINN_ZLIB_DIR "C:/vcpkg/installed/x64-windows-static-md" CACHE PATH
+    "vcpkg prefix holding a static /MD zlib (include/zlib.h, lib/zs.lib)")
+if(EXISTS "${MUNINN_ZLIB_DIR}/include/zlib.h" AND
+   (EXISTS "${MUNINN_ZLIB_DIR}/lib/zs.lib" OR EXISTS "${MUNINN_ZLIB_DIR}/lib/zlib.lib"))
+    if(EXISTS "${MUNINN_ZLIB_DIR}/lib/zs.lib")
+        set(MUNINN_ZLIB_LIB "${MUNINN_ZLIB_DIR}/lib/zs.lib")
+    else()
+        set(MUNINN_ZLIB_LIB "${MUNINN_ZLIB_DIR}/lib/zlib.lib")
+    endif()
+    target_include_directories(muninn PRIVATE "${MUNINN_ZLIB_DIR}/include")
+    target_link_libraries(muninn PRIVATE "${MUNINN_ZLIB_LIB}")
+    target_compile_definitions(muninn PRIVATE MUNINN_REQUIRE_ZLIB)
+    message(STATUS "zlib: ${MUNINN_ZLIB_LIB}")
+else()
+    find_package(ZLIB QUIET)
+    if(ZLIB_FOUND)
+        target_link_libraries(muninn PRIVATE ZLIB::ZLIB)
+        target_compile_definitions(muninn PRIVATE MUNINN_REQUIRE_ZLIB)
+        message(STATUS "zlib: ${ZLIB_LIBRARIES}")
+    else()
+        message(WARNING "zlib not found: the compression ratio will be an estimate, not faster-whisper's. "
+                        "Set MUNINN_ZLIB_DIR or install zlib.")
+    endif()
 endif()
 
 if(SENTENCEPIECE_ENABLED)

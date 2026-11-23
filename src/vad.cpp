@@ -206,9 +206,12 @@ std::vector<float> VAD::filter_silence(
             return {};  // Empty = skip this track
         }
 
-        muninn::mlog() << "[VAD] No speech detected - returning original audio\n";
-        silence_removed_ = 0.0f;
-        return samples;
+        // Sound but no speech (game audio, music): nothing to transcribe, as
+        // in faster-whisper. The whole track used to be handed to Whisper,
+        // which then "transcribed" the music.
+        muninn::mlog() << "[VAD] No speech detected - nothing to transcribe\n";
+        silence_removed_ = static_cast<float>(samples.size()) / sample_rate;
+        return {};
     }
 
     // Extract speech portions

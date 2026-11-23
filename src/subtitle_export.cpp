@@ -434,24 +434,28 @@ std::string SubtitleExporter::export_vtt(const std::vector<Segment>& segments,
     // VTT header
     file << "WEBVTT\n\n";
 
-    // Optional: Add styling section
-    if (options.vtt_include_speaker_colors && !options.vtt_speaker_colors.empty()) {
+    // Optional styling. One STYLE block with no blank lines inside it: in
+    // WebVTT a blank line ends the block, so the rules after the first one
+    // used to be read as broken cues and ignored.
+    const bool speaker_colors = options.vtt_include_speaker_colors && !options.vtt_speaker_colors.empty();
+    if (speaker_colors || options.vtt_include_confidence_styling) {
         file << "STYLE\n";
-        file << "::cue {\n";
-        file << "  background-color: rgba(0, 0, 0, 0.8);\n";
-        file << "}\n\n";
-
-        for (const auto& [speaker_id, color] : options.vtt_speaker_colors) {
-            file << "::cue(v[voice=\"Speaker" << speaker_id << "\"]) {\n";
-            file << "  color: " << color << ";\n";
-            file << "}\n\n";
+        if (speaker_colors) {
+            file << "::cue {\n";
+            file << "  background-color: rgba(0, 0, 0, 0.8);\n";
+            file << "}\n";
+            for (const auto& [speaker_id, color] : options.vtt_speaker_colors) {
+                file << "::cue(v[voice=\"Speaker" << speaker_id << "\"]) {\n";
+                file << "  color: " << color << ";\n";
+                file << "}\n";
+            }
         }
-    }
-    if (options.vtt_include_confidence_styling) {
-        file << "STYLE\n";
-        file << "::cue(.uncertain) {\n";
-        file << "  color: #ff8080;\n";
-        file << "}\n\n";
+        if (options.vtt_include_confidence_styling) {
+            file << "::cue(.uncertain) {\n";
+            file << "  color: #ff8080;\n";
+            file << "}\n";
+        }
+        file << "\n";
     }
 
     // Write cues

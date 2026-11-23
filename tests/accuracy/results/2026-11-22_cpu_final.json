@@ -1,0 +1,32 @@
+{
+ "label": "cpu_final",
+ "clips": [
+  {
+   "clip": "ricochet_a_intro",
+   "wer": 4.8,
+   "sub": 7,
+   "del": 4,
+   "ins": 26,
+   "reference": {
+    "segments": 42,
+    "words": 767,
+    "repeated_lines": 1,
+    "short_lines": 0
+   },
+   "muninn": {
+    "segments": 44,
+    "words": 789,
+    "repeated_lines": 0,
+    "short_lines": 0
+   },
+   "muninn_seconds": 524.6,
+   "reference_seconds": 22.1,
+   "word_timing": {
+    "matched": 756,
+    "median_s": 0.012,
+    "p90_s": 0.164,
+    "over_0_5s": 22
+   }
+  }
+ ]
+}

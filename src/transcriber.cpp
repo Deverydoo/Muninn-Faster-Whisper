@@ -2610,7 +2610,8 @@ Transcriber& Transcriber::operator=(Transcriber&&) noexcept = default;
 AudioInfo Transcriber::get_audio_info(const std::string& audio_path) {
     AudioInfo info{};
 
-#ifdef WITH_HEIMDALL
+    // Muninn's own FFmpeg decoder (this sat behind a WITH_HEIMDALL switch that
+    // nothing sets, so it always threw).
     AudioExtractor extractor;
     if (!extractor.open(audio_path)) {
         throw std::runtime_error("Failed to open audio file: " + extractor.get_last_error());
@@ -2621,9 +2622,6 @@ AudioInfo Transcriber::get_audio_info(const std::string& audio_path) {
     info.num_tracks = extractor.get_track_count();
 
     extractor.close();
-#else
-    throw std::runtime_error("Audio info requires Heimdall library");
-#endif
 
     return info;
 }
@@ -2978,6 +2976,7 @@ TranscribeResult Transcriber::transcribe(
             TranscribeResult empty_result;
             empty_result.duration = prepared.original_duration;
             empty_result.language = options.language;
+            empty_result.was_cancelled = pimpl_->cancelled.load(std::memory_order_acquire);
             return empty_result;
         }
 
@@ -3613,6 +3612,12 @@ TranscribeResult Transcriber::transcribe(
 
         try {
             TranscribeResult track_result;
+            if (prepared.no_speech && pimpl_->cancelled.load(std::memory_order_acquire)) {
+                // Prep stopped because of a cancel (it returns "no speech"
+                // then): report the cancel, not an empty track.
+                combined_result.was_cancelled = true;
+                break;
+            }
             if (prepared.no_speech) {
                 Logger::info("Track " + std::to_string(track) + ": no speech, skipping inference");
                 track_result.duration = prepared.original_duration;

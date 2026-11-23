@@ -13,6 +13,9 @@
 #include <cstring>
 #include <set>
 
+#if defined(MUNINN_REQUIRE_ZLIB) && !__has_include(<zlib.h>)
+#error "MUNINN_REQUIRE_ZLIB is set but zlib.h isn't on the include path"
+#endif
 #if __has_include(<zlib.h>)
 #include <zlib.h>   // compression ratio, as faster-whisper measures it
 #define MUNINN_TEXT_HAVE_ZLIB 1

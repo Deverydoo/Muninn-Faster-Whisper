@@ -393,9 +393,11 @@ std::vector<float> SileroVAD::filter_silence(
             return {};
         }
 
-        muninn::mlog() << "[SileroVAD] No speech detected - returning original audio\n";
-        silence_removed_ = 0.0f;
-        return samples;
+        // Sound but no speech: nothing to transcribe, as in faster-whisper
+        // (the whole track used to go to Whisper; see VAD::filter_silence).
+        muninn::mlog() << "[SileroVAD] No speech detected - nothing to transcribe\n";
+        silence_removed_ = static_cast<float>(samples.size()) / sample_rate;
+        return {};
     }
 
     // Extract speech portions
