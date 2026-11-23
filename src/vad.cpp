@@ -172,21 +172,12 @@ std::vector<SpeechSegment> VAD::post_process_segments(
     // This handles speech that starts immediately
     float preamble_sec = options_.audio_preamble_ms / 1000.0f;
     if (preamble_sec > 0.0f) {
-        if (result.empty()) {
-            // No speech detected, but include preamble as a segment
-            result.emplace_back(0.0f, preamble_sec);
-            muninn::mlog() << "[VAD] No speech detected, adding preamble segment 0.0-" << preamble_sec << "s\n";
-        } else if (result[0].start > 0.0f) {
-            // First segment doesn't start at 0, extend it or insert preamble
-            if (result[0].start <= preamble_sec) {
-                // Extend first segment to include preamble
-                result[0].start = 0.0f;
-                muninn::mlog() << "[VAD] Extended first segment to include preamble (now 0.0-" << result[0].end << "s)\n";
-            } else {
-                // Insert preamble as separate segment at the beginning
-                result.insert(result.begin(), SpeechSegment(0.0f, preamble_sec));
-                muninn::mlog() << "[VAD] Inserted preamble segment 0.0-" << preamble_sec << "s\n";
-            }
+        // Speech starting within the preamble is pulled back to 0; silence is
+        // never added as a segment of its own (see SileroVAD: it made a silent
+        // track get decoded, and Whisper invents text for silence).
+        if (!result.empty() && result[0].start > 0.0f && result[0].start <= preamble_sec) {
+            result[0].start = 0.0f;
+            muninn::mlog() << "[VAD] Extended first segment to include preamble (now 0.0-" << result[0].end << "s)\n";
         }
     }
 

@@ -2746,7 +2746,9 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
         auto apply_energy_vad = [&]() {
             muninn::mlog() << "[Muninn] Applying Energy VAD filter...\n";
             VADOptions vad_opts;
-            vad_opts.threshold = options.vad_threshold;
+            // A threshold above 0.1 is a speech probability meant for Silero
+            // (0.35 typically): as an RMS floor it would cut quiet speech.
+            if (options.vad_threshold <= 0.1f) vad_opts.threshold = options.vad_threshold;
             vad_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
             vad_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms;
             vad_opts.speech_pad_ms = options.vad_speech_pad_ms;
@@ -2790,7 +2792,7 @@ Transcriber::Impl::PreparedFeatures Transcriber::Impl::prepare_features_for_trac
                     silero_opts.model_path = options.silero_model_path;
                     silero_opts.threshold = options.vad_threshold > 0.1f ? options.vad_threshold : 0.25f;
                     silero_opts.min_speech_duration_ms = options.vad_min_speech_duration_ms;
-                    silero_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms > 200 ? 100 : options.vad_min_silence_duration_ms;
+                    silero_opts.min_silence_duration_ms = options.vad_min_silence_duration_ms;   // as set (it was forced to 100 ms above 200)
                     silero_opts.speech_pad_ms = options.vad_speech_pad_ms;
                     silero_opts.max_speech_duration_s = options.vad_max_speech_duration_s;
                     // Silero stays on CPU — see comment in the original transcribe(samples).

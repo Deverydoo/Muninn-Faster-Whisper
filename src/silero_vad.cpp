@@ -191,6 +191,12 @@ public:
         // State for segment detection
         int speech_start = -1;
         int neg_threshold_count = 0;
+        // The last pause of at least ~98 ms inside the current speech run, and
+        // where speech resumed after it: an over-long run is split there
+        // rather than at an arbitrary sample, as faster-whisper does (#1386).
+        int pause_start = -1;
+        int pause_resume = -1;
+        const int pause_min_samples = static_cast<int>(0.098f * sample_rate);
         int min_silence_samples = static_cast<int>(min_silence_sec * sample_rate);
         int min_speech_samples = static_cast<int>(min_speech_sec * sample_rate);
         int max_speech_samples = static_cast<int>(max_speech_sec * sample_rate);
@@ -216,15 +222,29 @@ public:
                 // Currently in speech segment
                 if (speech_prob >= offset_threshold) {
                     // Still in speech (using lower offset threshold for hysteresis)
+                    if (neg_threshold_count >= pause_min_samples) {
+                        pause_start = current_pos - neg_threshold_count;
+                        pause_resume = current_pos;
+                    }
                     neg_threshold_count = 0;
 
-                    // Force split if segment too long
+                    // Split a run that's too long: at its last pause if there
+                    // was one, else here.
                     if ((current_pos - speech_start) > max_speech_samples) {
-                        segments.emplace_back(
-                            static_cast<float>(speech_start) / sample_rate,
-                            static_cast<float>(current_pos) / sample_rate
-                        );
-                        speech_start = current_pos;
+                        if (pause_start > speech_start) {
+                            segments.emplace_back(
+                                static_cast<float>(speech_start) / sample_rate,
+                                static_cast<float>(pause_start) / sample_rate
+                            );
+                            speech_start = pause_resume;
+                        } else {
+                            segments.emplace_back(
+                                static_cast<float>(speech_start) / sample_rate,
+                                static_cast<float>(current_pos) / sample_rate
+                            );
+                            speech_start = current_pos;
+                        }
+                        pause_start = pause_resume = -1;
                     }
                 } else {
                     // Below offset threshold - count silence
@@ -243,6 +263,7 @@ public:
                         }
                         speech_start = -1;
                         neg_threshold_count = 0;
+                        pause_start = pause_resume = -1;
                     }
                 }
             }
@@ -283,21 +304,14 @@ public:
         if (preamble_sec > 0.0f && audio_duration > 0.0f) {
             float preamble_end = std::min(preamble_sec, audio_duration);
 
-            if (segments.empty()) {
-                // No speech detected, but include preamble as a segment
-                segments.emplace_back(0.0f, preamble_end);
-                muninn::mlog() << "[SileroVAD] No speech detected, adding preamble segment 0.0-" << preamble_end << "s\n";
-            } else if (segments[0].start > 0.0f) {
-                // First segment doesn't start at 0, extend it or insert preamble
-                if (segments[0].start <= preamble_end) {
-                    // Extend first segment to include preamble
-                    segments[0].start = 0.0f;
-                    muninn::mlog() << "[SileroVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
-                } else {
-                    // Insert preamble as separate segment at the beginning
-                    segments.insert(segments.begin(), SpeechSegment(0.0f, preamble_end));
-                    muninn::mlog() << "[SileroVAD] Inserted preamble segment 0.0-" << preamble_end << "s\n";
-                }
+            // Only speech that starts within the preamble is pulled back to 0
+            // (the detector warming up can miss an onset). No speech means no
+            // segment, and a preamble isn't added as a segment of its own:
+            // both handed Whisper seconds of silence, and given silence it
+            // invents text (a game track came back as the initial prompt).
+            if (!segments.empty() && segments[0].start > 0.0f && segments[0].start <= preamble_end) {
+                segments[0].start = 0.0f;
+                muninn::mlog() << "[SileroVAD] Extended first segment to include preamble (now 0.0-" << segments[0].end << "s)\n";
             }
         }
 
