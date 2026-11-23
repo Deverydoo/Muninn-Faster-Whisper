@@ -207,6 +207,13 @@ public:
     bool is_cancelled() const;
 /**     * @brief Clear internal caches to free GPU memory     *     * Call this between batch transcriptions to prevent CUDA memory accumulation.     * The model remains loaded, but temporary buffers are freed.     * This is useful for long batch jobs processing many videos.     */    void clear_cache();
 
+    /**
+     * @brief Text to the model's token ids, as Whisper's tokenizer makes them
+     * (GPT-2 byte-level BPE from the model's tokenizer.json). Used for the
+     * initial prompt; empty if the model has no vocabulary.
+     */
+    std::vector<size_t> encode(const std::string& text) const;
+
 private:
     // Both public constructors land here.
     Transcriber(const std::string& model_path, const std::string& device,

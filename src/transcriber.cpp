@@ -24,6 +24,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <climits>
+#include <cstring>
 #include <set>
 #if __has_include(<zlib.h>)
 #include <zlib.h>   // compression ratio, as faster-whisper measures it
@@ -102,6 +104,12 @@ public:
     size_t startofprev_id = 0;   // <|startofprev|>, opens the previous-text prompt
     // The model's vocabulary, for prompts given as token ids (null if unavailable).
     const ctranslate2::Vocabulary* vocabulary = nullptr;
+
+    // GPT-2 BPE merges from the model's tokenizer.json (pair "a b" -> rank),
+    // so text becomes the same tokens Whisper's tokenizer makes. Empty: the
+    // longest-match fallback in encode_text.
+    std::unordered_map<std::string, int> bpe_ranks;
+    void load_bpe_merges(const std::string& model_dir);
     std::unordered_map<std::string, size_t> token_to_id;
     bool tokens_initialized = false;
 
@@ -1313,9 +1321,225 @@ void filter_silence_hallucinations(
     }
 }
 
+namespace {
+
+// One JSON string starting at s[i] == '"'; i ends after the closing quote.
+bool read_json_string(const std::string& s, size_t& i, std::string& out) {
+    out.clear();
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    auto put = [&out](uint32_t cp) {
+        if (cp < 0x80) out += static_cast<char>(cp);
+        else if (cp < 0x800) { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { out += static_cast<char>(0xE0 | (cp >> 12)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+        else { out += static_cast<char>(0xF0 | (cp >> 18)); out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    };
+    while (i < s.size()) {
+        const char c = s[i++];
+        if (c == '"') return true;
+        if (c != '\\') { out += c; continue; }
+        if (i >= s.size()) return false;
+        const char e = s[i++];
+        switch (e) {
+            case 'n': out += '\n'; break;
+            case 't': out += '\t'; break;
+            case 'r': out += '\r'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'u': {
+                if (i + 4 > s.size()) return false;
+                uint32_t cp = static_cast<uint32_t>(std::stoul(s.substr(i, 4), nullptr, 16));
+                i += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= s.size() && s[i] == '\\' && s[i + 1] == 'u') {
+                    const uint32_t lo = static_cast<uint32_t>(std::stoul(s.substr(i + 2, 4), nullptr, 16));
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 6;
+                }
+                put(cp);
+                break;
+            }
+            default: out += e; break;
+        }
+    }
+    return false;
+}
+
+// UTF-8 decode of one code point at s[i]; i advances.
+uint32_t next_codepoint(const std::string& s, size_t& i) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    int len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+    if (i + len > s.size()) len = 1;
+    uint32_t cp = len == 1 ? c : len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : (c & 0x07);
+    for (int k = 1; k < len; ++k) cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+    i += len;
+    return cp;
+}
+
+bool cp_is_space(uint32_t cp) {
+    return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\v' || cp == '\f' ||
+           cp == 0x85 || cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+bool cp_is_number(uint32_t cp) { return (cp >= '0' && cp <= '9') || (cp >= 0xFF10 && cp <= 0xFF19); }
+// Letters: ASCII letters, and any other character outside the common
+// punctuation and symbol blocks (accented, CJK, Cyrillic, Arabic, Hangul...).
+bool cp_is_letter(uint32_t cp) {
+    if (cp < 0x80) return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z');
+    if (cp_is_space(cp) || cp_is_number(cp)) return false;
+    if (cp >= 0xA1 && cp <= 0xBF && cp != 0xAA && cp != 0xB5 && cp != 0xBA) return false;   // Latin-1 punctuation/symbols
+    if (cp == 0xD7 || cp == 0xF7) return false;
+    if ((cp >= 0x2010 && cp <= 0x2BFF) || (cp >= 0x3000 && cp <= 0x303F) ||
+        (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF01 && cp <= 0xFF0F) ||
+        (cp >= 0xFF1A && cp <= 0xFF20) || (cp >= 0xFF3B && cp <= 0xFF40) ||
+        (cp >= 0xFF5B && cp <= 0xFF65) || (cp >= 0x1F000 && cp <= 0x1FAFF)) return false;
+    return true;
+}
+
+// GPT-2's pre-tokenizer pattern, by hand (std::regex has no \p{L}):
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+std::vector<std::string> gpt2_pretokenize(const std::string& text) {
+    std::vector<uint32_t> cps;
+    std::vector<size_t> at;   // byte offset of each code point, plus the end
+    for (size_t i = 0; i < text.size();) { at.push_back(i); cps.push_back(next_codepoint(text, i)); }
+    at.push_back(text.size());
+    std::vector<std::string> out;
+    const size_t n = cps.size();
+    size_t p = 0;
+    auto piece = [&](size_t a, size_t b) { out.push_back(text.substr(at[a], at[b] - at[a])); };
+    while (p < n) {
+        // Contractions.
+        if (cps[p] == '\'' && p + 1 < n) {
+            static const char* forms[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+            bool hit = false;
+            for (const char* f : forms) {
+                const size_t len = std::strlen(f);
+                if (p + 1 + len > n) continue;
+                bool same = true;
+                for (size_t k = 0; k < len; ++k) same = same && cps[p + 1 + k] == static_cast<uint32_t>(f[k]);
+                if (same) { piece(p, p + 1 + len); p += 1 + len; hit = true; break; }
+            }
+            if (hit) continue;
+        }
+        const size_t q = (cps[p] == ' ' && p + 1 < n && !cp_is_space(cps[p + 1])) ? p + 1 : p;   // optional leading space
+        if (cp_is_letter(cps[q])) {
+            size_t e = q; while (e < n && cp_is_letter(cps[e])) ++e;
+            piece(p, e); p = e; continue;
+        }
+        if (cp_is_number(cps[q])) {
+            size_t e = q; while (e < n && cp_is_number(cps[e])) ++e;
+            piece(p, e); p = e; continue;
+        }
+        if (!cp_is_space(cps[q])) {
+            size_t e = q; while (e < n && !cp_is_space(cps[e]) && !cp_is_letter(cps[e]) && !cp_is_number(cps[e])) ++e;
+            piece(p, e); p = e; continue;
+        }
+        // Whitespace: a run, minus its last character when something follows
+        // (that one belongs to the next word's optional leading space).
+        size_t e = p; while (e < n && cp_is_space(cps[e])) ++e;
+        if (e < n && e - p > 1) --e;
+        piece(p, e); p = e;
+    }
+    return out;
+}
+
+} // namespace
+
+void Transcriber::Impl::load_bpe_merges(const std::string& model_dir) {
+    bpe_ranks.clear();
+    std::ifstream f(std::filesystem::u8path(model_dir) / "tokenizer.json", std::ios::binary);
+    if (!f) return;
+    const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t i = s.find("\"merges\"");
+    if (i == std::string::npos) return;
+    i = s.find('[', i);
+    if (i == std::string::npos) return;
+    ++i;
+    int rank = 0;
+    std::string a, b;
+    while (i < s.size()) {
+        while (i < s.size() && (std::isspace(static_cast<unsigned char>(s[i])) || s[i] == ',')) ++i;
+        if (i >= s.size() || s[i] == ']') break;
+        if (s[i] == '"') {                 // "a b"
+            if (!read_json_string(s, i, a)) break;
+            bpe_ranks.emplace(a, rank++);
+        } else if (s[i] == '[') {          // ["a", "b"] (newer tokenizers)
+            ++i;
+            while (i < s.size() && s[i] != '"') ++i;
+            if (!read_json_string(s, i, a)) break;
+            while (i < s.size() && s[i] != '"') ++i;
+            if (!read_json_string(s, i, b)) break;
+            while (i < s.size() && s[i] != ']') ++i;
+            ++i;
+            bpe_ranks.emplace(a + " " + b, rank++);
+        } else {
+            break;
+        }
+    }
+    Logger::info("BPE merges loaded: " + std::to_string(bpe_ranks.size()));
+}
+
 std::vector<size_t> Transcriber::Impl::encode_text(const std::string& text) const {
     std::vector<size_t> ids;
     if (token_to_id.empty() || text.empty()) return ids;
+
+    // Real BPE when the merges are available (the same tokens Whisper's own
+    // tokenizer makes; the longest-match below often split names differently).
+    if (!bpe_ranks.empty()) {
+        auto byte_symbol = [](unsigned char b) -> std::string {
+            unsigned cp;
+            if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) cp = b;
+            else {
+                int n = 0;
+                for (unsigned x = 0; x < b; ++x)
+                    if (!((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174))) ++n;
+                cp = 256 + n;
+            }
+            std::string out;
+            if (cp < 0x80) out += static_cast<char>(cp);
+            else { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+            return out;
+        };
+        for (const std::string& word : gpt2_pretokenize(text)) {
+            std::vector<std::string> sym;
+            for (unsigned char c : word) sym.push_back(byte_symbol(c));
+            while (sym.size() > 1) {
+                int best_rank = INT_MAX;
+                size_t best_at = 0;
+                for (size_t k = 0; k + 1 < sym.size(); ++k) {
+                    auto it = bpe_ranks.find(sym[k] + " " + sym[k + 1]);
+                    if (it != bpe_ranks.end() && it->second < best_rank) { best_rank = it->second; best_at = k; }
+                }
+                if (best_rank == INT_MAX) break;
+                const std::string first = sym[best_at], second = sym[best_at + 1];
+                std::vector<std::string> merged;
+                for (size_t k = 0; k < sym.size();) {
+                    if (k + 1 < sym.size() && sym[k] == first && sym[k + 1] == second) {
+                        merged.push_back(first + second);
+                        k += 2;
+                    } else {
+                        merged.push_back(sym[k]);
+                        ++k;
+                    }
+                }
+                sym.swap(merged);
+            }
+            for (const std::string& t : sym) {
+                auto it = token_to_id.find(t);
+                if (it != token_to_id.end()) {
+                    ids.push_back(it->second);
+                } else {
+                    // Not in the vocabulary (shouldn't happen): its bytes one by one.
+                    for (size_t k = 0; k < t.size();) {
+                        size_t start = k;
+                        next_codepoint(t, k);
+                        auto bit = token_to_id.find(t.substr(start, k - start));
+                        if (bit != token_to_id.end()) ids.push_back(bit->second);
+                    }
+                }
+            }
+        }
+        return ids;
+    }
 
     // GPT-2's byte-to-unicode table: printable bytes map to themselves, the
     // rest to U+0100 upwards, so every byte is one visible character.
@@ -1466,15 +1690,19 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
 
             // Configure Whisper options (matching faster-whisper defaults)
             ctranslate2::models::WhisperOptions whisper_options;
-            whisper_options.beam_size = options.beam_size;
-            whisper_options.patience = options.patience;
+            // As faster-whisper: beam search at temperature 0; above it,
+            // best_of independent samples (beam 1) and the best kept. Muninn
+            // used to sample inside a beam search of 10 with patience 2.
+            const bool sampling = current_temp > 0.0f;
+            whisper_options.beam_size = sampling ? 1 : options.beam_size;
+            whisper_options.patience = sampling ? 1.0f : options.patience;
             whisper_options.length_penalty = options.length_penalty;
             whisper_options.repetition_penalty = options.repetition_penalty;
             whisper_options.no_repeat_ngram_size = options.no_repeat_ngram_size;
             whisper_options.max_length = options.max_length;
-            whisper_options.sampling_topk = (current_temp > 0) ? 0 : 1;  // Use sampling for T > 0
+            whisper_options.sampling_topk = sampling ? 0 : 1;
             whisper_options.sampling_temperature = current_temp;
-            whisper_options.num_hypotheses = 1;
+            whisper_options.num_hypotheses = sampling ? static_cast<size_t>(std::max(1, options.best_of)) : 1;
             whisper_options.return_scores = true;
             whisper_options.return_no_speech_prob = true;
             whisper_options.max_initial_timestamp_index = 50;
@@ -1556,7 +1784,10 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                     }
                 }
                 result = best->result;
-                current_temp = best->temperature;
+                // current_temp stays the last one tried, as faster-whisper
+                // reports it, so the context starts over after a window that
+                // no temperature could fix (it reported the best attempt's,
+                // often 0, and a looping window kept feeding the next).
                 avg_logprob = best->avg_logprob;
                 compression_ratio = best->compression_ratio;
                 num_tokens = result.sequences_ids.empty() ? 0 : result.sequences_ids[0].size();
@@ -2343,6 +2574,7 @@ Transcriber::Transcriber(
 
         // Initialize token IDs for word-level alignment
         pimpl_->initialize_token_ids();
+        pimpl_->load_bpe_merges(model_path);
 
         // config.json keys CTranslate2 relies on without saying so: with no
         // suppress_ids it suppresses nothing (music notes, "(music)" come
@@ -3694,6 +3926,10 @@ void Transcriber::reset_cancel() {
 
 bool Transcriber::is_cancelled() const {
     return pimpl_->cancelled.load(std::memory_order_acquire);
+}
+
+std::vector<size_t> Transcriber::encode(const std::string& text) const {
+    return pimpl_ ? pimpl_->encode_text(text) : std::vector<size_t>{};
 }
 
 void Transcriber::clear_cache() {

@@ -166,6 +166,7 @@ struct TranscribeOptions {
     int beam_size = 5;                     // Beam search width (1-10)
     float temperature = 0.0f;              // Sampling temperature (0 = greedy)
     std::vector<float> temperature_fallback = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};  // Temperature fallback sequence
+    int best_of = 5;                       // Samples per window above temperature 0 (the best is kept)
     float patience = 1.0f;                 // Beam search patience
     float length_penalty = 1.0f;           // Length penalty factor
     float repetition_penalty = 1.0f;       // Repetition penalty
