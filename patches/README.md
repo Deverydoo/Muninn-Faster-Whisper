@@ -57,8 +57,7 @@ After switching CTranslate2, reconfigure Muninn's build with
 paths are cached, and the old DLL with the new headers crashes (4.9 changed the
 `Model` vtable).
 
-```
-```
+`scripts/build_ctranslate2.ps1` runs these steps and the cuobjdump check.
 
 The CPU backend is Ruy, which is bundled with CTranslate2 (Apache 2.0) and does
 float32 and int8 GEMM, with AVX2/AVX-512 kernels picked at run time. OpenMP is
@@ -67,7 +66,3 @@ Without a CPU backend (`WITH_RUY=OFF`, as until November 2026) `device="cpu"`
 throws "No SGEMM backend on CPU", so PCs without an RTX 20 series or newer GPU
 couldn't transcribe at all. MKL would be faster on Intel CPUs but means
 installing oneAPI and shipping Intel's OpenMP; Ruy needs nothing extra.
-
-sm_120 (RTX 50) goes in through `CUDA_NVCC_FLAGS` because CMake's FindCUDA
-module, which CTranslate2 still uses, has no name for 12.0. Check the result
-with `cuobjdump --list-elf ctranslate2.dll`: sm_75, 80, 86, 89, 90 and 120.

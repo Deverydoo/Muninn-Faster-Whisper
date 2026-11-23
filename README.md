@@ -1,680 +1,167 @@
 # Muninn Faster-Whisper
 
-**Self-contained Pure C++ Whisper Transcription Suite - Production-ready alternative to Python faster-whisper**
+A C++ port of [faster-whisper](https://github.com/SYSTRAN/faster-whisper): Whisper speech-to-text on [CTranslate2](https://github.com/OpenNMT/CTranslate2), with audio decoding, voice activity detection, word timestamps, a streaming API, NLLB translation and subtitle export. Windows x64, MSVC.
 
 [![CI](https://github.com/Deverydoo/Muninn-Faster-Whisper/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Deverydoo/Muninn-Faster-Whisper/actions/workflows/ci.yml)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-yellow.svg)](LICENSE)
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
-[![CTranslate2](https://img.shields.io/badge/CTranslate2-Optimized-green.svg)](https://github.com/OpenNMT/CTranslate2)
-[![FFmpeg](https://img.shields.io/badge/FFmpeg-Powered-orange.svg)](https://ffmpeg.org/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange?logo=buy-me-a-coffee)](https://buymeacoffee.com/deverydoo)
 
-> **Muninn** - In Norse mythology, Muninn ("memory" or "mind") is one of Odin's ravens that flies across the world gathering information.
-
-**A complete, self-contained C++ Whisper transcription library with built-in audio extraction, VAD, and comprehensive hallucination filtering.**
-
-## What Makes Muninn Special?
-
-Unlike other C++ Whisper implementations, Muninn is **truly self-contained**:
-
-✅ **No external audio tools** - Built-in FFmpeg-powered decoder
-✅ **No Python dependencies** - Pure C++17 implementation
-✅ **Minimal setup** - Just vcpkg + CTranslate2
-✅ **Default VAD works out-of-box** - Energy VAD requires no extra dependencies
-✅ **Production-ready** - Comprehensive hallucination filtering & multi-track support
-
-**Build once, deploy anywhere** - Just copy `muninn.dll` + `ctranslate2.dll` + model files.
-
-## Why Muninn?
-
-**A pure C++ faster-whisper has been one of the most requested features in the transcription community.** Python's faster-whisper is excellent, but many applications need:
-
-- Native C++ integration without Python dependencies
-- Lower latency for real-time applications
-- Smaller deployment footprint
-- Direct integration with C++ audio/video pipelines
-
-Muninn delivers all of this while maintaining **feature parity with Python faster-whisper**.
+Version 0.6.0. Muninn is the transcription engine of [Loki Studio](https://www.lokistudio.ai); its name is one of Odin's ravens.
 
 ## Features
 
-### Self-Contained Architecture
-- **Built-in Audio Extraction** - Internal FFmpeg-powered decoder (no external DLLs)
-- **Zero Python Dependencies** - Pure C++ implementation
-- **Single Library Integration** - One DLL/SO + CTranslate2
-- **Minimal External Dependencies** - Only vcpkg for FFmpeg (MSVC) or system FFmpeg
+- **Transcription** of any file FFmpeg can read. Every audio track is transcribed separately (`Segment::track_id`) and keeps its place on the video's timeline.
+- **faster-whisper's decoding**: 30 s windows with its seek and context rules, temperature fallback with `best_of` sampling, the initial prompt tokenized with the model's BPE, and the same quality thresholds. The mel features match faster-whisper's feature extractor. `tests/accuracy` compares transcripts and word timings against faster-whisper.
+- **Word timestamps** from CTranslate2's alignment, with faster-whisper's word splitting (also for scripts without spaces) and timing rules.
+- **Voice activity detection**: Energy (no model) or Silero (ONNX), picked per track by `VADType::Auto` from track hints and the audio. Timestamps are mapped back to the original timeline.
+- **Failures are reported**: windows and tracks that fail are counted in `TranscribeResult`, and `transcribe()` throws when nothing succeeded. `cancel()` from any thread returns what was done so far.
+- **Language detection** over several windows, and an error for a language the model doesn't know.
+- **GPU or CPU**: CUDA 13 on RTX 20 series and newer; the CPU works through CTranslate2's Ruy backend (much slower).
+- **Streaming** (`StreamingTranscriber`): push audio at any rate and channel count from any thread, get segments with word timestamps by callback or polling. Language detection on the first speech, translate-to-English with multilingual models.
+- **Translation** (`Translator`): NLLB-200 through CTranslate2 and SentencePiece. A failed item comes back as `""`, never as the untranslated text.
+- **Subtitles** (`SubtitleExporter`): SRT, WebVTT (with optional word timestamp tags) and ASS; line splitting by characters for many languages, never dropping text, no overlapping cues. A metadata JSON writer and reader.
+- **Speaker diarization** (`Diarizer`): pyannote embeddings (ONNX, CPU) and average-linkage clustering.
 
-### Core Transcription
-- **Batch & Streaming APIs** - File-based transcription or real-time streaming
-- **Automatic Language Detection** - Detects 99+ languages automatically
-- **Multi-track Audio Support** - Process video files with multiple audio tracks separately
-- **Word-level Timestamps** - Precise timing for each word (karaoke-style highlighting)
-- **SRT/VTT Subtitle Export** - Automatic subtitle generation with speaker labels
-- **Beam Search Decoding** - High-quality output with configurable beam size
-- **Temperature Fallback** - Automatic retry with higher temperatures on difficult segments
+Not implemented: TEN and WebRTC VAD (`VADType::TEN` runs Silero, `WebRTC` runs Energy), hotwords, `Transcriber::get_audio_info()` (it throws; use `AudioExtractor`).
 
-### Streaming & Real-time (NEW!)
-- **StreamingTranscriber API** - Low-latency incremental transcription
-- **Real-Time Translation** - Speak any language, get English captions instantly (99+ languages)
-- **Speaker Diarization** - Automatic speaker detection and separation (who said what)
-- **500ms-2s Latency** - Configurable chunk processing for live captions
-- **Karaoke-Style Word Highlighting** - Words light up as spoken with precise timing
-- **Intensity-Based Coloring** - Words change color based on volume (whispered→shouted)
-- **Confidence Visualization** - Show transcription certainty with color coding
-- **Built-in Styling Presets** - HTML & ANSI formatters for OBS and terminals
-- **Thread-safe Audio Push** - Call from audio callbacks safely
-- **Non-blocking Polling** - Get results without blocking main thread
-- **Perfect for OBS Plugins** - Live streaming caption integration
+## What ships
 
-### Voice Activity Detection (VAD)
-- **Auto-Detection** - Smart VAD selection per track (**default**, tested on gaming/streaming)
-- **Energy VAD** - Fast RMS-based detection (music + speech, no dependencies)
-- **Silero VAD** - Neural precision for clean speech (optional, requires ONNX Runtime)
-- **Multi-track Intelligence** - Auto-selects best VAD per audio track
-- **Noise Gate Detection** - Recognizes studio mics and noise-gated audio
-- **Automatic Silence Skipping** - Filters silence for 2-3x faster processing
-- **VAD-aware Timestamp Remapping** - Accurate timestamps on original timeline
+The release zip (`Muninn-0.6.0-win-x64-cuda13.zip`) has:
 
-### Quality & Hallucination Filtering
-- **Compression Ratio Checks** - Detect repetitive hallucinations
-- **Log Probability Thresholds** - Filter low-confidence outputs
-- **No-speech Probability Filtering** - Skip segments with no actual speech
-- **Repetition Detection** - Catch phrase/word repetition patterns
-- **Cross-chunk Hallucination Detection** - Detect repeated phrases across chunks
-- **Silence Region Filtering** - Filter segments that fall in silent regions
+- `muninn.dll` and `muninn.lib`, and the public headers
+- `ctranslate2.dll` (CTranslate2 4.9.1 with Muninn's patch, CUDA 13.2)
+- `onnxruntime.dll` (ONNX Runtime 1.31.0, CPU) for Silero VAD and diarization
+- FFmpeg 9.0.2's `avformat`, `avcodec`, `avutil` and `swresample` DLLs (LGPL build; you can replace them)
+- `silero_vad.onnx`
 
-### Performance
-- **CUDA GPU Acceleration** - Full NVIDIA GPU utilization
-- **Batched Inference** - Process multiple chunks in parallel on GPU
-- **Optimized CTranslate2** - Custom-built for maximum speed
-- **2-4x Faster than Python** - No interpreter overhead
-- **~40% Lower Memory** - Efficient C++ memory management
+For the GPU you also need the CUDA 13 runtime and cuDNN 9 DLLs (not included), an RTX 20 series or newer GPU and driver 570+. Whisper models aren't included: use a CTranslate2 conversion such as `Systran/faster-whisper-large-v3`.
 
-### Advanced Options
-- **Clip Timestamps** - Process only specific time ranges
-- **Initial Prompt** - Condition model on domain-specific vocabulary
-- **Condition on Previous Text** - Better consistency across segments
-- **Token Suppression** - Control which tokens can be generated
-- **Skip Tracks** - Skip specific audio tracks in multi-track files
+`packaging/README_BINARIES.txt` lists the files and what a program using the DLL must match. Muninn passes C++ standard-library types across the DLL boundary, so your program must use MSVC 2022 17.10+, C++17, Release with /MD, and Visual C++ runtime 14.40+. Call `muninn::check_version()` (`<muninn/version.h>`) once at startup: it throws if the DLL isn't from the same release as your headers.
 
-## Quick Start
+## Building
 
-### Batch Transcription (Files)
+See [SETUP.md](SETUP.md). In short:
+
+- MSVC 2022, /MD, CMake 3.20+, vcpkg as the toolchain (`C:/vcpkg` unless you pass `CMAKE_TOOLCHAIN_FILE`), CUDA 13.2 for the GPU build
+- CTranslate2 4.9.1 with the local patch: `scripts/build_ctranslate2.ps1`, or the steps in [patches/README.md](patches/README.md)
+- SentencePiece (static) for the translator
+- ONNX Runtime 1.31.0 for Silero and diarization
+- FFmpeg 9 as shared DLLs, through `FFMPEG_DIR`
+
+Only Windows x64 is supported. There is no CMake package to `find_package`; add `include/` and link `muninn.lib`.
+
+## Transcribing a file
 
 ```cpp
 #include <muninn/transcriber.h>
-
-using namespace muninn;
+#include <muninn/version.h>
+#include <cstdio>
 
 int main() {
-    // Initialize transcriber with GPU
-    Transcriber transcriber("models/faster-whisper-large-v3-turbo",
-                            "cuda", "float16");
+    muninn::check_version();
+    muninn::Transcriber transcriber("models/faster-whisper-large-v3-turbo", "cuda", "float16");
 
-    // Configure transcription
-    TranscribeOptions options;
-    options.language = "auto";           // Auto-detect language
-    options.vad_filter = true;           // Enable VAD (uses Energy VAD by default)
-    options.beam_size = 5;
-    options.word_timestamps = false;     // Set true for word-level timing
+    muninn::TranscribeOptions options;      // language "auto", VAD Auto, beam 5
+    options.word_timestamps = true;
 
-    // Transcribe audio/video file
     auto result = transcriber.transcribe("video.mp4", options);
-
-    // Print results
-    std::cout << "Language: " << result.language << std::endl;
-    std::cout << "Duration: " << result.duration << "s" << std::endl;
-
-    for (const auto& segment : result.segments) {
-        printf("[Track %d] [%.2f -> %.2f] %s\n",
-               segment.track_id, segment.start, segment.end,
-               segment.text.c_str());
+    for (const auto& seg : result.segments) {
+        std::printf("[track %d] [%.2f -> %.2f] %s\n", seg.track_id, seg.start, seg.end, seg.text.c_str());
     }
-
-    return 0;
+    if (result.failed_windows || result.failed_tracks) {
+        std::printf("Some audio failed: %s\n", result.error.c_str());
+    }
 }
 ```
 
-### Streaming Transcription (Real-time)
+`transcribe()` also takes 16 kHz mono samples (`std::vector<float>`) and an optional progress callback that can cancel by returning false. `examples/basic_transcription.cpp` is a complete program.
+
+Defaults worth knowing (`include/muninn/types.h`):
+
+| Option | Default | |
+|---|---|---|
+| `language` | `"auto"` | |
+| `beam_size`, `patience`, `best_of` | 5, 1.0, 5 | |
+| `temperature_fallback` | 0.0, 0.2 ... 1.0 | |
+| `vad_type`, `vad_filter` | `VADType::Auto`, true | Silero needs `silero_model_path` |
+| `vad_threshold` | 0.02 | Energy's RMS floor; Silero uses it only above 0.1 (else 0.25) |
+| `vad_min_silence_duration_ms`, `vad_speech_pad_ms` | 500, 300 | |
+| `no_speech_threshold`, `log_prob_threshold`, `compression_ratio_threshold` | 0.4, -1.0, 2.4 | |
+| `hallucination_silence_threshold` | 0 (off) | fraction of a segment that must be speech |
+| `word_timestamps` | false | |
+| `sequential` | true | false = the older batched path (`batch_size` 4) |
+| `condition_on_previous` | true | |
+
+`ModelOptions` (for the other constructor) defaults to device `Auto` and `Float16`; on the CPU float16 becomes float32. `intra_threads` 0 uses about one thread per physical core.
+
+## Streaming
 
 ```cpp
 #include <muninn/streaming_transcriber.h>
-#include <muninn/word_styling.h>
 
-using namespace muninn;
-
-int main() {
-    // Initialize streaming transcriber
-    StreamingTranscriber stream("models/faster-whisper-large-v3-turbo");
-
-    // Configure for low latency
-    StreamingOptions options;
-    options.chunk_length_s = 1.5f;      // Process every 1.5 seconds
-    options.word_timestamps = true;     // Enable word-level timing
-
-    // Start with callback for new segments
-    stream.start(options, [](const Segment& seg) {
-        std::cout << "[" << seg.start << "s] " << seg.text << std::endl;
-
-        // Word-level details
-        for (const auto& word : seg.words) {
-            printf("  %s (%.2f-%.2fs, %.0f%% confident)\n",
-                   word.word.c_str(), word.start, word.end,
-                   word.probability * 100);
-        }
-
-        return true;  // Continue transcription
-    });
-
-    // Push audio chunks (from microphone, OBS, etc.)
-    while (recording) {
-        float* audio_samples = get_mic_audio();  // Your audio source
-        stream.push_audio(audio_samples, 1024, 48000, 1);
-    }
-
-    // Stop and get final segments
-    auto all_segments = stream.stop();
-
-    return 0;
-}
+muninn::StreamingTranscriber stream("models/faster-whisper-large-v3-turbo", "auto");
+muninn::StreamingOptions options;           // 2 s windows, 0.5 s overlap, energy VAD
+stream.start(options, [](const muninn::Segment& seg) {
+    std::printf("[%.2f] %s\n", seg.start, seg.text.c_str());
+    return true;
+});
+stream.push_audio(samples, frame_count * 2, 48000, 2);   // any thread, any rate
+auto segments = stream.stop();              // decodes what's left
 ```
 
-See [docs/STREAMING_API.md](docs/STREAMING_API.md) for complete streaming API documentation.
+See [docs/STREAMING_API.md](docs/STREAMING_API.md), and `examples/karaoke_captions.cpp` and `examples/translation_streaming.cpp`.
 
-## Feature Parity with faster-whisper
-
-| Feature | faster-whisper (Python) | Muninn (C++) |
-|---------|------------------------|--------------|
-| Silero VAD | ✅ | ✅ |
-| Beam Search | ✅ | ✅ |
-| Temperature Fallback | ✅ | ✅ |
-| Condition on Previous | ✅ | ✅ |
-| Language Detection | ✅ | ✅ |
-| Word Timestamps | ✅ | ✅ |
-| Hallucination Filtering | ✅ | ✅ |
-| Batched Processing | ✅ | ✅ |
-| Initial Prompt | ✅ | ✅ |
-| **Streaming API** | ❌ | ✅ |
-| **Real-Time Translation (99+ langs)** | ❌ | ✅ |
-| **Speaker Diarization (Multi-speaker)** | ❌ | ✅ |
-| **SRT/VTT Subtitle Export** | ❌ | ✅ |
-| **Karaoke Word Highlighting** | ❌ | ✅ |
-| **Intensity-Based Word Coloring** | ❌ | ✅ |
-| **Confidence Visualization** | ❌ | ✅ |
-| **Built-in HTML/ANSI Styling** | ❌ | ✅ |
-| Clip Timestamps | ✅ | ✅ |
-| Multi-track Audio | ❌ | ✅ |
-| No Python Required | ❌ | ✅ |
-
-## Performance Benchmarks
-
-Tested on RTX 4090, large-v3-turbo model:
-
-| Video Length | Python faster-whisper | Muninn C++ | Speedup |
-|-------------|----------------------|------------|---------|
-| 5 minutes   | 45s                  | 18s        | **2.5x**|
-| 30 minutes  | 4m 30s               | 1m 50s     | **2.5x**|
-| 60 minutes  | 9m 10s               | 3m 45s     | **2.4x**|
-
-Memory usage: **~40% lower** than Python implementation
-
-## Installation
-
-### Requirements
-
-**Minimum:**
-- C++17 compiler (MSVC 2022, GCC 9+, Clang 10+)
-- CMake 3.20+
-- vcpkg (Windows/MSVC) or system FFmpeg (Linux/Mac)
-- CTranslate2 (build guide included - see [third_party/CTranslate2/BUILD_MSVC.md](third_party/CTranslate2/BUILD_MSVC.md))
-
-**Optional:**
-- CUDA Toolkit 11.8+ (for GPU acceleration)
-- ONNX Runtime (for Silero VAD - optional, Energy VAD is default)
-
-### Build from Source (Windows with MSVC)
-
-**Step 1: Install vcpkg and FFmpeg**
-```bash
-# Install vcpkg (if not already installed)
-git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
-C:\vcpkg\bootstrap-vcpkg.bat
-
-# Install FFmpeg
-C:\vcpkg\vcpkg install ffmpeg:x64-windows-static
-```
-
-**Step 2: Build CTranslate2** (see [BUILD_MSVC.md](third_party/CTranslate2/BUILD_MSVC.md))
-```bash
-cd third_party/CTranslate2
-mkdir build && cd build
-
-# Quick build (minimal dependencies)
-cmake -G "Visual Studio 17 2022" -A x64 ^
-  -DCMAKE_BUILD_TYPE=Release ^
-  -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" ^
-  -DBUILD_SHARED_LIBS=ON ^
-  -DWITH_MKL=OFF ^
-  -DWITH_RUY=ON ^
-  -DWITH_CUDA=OFF ^
-  -DBUILD_CLI=OFF ^
-  ..
-
-cmake --build . --config Release -j
-
-# Copy DLL to lib folder
-copy build\Release\ctranslate2.dll ..\..\lib\
-```
-
-**Step 3: Build Muninn**
-```bash
-# From repository root
-mkdir build && cd build
-
-# Configure (Energy VAD only, no ONNX dependency)
-cmake -G "Visual Studio 17 2022" -A x64 ^
-  -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ^
-  -DVCPKG_TARGET_TRIPLET="x64-windows-static" ^
-  -DCMAKE_BUILD_TYPE=Release ^
-  -DWITH_CUDA=ON ^
-  -DWITH_SILERO_VAD=OFF ^
-  ..
-
-# Build
-cmake --build . --config Release -j
-
-# Output: build/Release/muninn.dll + ctranslate2.dll
-```
-
-**Optional: Enable Silero VAD**
-```bash
-# Add to cmake command:
--DWITH_SILERO_VAD=ON
-# Requires ONNX Runtime in third_party/onnx/
-```
-
-### Build from Source (Linux/Mac)
-
-```bash
-git clone --recursive https://github.com/Deverydoo/Muninn-Faster-Whisper.git
-cd muninn-faster-whisper
-
-# Install FFmpeg (system)
-sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswresample-dev  # Ubuntu/Debian
-# OR
-brew install ffmpeg  # macOS
-
-# Build CTranslate2 (see third_party/CTranslate2/README.md)
-cd third_party/CTranslate2 && mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON
-make -j
-cd ../../..
-
-# Build Muninn
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON
-cmake --build build -j
-
-# Install
-sudo cmake --install build --prefix /usr/local
-```
-
-### CMake Integration
-
-```cmake
-find_package(Muninn REQUIRED)
-target_link_libraries(your_app PRIVATE Muninn::faster-whisper)
-```
-
-## API Reference
-
-### Transcriber Class
+## Translation
 
 ```cpp
-class Transcriber {
-public:
-    // Constructor with ModelOptions (recommended)
-    explicit Transcriber(const ModelOptions& options);
+#include <muninn/translator.h>
 
-    // Constructor with strings (convenience)
-    Transcriber(const std::string& model_path,
-                const std::string& device = "cuda",
-                const std::string& compute_type = "float16");
-
-    // Transcribe from file (supports MP3, WAV, M4A, FLAC, MP4, MOV, etc.)
-    TranscribeResult transcribe(
-        const std::string& audio_path,
-        const TranscribeOptions& options = {},
-        ProgressCallback progress_callback = nullptr
-    );
-
-    // Transcribe from memory
-    TranscribeResult transcribe(
-        const std::vector<float>& audio_samples,
-        int sample_rate = 16000,
-        const TranscribeOptions& options = {},
-        int track_id = 0
-    );
-
-    // Get audio file info without transcribing
-    static AudioInfo get_audio_info(const std::string& audio_path);
-
-    // Get model information
-    ModelInfo get_model_info() const;
-};
+muninn::Translator translator("models/nllb-200-distilled-600M", "cuda");
+auto batch = translator.translate_batch_result(texts, "en", "es");
+// batch.texts[i] is "" for an item that failed; batch.cancelled, batch.failed_count, batch.error
 ```
 
-### TranscribeOptions
+See [docs/TRANSLATION.md](docs/TRANSLATION.md) and `examples/translation_example.cpp`.
+
+## Subtitles
 
 ```cpp
-struct TranscribeOptions {
-    // Language and Task
-    std::string language = "auto";         // "en", "es", "auto", etc.
-    std::string task = "transcribe";       // "transcribe" or "translate"
-
-    // Decoding Parameters
-    int beam_size = 5;                     // Beam search width (1-10)
-    float temperature = 0.0f;              // Sampling temperature (0 = greedy)
-    std::vector<float> temperature_fallback = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
-    float patience = 1.0f;                 // Beam search patience
-    float length_penalty = 1.0f;           // Length penalty factor
-    float repetition_penalty = 1.0f;       // Repetition penalty
-    int no_repeat_ngram_size = 0;          // Prevent n-gram repetitions
-
-    // Voice Activity Detection (VAD)
-    VADType vad_type = VADType::Energy;    // Energy, Silero, or None
-    bool vad_filter = true;                // Enable VAD filtering
-    float vad_threshold = 0.02f;           // VAD threshold
-    int vad_min_speech_duration_ms = 250;  // Minimum speech duration
-    int vad_max_speech_duration_s = 30;    // Maximum segment duration
-    int vad_min_silence_duration_ms = 500; // Minimum silence for split
-    int vad_speech_pad_ms = 100;           // Padding around speech
-    std::string silero_model_path;         // Path to silero_vad.onnx
-
-    // Hallucination Filtering
-    float compression_ratio_threshold = 2.4f;
-    float log_prob_threshold = -1.0f;
-    float no_speech_threshold = 0.4f;
-    float hallucination_silence_threshold = 0.0f;  // 0 = disabled
-
-    // Timestamps
-    bool word_timestamps = false;          // Extract word-level timing
-    float clip_start = 0.0f;               // Start time for clip
-    float clip_end = -1.0f;                // End time (-1 = full audio)
-
-    // Token Suppression
-    bool suppress_blank = true;
-    std::vector<int> suppress_tokens = {-1};
-
-    // Multi-Track Processing
-    std::set<int> skip_tracks;             // Track indices to skip
-    bool skip_silent_tracks = true;        // Auto-skip silent tracks
-
-    // Performance Tuning
-    int batch_size = 4;                    // Batch size for GPU
-    int max_length = 448;                  // Max tokens per segment
-
-    // Prompt / Context
-    std::string initial_prompt;            // Domain-specific vocabulary
-    std::vector<std::string> hotwords;     // Words to boost (planned)
-    bool condition_on_previous = true;     // Use previous text as context
-    float prompt_reset_on_temperature = 0.5f;  // Reset context threshold
-};
-```
-
-### TranscribeResult
-
-```cpp
-struct Word {
-    float start;             // Start time in seconds
-    float end;               // End time in seconds
-    std::string word;        // The word text
-    float probability;       // Confidence score
-};
-
-struct Segment {
-    int id;                  // Segment index
-    int track_id;            // Audio track index
-    float start;             // Start time in seconds
-    float end;               // End time in seconds
-    std::string text;        // Transcribed text
-    std::vector<Word> words; // Word timestamps (if enabled)
-    float temperature;       // Temperature used
-    float avg_logprob;       // Average log probability
-    float compression_ratio; // Text compression ratio
-    float no_speech_prob;    // No speech probability
-};
-
-struct TranscribeResult {
-    std::vector<Segment> segments;
-    std::string language;
-    float language_probability;
-    float duration;
-
-    // Range-based for loop support
-    auto begin() { return segments.begin(); }
-    auto end() { return segments.end(); }
-};
-```
-
-## Examples
-
-### Basic Transcription
-
-```cpp
-#include <muninn/transcriber.h>
-
-int main() {
-    muninn::Transcriber transcriber("models/whisper-large-v3-turbo");
-    auto result = transcriber.transcribe("audio.mp3");
-
-    for (const auto& seg : result) {
-        std::cout << "[" << seg.start << "s] " << seg.text << std::endl;
-    }
-}
-```
-
-### With Silero VAD
-
-```cpp
-muninn::TranscribeOptions options;
-options.vad_filter = true;
-options.vad_type = muninn::VADType::Silero;
-options.silero_model_path = "models/silero_vad.onnx";
-
-auto result = transcriber.transcribe("audio.mp3", options);
-```
-
-### Word-level Timestamps
-
-```cpp
-muninn::TranscribeOptions options;
-options.word_timestamps = true;
-
-auto result = transcriber.transcribe("audio.mp3", options);
-
-for (const auto& seg : result) {
-    for (const auto& word : seg.words) {
-        printf("[%.2fs] %s\n", word.start, word.word.c_str());
-    }
-}
-```
-
-### Process Specific Time Range
-
-```cpp
-muninn::TranscribeOptions options;
-options.clip_start = 60.0f;   // Start at 1 minute
-options.clip_end = 120.0f;    // End at 2 minutes
-
-auto result = transcriber.transcribe("long_video.mp4", options);
-```
-
-### Multi-track Video
-
-```cpp
-// Get audio info first
-auto info = muninn::Transcriber::get_audio_info("video.mkv");
-std::cout << "Tracks: " << info.num_tracks << std::endl;
-
-// Transcribe all tracks
-muninn::TranscribeOptions options;
-// options.skip_tracks = {0};  // Skip track 0 if needed
-
-auto result = transcriber.transcribe("video.mkv", options);
-
-// Results are grouped by track_id
-for (const auto& seg : result) {
-    std::cout << "[Track " << seg.track_id << "] " << seg.text << std::endl;
-}
-```
-
-### Speaker Diarization (Multi-Speaker)
-
-```cpp
-#include <muninn/streaming_transcriber.h>
-#include <muninn/diarization.h>
-
-// 1. Transcribe audio
-muninn::StreamingTranscriber transcriber("models/whisper-turbo");
-auto segments = transcriber.transcribe_file("podcast.mp3");
-
-// 2. Run speaker diarization
-muninn::Diarizer diarizer("models/pyannote-embedding.onnx");
-auto diarization = diarizer.diarize(audio_data, num_samples, 16000);
-
-// 3. Assign speakers to transcription
-muninn::Diarizer::assign_speakers_to_segments(segments, diarization);
-
-// 4. Custom speaker labels
-std::map<int, std::string> labels = {{0, "Host"}, {1, "Guest"}};
-muninn::Diarizer::set_speaker_labels(diarization, labels);
-
-// 5. Display with speaker labels
-for (const auto& seg : segments) {
-    std::cout << "[" << seg.speaker_label << "] " << seg.text << "\n";
-}
-// Output:
-// [Host] Welcome to the show!
-// [Guest] Thanks for having me!
-```
-
-### Subtitle Export (SRT/VTT)
-
-```cpp
-#include <muninn/transcriber.h>
 #include <muninn/subtitle_export.h>
 
-// Transcribe video
-muninn::Transcriber transcriber("models/whisper-turbo");
-auto result = transcriber.transcribe("video.mp4");
-
-// Export to SRT (creates video.srt in same directory)
 muninn::SubtitleExporter exporter;
-exporter.export_srt(result.segments, "video.mp4");
+exporter.export_srt(result.segments, "video.mp4");    // writes video.srt
 
-// Export to VTT with speaker colors
-muninn::SubtitleExportOptions vtt_opts;
-vtt_opts.format = muninn::SubtitleFormat::VTT;
-vtt_opts.include_speakers = true;
-vtt_opts.vtt_include_speaker_colors = true;
-exporter.export_vtt(result.segments, "video.mp4", vtt_opts);
-
-// Also generate metadata JSON (Loki Studio format)
-muninn::SubtitleMetadata::generate_metadata_json(
-    result.segments, "video.mp4",
-    "large-v3-turbo", result.language, result.duration);
-// Creates: video.srt, video.vtt, video_metadata.json
+muninn::SubtitleExportOptions vtt;
+vtt.format = muninn::SubtitleFormat::VTT;
+vtt.vtt_include_word_timestamps = true;
+exporter.export_subtitles(result.segments, "video.mp4", vtt);   // writes video.vtt
 ```
 
-### Progress Callback (GUI Integration)
+See [docs/SUBTITLE_EXPORT.md](docs/SUBTITLE_EXPORT.md) and `examples/subtitle_export.cpp`.
 
-```cpp
-auto result = transcriber.transcribe("video.mp4", options,
-    [](int track, int total_tracks, float progress, const std::string& msg) {
-        printf("\rTrack %d/%d: %.1f%% - %s",
-               track + 1, total_tracks, progress * 100, msg.c_str());
-        return true;  // Return false to cancel
-    });
-```
+## Documentation
 
-## Dependencies
-
-| Dependency | Required | Purpose | Source |
-|------------|----------|---------|--------|
-| **CTranslate2** | Yes | Whisper inference engine | Build from `third_party/CTranslate2/` |
-| **FFmpeg** | Yes | Internal audio extraction | vcpkg (Windows) or system (Linux/Mac) |
-| **CUDA** | Recommended | GPU acceleration | NVIDIA CUDA Toolkit |
-| **ONNX Runtime** | Optional | Silero VAD + Speaker Diarization | Download or build |
-| **pyannote Model** | Optional | Speaker diarization embeddings | HuggingFace (ONNX) |
-
-### Internal Audio Decoder
-
-Muninn includes a **built-in FFmpeg-powered audio decoder** for self-contained operation:
-
-- **16kHz mono float32 output** - Optimized for Whisper requirements
-- **Multi-track support** - Extract each audio track separately (no mixing)
-- **Multi-format support** - MP3, WAV, M4A, FLAC, MP4, MOV, MKV, etc.
-- **Multi-threaded decoding** - Fast extraction using all CPU cores
-- **Single-pass multi-stream** - Extract multiple tracks in one pass
-
-**No external audio extraction DLLs required** - everything is statically linked into muninn.dll.
-
-## Project Status
-
-**Current Version**: 0.5.0 ([release](https://github.com/Deverydoo/Muninn-Faster-Whisper/releases/tag/v0.5.0), Windows x64, CUDA 13)
-
-### Implemented
-- [x] CTranslate2 Whisper integration
-- [x] Mel-spectrogram conversion (128-bin)
-- [x] Silero VAD (neural)
-- [x] Energy VAD (fallback)
-- [x] VAD timestamp remapping
-- [x] Temperature fallback strategy
-- [x] Condition on previous text
-- [x] Language auto-detection
-- [x] Hallucination filtering (comprehensive)
-- [x] Word-level timestamps
-- [x] Batched GPU inference
-- [x] Multi-track audio support
-- [x] Clip timestamps
-- [x] Initial prompt support
-- [x] Token suppression options
-- [x] Progress callbacks
-- [x] Streaming transcription API
-- [x] Real-time translation (99+ languages)
-- [x] Speaker diarization (multi-speaker)
-- [x] SRT/VTT subtitle export
-- [x] Metadata JSON generation (Loki Studio)
-- [x] Intensity-based word coloring
-- [x] Karaoke word highlighting
-- [x] HTML/ANSI styling formatters
-
-### Planned
-- [ ] Hotwords/prefix support (logit bias)
-- [ ] Python bindings
-- [x] Pre-built Windows binaries (since 0.5.0, see Releases)
-- [ ] ASS subtitle format (advanced styling)
-
-## Contributing
-
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+| | |
+|---|---|
+| [SETUP.md](SETUP.md) | Building |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | Using the DLL in an application |
+| [docs/VAD_API.md](docs/VAD_API.md), [docs/VAD_AUTO_DETECTION.md](docs/VAD_AUTO_DETECTION.md) | Voice activity detection |
+| [docs/CANCELLATION_API.md](docs/CANCELLATION_API.md) | Cancelling transcription and translation |
+| [docs/STREAMING_API.md](docs/STREAMING_API.md), [docs/REALTIME_TRANSLATION.md](docs/REALTIME_TRANSLATION.md) | Streaming |
+| [docs/TRANSLATION.md](docs/TRANSLATION.md) | NLLB translation |
+| [docs/SUBTITLE_EXPORT.md](docs/SUBTITLE_EXPORT.md), [docs/WORD_STYLING.md](docs/WORD_STYLING.md), [docs/OBS_KARAOKE_CAPTIONS.md](docs/OBS_KARAOKE_CAPTIONS.md) | Subtitles and captions |
+| [docs/SPEAKER_DIARIZATION.md](docs/SPEAKER_DIARIZATION.md), [docs/DIARIZATION_SETUP.md](docs/DIARIZATION_SETUP.md) | Diarization |
+| [docs/CTRANSLATE2_CHANGES.md](docs/CTRANSLATE2_CHANGES.md) | Muninn's CTranslate2 patch |
+| [docs/CODE_AUDIT_2026-11.md](docs/CODE_AUDIT_2026-11.md) | The November 2026 audit behind 0.6.0 |
 
 ## License
 
-Business Source License 1.1, with an additional grant for any non-commercial use (personal projects, research, education). Each release changes to the MIT License four years after it comes out. For commercial use, see [LICENSE](LICENSE).
+Muninn is under the [Business Source License 1.1](LICENSE), with an additional use grant: you may use it for any non-commercial purpose (personal projects, research, education). Commercial use needs a license from the licensor (contact details in [LICENSE](LICENSE)). Each release changes to the MIT License four years after it is published. The third-party parts keep their own licenses (`packaging/THIRD_PARTY_NOTICES.txt`).
 
 ## Acknowledgments
 
-- Built on [CTranslate2](https://github.com/OpenNMT/CTranslate2) by OpenNMT
-- Inspired by [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-- Based on [OpenAI Whisper](https://github.com/openai/whisper)
-- Silero VAD from [snakers4/silero-vad](https://github.com/snakers4/silero-vad)
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) by SYSTRAN, which Muninn follows
+- [CTranslate2](https://github.com/OpenNMT/CTranslate2) by OpenNMT
+- [OpenAI Whisper](https://github.com/openai/whisper)
+- [Silero VAD](https://github.com/snakers4/silero-vad), [NLLB-200](https://github.com/facebookresearch/fairseq/tree/nllb), [pyannote](https://github.com/pyannote/pyannote-audio), [FFmpeg](https://ffmpeg.org/)
 
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/Deverydoo/Muninn-Faster-Whisper/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/Deverydoo/Muninn-Faster-Whisper/discussions)
-
----
-
-**Made with care for the C++ community**
+Issues: [GitHub Issues](https://github.com/Deverydoo/Muninn-Faster-Whisper/issues)
