@@ -51,8 +51,11 @@ public:
     /**
      * @brief Set a custom logging callback
      *
-     * When set, all Muninn log output goes to this callback instead of stderr.
-     * Set to nullptr to restore the default (stderr).
+     * When set, Muninn's own log lines go to this callback instead of stderr
+     * (and still to the log file, if set_log_directory() enabled one). Set to
+     * nullptr to restore the default (stderr). Not covered: messages printed
+     * by the libraries Muninn uses (CTranslate2, ONNX Runtime, FFmpeg), and
+     * the error printed to stderr when the log file can't be opened.
      *
      * @param callback The logging callback function
      */
@@ -119,7 +122,8 @@ private:
     static std::string level_to_string(LogLevel level);
 };
 
-// Convenience macros for logging with automatic [Muninn] prefix
+// Convenience macros: stream-style formatting (MUNINN_LOG_INFO("n=" << n)).
+// The "[Muninn]" prefix is added only on the default stderr output.
 #define MUNINN_LOG_DEBUG(msg) do { \
     std::ostringstream oss; oss << msg; \
     muninn::Logger::debug(oss.str()); \

@@ -43,27 +43,28 @@ struct DiarizationOptions {
     // Model Configuration
     // ═══════════════════════════════════════════════════════════
     std::string embedding_model_path;      // Path to pyannote speaker embedding model (ONNX)
-    std::string segmentation_model_path;   // Optional: Path to pyannote segmentation model
+    std::string segmentation_model_path;   // Not used (no segmentation model support yet)
 
     // ═══════════════════════════════════════════════════════════
     // Clustering Parameters
     // ═══════════════════════════════════════════════════════════
-    float clustering_threshold = 0.7f;     // Cosine similarity threshold (0.5-0.9)
-    int min_speakers = 1;                  // Minimum number of speakers
+    float clustering_threshold = 0.7f;     // Cosine similarity needed to merge (0.5-0.9; higher = more speakers)
+    int min_speakers = 1;                  // Not used
     int max_speakers = 10;                 // Maximum number of speakers (0 = unlimited)
 
     // ═══════════════════════════════════════════════════════════
     // Embedding Extraction
     // ═══════════════════════════════════════════════════════════
-    float embedding_window_s = 1.0f;       // Audio per embedding. A model with a fixed input length
-                                           // (the shipped export takes 16000 samples) gets the window
+    float embedding_window_s = 1.0f;       // Audio per embedding. A model that takes any length
+                                           // (convert_pyannote_to_onnx.py's export does) gets the whole
+                                           // window; a model with a fixed input length gets the window
                                            // padded or cut to that length, with a warning at load.
     float embedding_step_s = 0.5f;         // Step size between embeddings (50% overlap)
 
     // ═══════════════════════════════════════════════════════════
     // Speaker Assignment
     // ═══════════════════════════════════════════════════════════
-    float min_segment_duration = 0.3f;     // Minimum duration to assign speaker
+    float min_segment_duration = 0.3f;     // Not used
     bool merge_adjacent_same_speaker = true;  // Merge consecutive segments from same speaker
 
     // ═══════════════════════════════════════════════════════════
@@ -102,17 +103,15 @@ struct DiarizationResult {
 /**
  * @brief Speaker Diarization Engine
  *
- * Uses pyannote-audio ONNX models for speaker detection and separation.
+ * Uses a pyannote/embedding ONNX model (512-dimensional speaker embeddings;
+ * convert_pyannote_to_onnx.py makes one). Runs on the CPU by default.
  *
- * Features:
- * - Extract speaker embeddings from audio
- * - Cluster embeddings to identify unique speakers
- * - Assign speaker labels to transcription segments
- * - Multi-speaker conversation analysis
+ * - Extracts an embedding per window (embedding_window_s, step embedding_step_s)
+ * - Clusters them into speakers (average linkage on cosine similarity)
+ * - Assigns speaker labels to transcription segments
  *
- * Models:
- * - pyannote/embedding (512-dimensional speaker embeddings)
- * - pyannote/segmentation (optional, for better boundaries)
+ * Set custom names with set_speaker_labels() before
+ * assign_speakers_to_segments(): it copies the labels onto the segments.
  *
  * Example usage:
  * @code

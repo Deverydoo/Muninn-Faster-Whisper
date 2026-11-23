@@ -15,8 +15,9 @@ struct SileroVADOptions {
     int min_speech_duration_ms = 250;       // Minimum speech duration to keep
     int min_silence_duration_ms = 100;      // Minimum silence duration for split
     int speech_pad_ms = 300;                // Padding around speech segments (300ms to capture gradual onset)
-    int max_speech_duration_s = 30;         // Force split long segments (for Whisper)
-    int audio_preamble_ms = 2000;           // Always include first N ms of audio (handles VAD warm-up)
+    int max_speech_duration_s = 30;         // Split longer speech at its last pause (for Whisper)
+    int audio_preamble_ms = 2000;           // Speech starting within the first N ms is extended back to 0
+                                            // (never a segment of its own)
 
     // GPU acceleration
     // NOTE: CPU is typically FASTER for Silero VAD due to small inference windows (512 samples).
@@ -85,7 +86,9 @@ public:
      * @param samples Input audio samples
      * @param sample_rate Sample rate
      * @param segments Output: detected speech segments
-     * @return Filtered audio containing only speech (empty if silent track)
+     * @return Filtered audio containing only speech. When no speech is found:
+     *         empty if the track is silent (peak below 0.001), otherwise the
+     *         whole input unchanged
      */
     std::vector<float> filter_silence(
         const std::vector<float>& samples,

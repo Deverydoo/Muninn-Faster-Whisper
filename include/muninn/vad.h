@@ -24,7 +24,8 @@ struct VADOptions {
     int min_speech_duration_ms = 250;     // Minimum speech duration to keep
     int min_silence_duration_ms = 500;    // Minimum silence to split segments
     int speech_pad_ms = 100;              // Padding around speech segments
-    int audio_preamble_ms = 2000;         // Always include first N ms of audio (handles speech starting immediately)
+    int audio_preamble_ms = 2000;         // Speech starting within the first N ms is extended back to 0
+                                          // (never a segment of its own)
     bool adaptive_threshold = true;       // Auto-adjust threshold based on noise floor
     float noise_floor_percentile = 0.1f;  // Percentile for noise floor estimation
 };
@@ -60,7 +61,9 @@ public:
      * @param samples Input audio samples
      * @param sample_rate Sample rate
      * @param segments Output: detected speech segments
-     * @return Filtered audio containing only speech
+     * @return Filtered audio containing only speech. When no speech is found:
+     *         empty if the track is silent (peak below 0.001), otherwise the
+     *         whole input unchanged
      */
     std::vector<float> filter_silence(
         const std::vector<float>& samples,

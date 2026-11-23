@@ -38,7 +38,8 @@ struct StreamingOptions {
     float chunk_length_s = 2.0f;
     float overlap_s = 0.5f;
     bool enable_vad = true;                // Use VAD to skip windows without speech
-    VADType vad_type = VADType::Energy;    // VAD algorithm
+    VADType vad_type = VADType::Energy;    // Energy or Silero. Auto = Silero when vad_model_path is
+                                           // set, else Energy. TEN runs Silero (not implemented yet).
 
     // Path to silero_vad.onnx. Required when vad_type is Silero (or when Auto
     // resolves to it); ignored otherwise. Without it the neural VAD cannot be
@@ -196,12 +197,13 @@ public:
     /**
      * @brief Stop streaming, decode the audio still buffered, and end the session
      *
-     * Waits for the worker to finish the remaining audio (the final segments
-     * are also passed to the callback, unless it returned false earlier).
-     * Throws std::logic_error when called from a callback (it would wait for
-     * itself).
+     * Waits for the worker to decode the audio still buffered and passes the
+     * final segments to the callback. If the callback returned false earlier,
+     * the buffered audio is not decoded at all. Throws std::logic_error when
+     * called from a callback (it would wait for itself).
      *
-     * @return Every segment of the session, in order
+     * @return The segments since start() or the last reset(), in order (the
+     *         same as get_all_segments()); empty when no session was active
      */
     std::vector<Segment> stop();
 
@@ -247,7 +249,7 @@ public:
      *
      * Useful for exporting SRT subtitles or reviewing transcript.
      *
-     * @return Vector of all completed segments since start()
+     * @return Vector of all completed segments since start() or the last reset()
      */
     std::vector<Segment> get_all_segments() const;
 

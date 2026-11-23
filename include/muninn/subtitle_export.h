@@ -248,15 +248,19 @@ struct SubtitleEntry {
 /**
  * @brief Subtitle Exporter
  *
- * Export transcription results to standard subtitle formats (SRT, VTT, ASS).
+ * Export transcription results to SRT, WebVTT or ASS.
  *
- * Features:
- * - SRT: Universal compatibility (all video players)
- * - VTT: Web standard with styling, word-level timing, speaker colors
- * - ASS: One plain style, for tools that want ASS
- * - Auto-splitting long text to fit subtitle guidelines
- * - Speaker label integration
- * - Automatic output path generation (same directory as video)
+ * - SRT: plain cues (no escaping exists in SRT; a "-->" in the text becomes "->")
+ * - VTT: optional per-word timestamp tags, speaker colours and a class for
+ *   low-confidence words; & < > are escaped
+ * - ASS: one plain style, speaker in the Name field
+ * - Long text split into lines and extra cues, never dropped
+ * - Speaker labels from Segment::speaker_label or speaker_names
+ * - Output next to the video, with the format's extension, unless
+ *   output_path is set
+ *
+ * export_srt/export_vtt/export_ass always write their own format;
+ * export_subtitles picks one from options.format.
  *
  * Example usage:
  * @code
@@ -278,13 +282,16 @@ public:
     ~SubtitleExporter() = default;
 
     // ═══════════════════════════════════════════════════════════
-    // High-level Export (Auto-detect format from extension)
+    // High-level Export (format from options.format)
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * @brief Export subtitles with custom options
+     * @brief Export subtitles in the format options.format names
      *
-     * Output path auto-generated from video_path if not specified in options.
+     * Calls export_srt, export_vtt or export_ass. The format comes from
+     * options.format only, never from a file extension: an output_path ending
+     * in ".vtt" still gets SRT unless format is VTT. Without output_path the
+     * file is video_path with the format's extension (.srt, .vtt, .ass).
      *
      * @param segments Transcription segments
      * @param video_path Original video file path (for auto-naming output)

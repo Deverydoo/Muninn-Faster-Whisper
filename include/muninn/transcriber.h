@@ -10,7 +10,11 @@
 namespace muninn {
 
 /**
- * @brief Audio file information (from Heimdall)
+ * @brief Audio file information
+ *
+ * get_audio_info() is not available in this build: it always throws (it sits
+ * behind a WITH_HEIMDALL switch that nothing sets). AudioExtractor::open()
+ * with get_track_count() and get_duration() gives the same information.
  */
 struct MUNINN_API AudioInfo {
     float duration;              // Duration in seconds
@@ -33,14 +37,16 @@ using ProgressCallback = std::function<bool(int track_index, int total_tracks, f
 /**
  * @brief High-level Whisper transcription API
  *
- * Muninn Transcriber provides a production-ready C++ implementation of
- * faster-whisper's transcribe() functionality. Features include:
+ * A C++ port of faster-whisper's transcribe():
  *
- * - Voice Activity Detection (VAD) for automatic silence skipping
- * - Sliding window processing for long audio files
- * - Comprehensive hallucination filtering
- * - Automatic prompt management
- * - Language detection
+ * - every audio track of a file transcribed separately (Segment::track_id)
+ * - voice activity detection to skip silence (Energy or Silero)
+ * - 30 s windows with faster-whisper's seek, context and temperature fallback
+ * - word timestamps from CTranslate2's alignment
+ * - language detection
+ *
+ * A window or track that fails is counted in TranscribeResult::failed_windows
+ * and failed_tracks; transcribe() throws when nothing succeeded.
  *
  * Example:
  * @code
@@ -90,18 +96,19 @@ public:
     /**
      * @brief Unload the model and release GPU resources
      *
-     * Releases the CTranslate2 model and its CUDA resources without blocking.
-     * Uses a timeout for thread pool shutdown to avoid hanging on CUDA teardown.
-     * After calling this, the transcriber cannot be used until a new model is loaded.
+     * Waits for a running transcribe() to finish, then frees the model's GPU
+     * memory. The Transcriber can't transcribe again afterwards (transcribe()
+     * throws); create a new one. A second call does nothing.
      *
-     * @param timeout_ms Maximum time to wait for thread pool shutdown (default 3000ms)
+     * @param timeout_ms Not used at present (the wait has no limit)
      */
     void unload_model(int timeout_ms = 3000);
 
     /**
      * @brief Get audio file information without transcribing
      *
-     * Fast metadata query - useful for GUI to show track count before processing
+     * Not available at present: always throws std::runtime_error (see
+     * AudioInfo). Use AudioExtractor instead.
      *
      * @param audio_path Path to audio/video file
      * @return Audio metadata including duration and track count
@@ -111,8 +118,9 @@ public:
     /**
      * @brief Transcribe audio from file
      *
-     * Supports formats: MP3, WAV, M4A, FLAC, MP4, MOV, etc.
-     * Audio is automatically converted to 16kHz mono.
+     * Anything FFmpeg can read (MP3, WAV, M4A, FLAC, MP4, MKV, MOV, ...).
+     * Each audio track is decoded to 16 kHz mono and transcribed separately;
+     * Segment::track_id says which track a segment came from.
      *
      * @param audio_path Path to audio/video file
      * @param options Transcription configuration
@@ -131,7 +139,8 @@ public:
      * @brief Transcribe audio from memory (single track)
      *
      * @param audio_samples Audio samples (mono, float32, normalized to [-1, 1])
-     * @param sample_rate Sample rate (will be resampled to 16kHz if needed)
+     * @param sample_rate Must be 16000: other rates throw (there is no resampling here;
+     *                    AudioExtractor and the file overload resample for you)
      * @param options Transcription configuration
      * @param track_id Track identifier for multi-track results (default 0)
      * @param total_tracks Total number of tracks being processed
@@ -183,8 +192,10 @@ public:
      * Thread-safe method that can be called from any thread (e.g., UI thread)
      * to request cancellation of an ongoing transcribe() call.
      *
-     * The cancellation is cooperative - the transcription will stop at the
-     * next safe checkpoint (typically between batches or chunks).
+     * The cancellation is cooperative: the run stops at its next checkpoint
+     * (before each track, between VAD and mel, before each window or batch).
+     * The segments finished so far are returned on the original timeline,
+     * with TranscribeResult::was_cancelled set.
      *
      * The flag is cleared when the running transcribe() returns, so a cancel()
      * sent just before transcribe() starts still cancels that run.
@@ -205,7 +216,14 @@ public:
      * @return true if cancel() was called and not yet reset
      */
     bool is_cancelled() const;
-/**     * @brief Clear internal caches to free GPU memory     *     * Call this between batch transcriptions to prevent CUDA memory accumulation.     * The model remains loaded, but temporary buffers are freed.     * This is useful for long batch jobs processing many videos.     */    void clear_cache();
+
+    /**
+     * @brief Clear internal caches to free GPU memory
+     *
+     * Frees CTranslate2's cached allocator blocks; the model stays loaded.
+     * Useful between files in a long batch job.
+     */
+    void clear_cache();
 
     /**
      * @brief Text to the model's token ids, as Whisper's tokenizer makes them

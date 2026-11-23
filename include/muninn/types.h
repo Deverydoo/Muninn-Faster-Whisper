@@ -27,15 +27,16 @@ enum class TrackType {
 /**
  * @brief VAD algorithm type (user-selectable in GUI)
  *
- * API Options: Auto (default), None, Energy, Silero, TEN
+ * Implemented: Auto (default), None, Energy, Silero. TEN and WebRTC are not:
+ * TEN runs Silero and WebRTC runs Energy, with a warning.
  */
 enum class VADType {
-    Auto,           // Auto-detect best VAD per track (DEFAULT - recommended for multi-track)
-    None,           // No VAD - process all audio (use for clean audio or when VAD causes issues)
-    Energy,         // Energy-based VAD (fast, no dependencies, works with music/mixed audio)
-    Silero,         // Silero VAD ONNX (neural precision for clean speech, requires ONNX Runtime)
-    TEN,            // TEN VAD ONNX (lightweight, fast, ~308KB model, no delay issues)
-    WebRTC          // WebRTC/Google VAD (future support)
+    Auto,           // Pick per track (track hints, then the audio's noise floor and range)
+    None,           // No VAD - process all audio
+    Energy,         // Energy-based VAD (no model needed)
+    Silero,         // Silero VAD ONNX (needs ONNX Runtime and silero_model_path; else Energy)
+    TEN,            // Not implemented yet: runs Silero instead
+    WebRTC          // Not implemented: runs Energy instead
 };
 
 /**
@@ -177,18 +178,21 @@ struct TranscribeOptions {
     // ═══════════════════════════════════════════════════════════
     VADType vad_type = VADType::Auto;      // VAD algorithm to use (Auto = smart selection)
     bool vad_filter = true;                // Enable VAD (shortcut for vad_type != None)
-    float vad_threshold = 0.02f;           // VAD energy threshold (Energy) or speech prob (Silero)
+    float vad_threshold = 0.02f;           // Energy reads it as an RMS floor when <= 0.1; Silero reads it
+                                           // as a speech probability when > 0.1, and uses 0.25 otherwise
     int vad_min_speech_duration_ms = 250;  // Minimum speech duration to keep
-    int vad_max_speech_duration_s = 30;    // Maximum speech duration before split
-    int vad_min_silence_duration_ms = 500; // Minimum silence for split (Energy: 500ms, Silero: 100ms)
-    int vad_speech_pad_ms = 300;           // Padding around speech segments (300ms to capture gradual speech onset)
-    int vad_audio_preamble_ms = 2000;      // Always include first N ms of audio (handles VAD warm-up and immediate speech)
+    int vad_max_speech_duration_s = 30;    // Maximum speech duration before split (Silero splits at a pause)
+    int vad_min_silence_duration_ms = 500; // Minimum silence for split (both detectors)
+    int vad_speech_pad_ms = 300;           // Padding around speech segments
+    int vad_audio_preamble_ms = 2000;      // Not read at present: Energy and Silero use 2000 ms. Speech that
+                                           // starts within it is pulled back to 0; it never adds a segment
+                                           // of its own.
 
     // Silero VAD specific
     std::string silero_model_path;         // Path to silero_vad.onnx (required for VADType::Silero)
 
     // TEN VAD specific
-    std::string ten_vad_model_path;        // Path to ten-vad.onnx (required for VADType::TEN)
+    std::string ten_vad_model_path;        // Not used: TEN isn't implemented yet and VADType::TEN runs Silero
 
     // ═══════════════════════════════════════════════════════════
     // Hallucination Filtering
@@ -196,7 +200,9 @@ struct TranscribeOptions {
     float compression_ratio_threshold = 2.4f;  // Max compression ratio
     float log_prob_threshold = -1.0f;          // Min average log probability
     float no_speech_threshold = 0.4f;          // Max no-speech probability
-    float hallucination_silence_threshold = 0.0f;  // Skip segments in silent regions (0 = disabled)
+    float hallucination_silence_threshold = 0.0f;  // Fraction (0-1) of a segment that must overlap
+                                                   // VAD speech, or it is dropped. 0 = off. Not
+                                                   // faster-whisper's option of the same name (seconds).
 
     // ═══════════════════════════════════════════════════════════
     // Timestamps
@@ -221,16 +227,16 @@ struct TranscribeOptions {
     // ═══════════════════════════════════════════════════════════
     // Speaker Diarization ("Who Said What")
     // ═══════════════════════════════════════════════════════════
-    bool enable_diarization = false;       // Enable speaker diarization (OFF by default)
+    bool enable_diarization = false;       // Diarize after transcribing (file input only, on the CPU)
     std::string diarization_model_path;    // Path to pyannote embedding model (ONNX)
     float diarization_threshold = 0.7f;    // Speaker clustering threshold (0.5-0.9)
-    int diarization_min_speakers = 1;      // Minimum number of speakers
+    int diarization_min_speakers = 1;      // Not used
     int diarization_max_speakers = 10;     // Maximum number of speakers (0 = unlimited)
 
     // ═══════════════════════════════════════════════════════════
     // Performance Tuning
     // ═══════════════════════════════════════════════════════════
-    int batch_size = 4;                    // Batch size for parallel GPU processing
+    int batch_size = 4;                    // Windows decoded together when sequential = false (1-32)
     int max_length = 448;                  // Maximum tokens per segment
 
     // Phase C pipeline: overlap CPU prep (VAD + mel) of upcoming track with
@@ -244,7 +250,7 @@ struct TranscribeOptions {
     // Prompt / Context
     // ═══════════════════════════════════════════════════════════
     std::string initial_prompt;            // Initial prompt to condition model
-    std::vector<std::string> hotwords;     // Words to boost recognition
+    std::vector<std::string> hotwords;     // Not used yet
     bool condition_on_previous = true;     // Use previous text as context
     // Long audio decoded as faster-whisper does: 30 s windows from a seek position,
     // with fallback and context. Default since October 2026: on Loki Studio's test

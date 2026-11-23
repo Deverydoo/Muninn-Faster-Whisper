@@ -9,10 +9,9 @@ namespace muninn {
 /**
  * @brief TEN VAD options
  *
- * TEN VAD is a lightweight neural VAD model with:
- * - Small model size (~308KB vs 2.3MB for Silero)
- * - No delay issues (simpler architecture)
- * - Fast inference
+ * NOT WORKING YET: TenVAD feeds raw audio to a model that expects features
+ * and recurrent state, so detect_speech() fails. The transcriber and the
+ * streaming transcriber run Silero when VADType::TEN is asked for.
  */
 struct TenVADOptions {
     std::string model_path;                 // Path to ten-vad.onnx model
@@ -35,12 +34,8 @@ struct TenVADOptions {
 /**
  * @brief TEN VAD - Lightweight Neural Voice Activity Detection
  *
- * TEN VAD is a lightweight alternative to Silero VAD with:
- * - ~10x smaller model size (308KB vs 2.3MB)
- * - Simpler architecture with no delay issues
- * - Comparable accuracy for speech detection
- *
- * Model source: https://github.com/rhasspy/wyoming-satellite
+ * Not working yet (see TenVADOptions). Kept so it can be finished; use
+ * SileroVAD.
  *
  * Requirements:
  * - ONNX Runtime library

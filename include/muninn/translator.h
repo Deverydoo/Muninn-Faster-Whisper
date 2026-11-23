@@ -70,9 +70,8 @@ struct TranslationBatchResult {
  * - Destroying the Translator while another thread is still inside one of its
  *   methods is not allowed.
  *
- * Performance Tips:
- * - Use translate_batch() instead of calling translate() in a loop (5-10x faster)
- * - Batch translation amortizes tokenization and GPU kernel launch overhead
+ * Performance: use translate_batch() rather than translate() in a loop, so
+ * CTranslate2 can decode many sentences together.
  *
  * Usage:
  * @code
@@ -118,10 +117,12 @@ public:
     /**
      * @brief Unload the model and release GPU resources
      *
-     * Releases the CTranslate2 model's GPU memory. If a translate_batch() is
+     * Releases the model's memory (VRAM on CUDA). If a translate_batch() is
      * running, it is asked to stop after its current chunk (its remaining
-     * items come back "" with cancelled = true) and this waits for it.
-     * After calling this, the translator cannot be used until a new one is created.
+     * items come back "" with cancelled = true) and this waits for it, up to
+     * timeout_ms. After an unload the Translator can't translate again (calls
+     * return ""); create a new one. A second call does nothing. The
+     * destructor calls it with a 5000 ms timeout.
      *
      * @param timeout_ms How long to wait for a running batch to let go of the
      *                   model (default 3000 ms; negative = wait as long as it takes)
@@ -177,7 +178,8 @@ public:
      * @param source_lang Source language code
      * @param target_langs List of target language codes
      * @param options Translation options
-     * @return Map of target_lang -> translated_text
+     * @return (target_lang, translated_text) pairs in the order of target_langs;
+     *         "" for a target that failed. One translate() call per target.
      */
     std::vector<std::pair<std::string, std::string>> translate_multi_target(
         const std::string& text,

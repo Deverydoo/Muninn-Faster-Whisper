@@ -8,11 +8,14 @@ namespace muninn {
 /**
  * @brief Whisper-compatible mel-spectrogram converter
  *
- * Converts audio samples to mel-filterbank features for Whisper models.
- * Implements the same mel-spectrogram generation as OpenAI Whisper / faster-whisper.
+ * Converts audio samples to log-mel features for Whisper models, as
+ * faster-whisper's FeatureExtractor does: periodic Hann window, centred frames
+ * with reflect padding, Slaney mel scale and area-normalised filters, and a
+ * log floor 8 below the loudest value.
  *
- * Parameters match Whisper's defaults:
- * - 128 mel bins (large-v3/large-v3-turbo models)
+ * Defaults:
+ * - 128 mel bins (large-v3 and large-v3-turbo; older models use 80, which the
+ *   transcriber reads from the model)
  * - 16kHz sample rate
  * - 400-point FFT (25ms @ 16kHz)
  * - 160-sample hop (10ms @ 16kHz)
@@ -64,7 +67,7 @@ private:
     // Create mel filterbank matrix
     std::vector<std::vector<float>> createMelFilters(int sample_rate, int n_fft, int n_mels);
 
-    // Convert frequency to mel scale (HTK formula for Whisper compatibility)
+    // Convert frequency to mel scale (Slaney: linear below 1 kHz, log above; librosa's default)
     float hzToMel(float hz);
 
     // Convert mel scale to frequency

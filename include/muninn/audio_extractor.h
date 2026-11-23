@@ -11,8 +11,9 @@ namespace muninn {
  * @brief AudioExtractor - Internal Audio Extraction
  *
  * Extracts audio from video files and prepares it for Whisper transcription.
- * Uses internal audio decoder (no external dependencies).
- * Configured for Whisper requirements:
+ * Decodes with FFmpeg (the av*.dll / swresample DLLs muninn.dll links).
+ * Each track keeps its place on the video's timeline: gaps and late starts
+ * are filled with silence. Output:
  * - 16kHz sample rate
  * - Mono channel
  * - Float32 samples normalized to [-1, 1]
