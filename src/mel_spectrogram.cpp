@@ -38,8 +38,10 @@ std::vector<float> MelSpectrogram::createHannWindow(int size)
         if (size == 1) window[0] = 1.0f;
         return window;
     }
+    // Periodic Hann (divide by N, not N-1), as Whisper's feature extractor
+    // uses; the symmetric one used before shifted every feature slightly.
     for (int i = 0; i < size; i++) {
-        window[i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (size - 1)));
+        window[i] = static_cast<float>(0.5 * (1.0 - std::cos(2.0 * M_PI * i / size)));
     }
     return window;
 }
@@ -101,20 +103,23 @@ std::vector<std::vector<float>> MelSpectrogram::createMelFilters(int sample_rate
         mel_freqs[i] = melToHz(mel_points[i]);
     }
 
-    // Create triangular filters
+    // Triangular filters with Slaney area normalisation (librosa's norm="slaney",
+    // which Whisper's filterbank uses): each triangle is scaled by
+    // 2 / (right - left), so wide high bands don't outweigh narrow low ones.
+    // Without it every band was 23x to 179x too large and the features sat
+    // well above what the model was trained on.
     for (int m = 0; m < n_mels; m++) {
-        float left = mel_freqs[m];
-        float center = mel_freqs[m + 1];
-        float right = mel_freqs[m + 2];
+        const float left = mel_freqs[m];
+        const float center = mel_freqs[m + 1];
+        const float right = mel_freqs[m + 2];
+        const float enorm = 2.0f / (right - left);
 
         for (int f = 0; f < n_freqs; f++) {
-            float freq = fft_freqs[f];
-
-            if (freq >= left && freq <= center) {
-                filters[m][f] = (freq - left) / (center - left);
-            } else if (freq > center && freq <= right) {
-                filters[m][f] = (right - freq) / (right - center);
-            }
+            const float freq = fft_freqs[f];
+            const float lower = (freq - left) / (center - left);
+            const float upper = (right - freq) / (right - center);
+            const float w = std::max(0.0f, std::min(lower, upper));
+            filters[m][f] = w * enorm;
         }
     }
 
@@ -166,14 +171,43 @@ int MelSpectrogram::compute(const std::vector<float>& samples, std::vector<std::
 {
     const int n_freqs = n_fft_ / 2 + 1;
 
-    // samples.size() is unsigned: a clip shorter than one window used to wrap
-    // around to a nonsense frame count instead of producing nothing.
-    if (n_fft_ <= 0 || hop_length_ <= 0 || samples.size() < static_cast<size_t>(n_fft_)) {
+    if (n_fft_ <= 0 || hop_length_ <= 0 || samples.empty()) {
         mel_output.clear();
         return 0;
     }
 
-    const int n_frames = static_cast<int>((samples.size() - n_fft_) / hop_length_) + 1;
+    // As faster-whisper's FeatureExtractor: 160 samples of zeros appended, then
+    // the STFT is centred (n_fft/2 reflected samples each side), and its last
+    // frame dropped. That gives one frame per hop: frame i is centred on sample
+    // i*hop, which is what Whisper's 10 ms timestamps assume. (Muninn used
+    // uncentred frames, so every frame sat half a window late.)
+    const int half = n_fft_ / 2;
+    std::vector<float> padded;
+    {
+        std::vector<float> body(samples);
+        body.insert(body.end(), static_cast<size_t>(hop_length_), 0.0f);
+        const size_t n = body.size();
+        padded.resize(n + 2 * static_cast<size_t>(half));
+        for (int i = 0; i < half; i++) {
+            // numpy "reflect": the edge sample itself isn't repeated. Audio
+            // shorter than the pad reflects back and forth.
+            auto reflect = [n](long long idx) {
+                if (n == 1) return size_t(0);
+                const long long period = 2 * static_cast<long long>(n - 1);
+                long long r = ((idx % period) + period) % period;
+                if (r >= static_cast<long long>(n)) r = period - r;
+                return static_cast<size_t>(r);
+            };
+            padded[static_cast<size_t>(half - 1 - i)] = body[reflect(i + 1)];
+            padded[static_cast<size_t>(half) + n + i] = body[reflect(static_cast<long long>(n) - 2 - i)];
+        }
+        std::copy(body.begin(), body.end(), padded.begin() + half);
+    }
+    const int n_frames = static_cast<int>((padded.size() - n_fft_) / hop_length_) + 1 - 1;  // last frame dropped
+    if (n_frames <= 0) {
+        mel_output.clear();
+        return 0;
+    }
 
     // FFmpeg's transform, already linked for audio decode. RDFT needs a length
     // divisible by 4 and Whisper's 400-point window qualifies (400 = 4 x 100).
@@ -233,11 +267,12 @@ int MelSpectrogram::compute(const std::vector<float>& samples, std::vector<std::
     // complex spectrogram first cost ~1.5 KB per frame (around 380 MB on a
     // 40-minute track) for data that is consumed immediately.
     mel_output.assign(n_frames, std::vector<float>(n_mels_));
+    float global_max = -1e30f;
     std::vector<float> power(n_freqs);
     std::vector<std::complex<float>> fallback(n_freqs);
 
     for (int frame = 0; frame < n_frames; frame++) {
-        const float* src = samples.data() + static_cast<size_t>(frame) * hop_length_;
+        const float* src = padded.data() + static_cast<size_t>(frame) * hop_length_;
         for (int n = 0; n < n_fft_; n++) {
             in_buf[n] = src[n] * hann_window_[n];
         }
@@ -265,15 +300,17 @@ int MelSpectrogram::compute(const std::vector<float>& samples, std::vector<std::
                 mel_value += weights[i] * p[i];
             }
 
-            // Log compression (Whisper-style)
-            mel_value = std::max(mel_value, 1e-10f);
-            float log_mel = std::log10(mel_value);
-            float max_log = std::log10(1.0f);  // Simplified normalization
-            log_mel = std::max(log_mel, max_log - 8.0f);
-            log_mel = (log_mel + 4.0f) / 4.0f;
-
-            row[mel] = log_mel;
+            row[mel] = std::log10(std::max(mel_value, 1e-10f));
+            global_max = std::max(global_max, row[mel]);
         }
+    }
+
+    // Whisper's normalisation: floor at the loudest value minus 8 (over the
+    // whole input, as faster-whisper computes it), then (x + 4) / 4. The floor
+    // used to be a fixed -8, which ignored how loud the recording is.
+    const float floor_value = global_max - 8.0f;
+    for (auto& row : mel_output) {
+        for (float& v : row) v = (std::max(v, floor_value) + 4.0f) / 4.0f;
     }
 
     av_free(in_buf);

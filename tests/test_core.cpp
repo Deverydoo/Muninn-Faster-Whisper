@@ -103,8 +103,8 @@ void test_mel_spectrogram() {
     std::vector<std::vector<float>> out;
     const auto tone = tone_in_silence(16000, 1.0f, 0.0f, 1.0f);
     const int frames = mel.compute(tone, out);
-    // (16000 - 400) / 160 + 1
-    CHECK(frames == 98);
+    // One frame per 160-sample hop, as faster-whisper: 16000 / 160 + 1.
+    CHECK(frames == 101);
     CHECK(out.size() == static_cast<size_t>(frames));
 
     bool all_finite = true, rows_ok = true;
@@ -121,16 +121,45 @@ void test_mel_spectrogram() {
 
     std::vector<std::vector<float>> quiet_out;
     const std::vector<float> quiet(16000, 0.0f);
-    CHECK(mel.compute(quiet, quiet_out) == 98);
+    CHECK(mel.compute(quiet, quiet_out) == 101);
     double quiet_sum = 0.0;
     for (const auto& row : quiet_out)
         for (float v : row) quiet_sum += v;
     // A tone carries more energy than silence in the log-mel domain.
     CHECK(tone_sum > quiet_sum);
 
-    // Shorter than one window: no frames, no wrap-around.
+    // The same numbers as faster-whisper's FeatureExtractor (feature_size=128)
+    // for 0.5 s of a 440 Hz tone at 0.3 then 0.5 s of silence (values printed
+    // by faster-whisper 1.2.0, Nov 2026). Muninn's extractor used to differ by
+    // about 0.4 on average (no Slaney norm, fixed floor, symmetric window,
+    // uncentred frames).
+    {
+        std::vector<std::vector<float>> ref;
+        const auto half_tone = tone_in_silence(16000, 1.0f, 0.0f, 0.5f);
+        CHECK(mel.compute(half_tone, ref) == 101);
+        auto near = [](float a, float b) { return std::fabs(a - b) < 2e-3f; };
+        CHECK(near(ref[0][16], 1.2960435f));
+        CHECK(near(ref[0][5], 0.8186983f));
+        CHECK(near(ref[20][18], 1.3744297f));
+        CHECK(near(ref[20][5], -0.6255703f));   // the floor: loudest - 8
+        CHECK(near(ref[49][30], 0.1489637f));
+        CHECK(near(ref[50][18], 1.2240041f));
+        CHECK(near(ref[51][11], 0.3036880f));
+        CHECK(near(ref[52][0], -0.6255703f));
+        double mean = 0.0;
+        for (const auto& row : ref) for (float v : row) mean += v;
+        mean /= 101.0 * 128.0;
+        CHECK(std::fabs(mean - (-0.5612341)) < 1e-3);
+    }
+
+    // Shorter than one window: centred frames still give one per hop
+    // (100 samples -> 1 frame, as faster-whisper), all finite; nothing in,
+    // nothing out.
     std::vector<std::vector<float>> tiny_out;
-    CHECK(mel.compute(std::vector<float>(100, 0.1f), tiny_out) == 0);
+    CHECK(mel.compute(std::vector<float>(100, 0.1f), tiny_out) == 1);
+    CHECK(tiny_out.size() == 1 && std::isfinite(tiny_out[0][0]));
+    CHECK(mel.compute(std::vector<float>(1, 0.1f), tiny_out) == 1);
+    CHECK(mel.compute(std::vector<float>(), tiny_out) == 0);
     CHECK(tiny_out.empty());
 }
 
