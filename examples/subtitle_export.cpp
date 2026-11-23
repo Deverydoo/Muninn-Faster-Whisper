@@ -48,7 +48,7 @@ bool label_speakers(const std::string& video_path,
 
     muninn::DiarizationOptions diar_options;
     diar_options.device = "cpu";  // the ONNX Runtime Muninn ships is CPU-only
-    muninn::Diarizer diarizer("models/pyannote-embedding.onnx", diar_options);
+    muninn::Diarizer diarizer("models/pyannote_embedding.onnx", diar_options);
 
     auto diarization = diarizer.diarize(audio_samples.data(), audio_samples.size(), 16000);
     std::cout << "Found " << diarization.num_speakers << " speaker(s)\n";

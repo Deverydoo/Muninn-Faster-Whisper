@@ -1,10 +1,13 @@
-// Exercises StreamingTranscriber's VAD selection, which is the code changed in
-// Muninn: start() used to hardcode the energy detector and ignore vad_type.
+// Shows how StreamingTranscriber picks its VAD for each session.
 //
-// Runs three sessions to cover selection, fallback, and reuse:
+// Usage: streaming_vad_selection <whisper_model> <silero_vad.onnx>
+//
+// Runs four short sessions on a synthetic tone:
 //   1. Silero requested with a valid model  -> Silero
 //   2. Silero requested with no model path  -> falls back to energy
 //   3. Silero again                         -> reuses the loaded session
+//   4. Energy explicitly                    -> energy
+// The VAD chosen is in Muninn's log lines (stderr).
 #include <cstdio>
 #include <cmath>
 #include <vector>

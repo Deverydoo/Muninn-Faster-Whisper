@@ -1,82 +1,69 @@
-#include "muninn/transcriber.h"
-#include <iostream>
-#include <vector>
-#include <cmath>
+/**
+ * @file basic_transcription.cpp
+ * @brief Example: transcribe an audio or video file and print the segments
+ *
+ * Usage: basic_transcription <model_dir> <audio_file> [cuda|cpu|auto] [language]
+ *
+ * model_dir is a CTranslate2 Whisper model (for example
+ * faster-whisper-large-v3-turbo). Every audio track of the file is
+ * transcribed; each segment says which track it came from.
+ */
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#include <muninn/transcriber.h>
+#include <muninn/version.h>
 
-// Generate a simple sine wave for testing (1 second @ 16kHz)
-std::vector<float> generate_test_audio(float frequency = 440.0f, float duration = 1.0f) {
-    const int sample_rate = 16000;
-    int num_samples = static_cast<int>(duration * sample_rate);
-    std::vector<float> samples(num_samples);
+#include <cstdio>
+#include <exception>
+#include <string>
 
-    for (int i = 0; i < num_samples; i++) {
-        float t = static_cast<float>(i) / sample_rate;
-        samples[i] = 0.5f * std::sin(2.0f * static_cast<float>(M_PI) * frequency * t);
-    }
-
-    return samples;
-}
-
-int main() {
-    std::cout << "═══════════════════════════════════════════════════════════\n";
-    std::cout << "Muninn Faster-Whisper - Basic Transcription Example\n";
-    std::cout << "═══════════════════════════════════════════════════════════\n\n";
-
-    try {
-        // Path to your Whisper model (adjust as needed)
-        std::string model_path = "models/whisper-large-v3-turbo";
-
-        std::cout << "[Example] Loading Whisper model...\n";
-        muninn::Transcriber transcriber(model_path, "cuda", "float16");
-
-        std::cout << "\n[Example] Generating test audio (sine wave)...\n";
-        auto audio_samples = generate_test_audio(440.0f, 5.0f);  // 5 seconds of 440Hz tone
-
-        std::cout << "[Example] Transcribing audio...\n\n";
-
-        // Configure transcription options
-        muninn::TranscribeOptions options;
-        options.language = "en";
-        options.beam_size = 5;
-        options.vad_filter = true;
-        options.compression_ratio_threshold = 2.4f;
-        options.no_speech_threshold = 0.6f;
-
-        // Transcribe
-        auto result = transcriber.transcribe(audio_samples, 16000, options);
-
-        // Display results
-        std::cout << "\n═══════════════════════════════════════════════════════════\n";
-        std::cout << "TRANSCRIPTION RESULT\n";
-        std::cout << "═══════════════════════════════════════════════════════════\n";
-        std::cout << "Language: " << result.language << "\n";
-        std::cout << "Duration: " << result.duration << "s\n";
-        std::cout << "Segments: " << result.segments.size() << "\n\n";
-
-        if (result.segments.empty()) {
-            std::cout << "No speech detected (expected for sine wave test audio)\n";
-        } else {
-            for (const auto& segment : result.segments) {
-                std::cout << "[" << segment.start << "s - " << segment.end << "s] "
-                         << segment.text << "\n";
-            }
-        }
-
-        std::cout << "═══════════════════════════════════════════════════════════\n\n";
-
-        std::cout << "[Example] Next steps:\n";
-        std::cout << "  1. Integrate Heimdall audio decoder for real audio files\n";
-        std::cout << "  2. Test with actual speech audio\n";
-        std::cout << "  3. Compare with Python faster-whisper output\n\n";
-
-    } catch (const std::exception& e) {
-        std::cerr << "[Example] ERROR: " << e.what() << "\n";
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::fprintf(stderr, "Usage: %s <model_dir> <audio_file> [cuda|cpu|auto] [language]\n", argv[0]);
         return 1;
     }
+    const std::string model_path = argv[1];
+    const std::string audio_path = argv[2];
+    const std::string device = argc > 3 ? argv[3] : "auto";
 
+    try {
+        // Throws if muninn.dll isn't from the same release as these headers.
+        muninn::check_version();
+
+        // float16 on the GPU; Muninn uses float32 instead on the CPU.
+        muninn::Transcriber transcriber(model_path, device, "float16");
+        const auto info = transcriber.get_device_info();
+        std::printf("Muninn %s on %s (%s)\n", muninn::library_version(), info.device.c_str(),
+                    info.compute_type.c_str());
+
+        muninn::TranscribeOptions options;
+        options.language = argc > 4 ? argv[4] : "auto";
+        options.word_timestamps = true;
+
+        const auto result = transcriber.transcribe(
+            audio_path, options,
+            [](int track, int total_tracks, float progress, const std::string& message) {
+                std::fprintf(stderr, "\rTrack %d/%d %3.0f%% %-40s", track + 1, total_tracks,
+                             progress * 100.0f, message.c_str());
+                return true;  // false cancels
+            });
+        std::fprintf(stderr, "\n");
+
+        std::printf("Language: %s (%.0f%%), duration %.1f s, %zu segments\n",
+                    result.language.c_str(), result.language_probability * 100.0f, result.duration,
+                    result.segments.size());
+        for (const auto& seg : result.segments) {
+            std::printf("[track %d] [%7.2f -> %7.2f] %s\n", seg.track_id, seg.start, seg.end,
+                        seg.text.c_str());
+        }
+
+        // A window or track that failed doesn't stop the run; it is counted here.
+        if (result.failed_windows > 0 || result.failed_tracks > 0) {
+            std::fprintf(stderr, "%d window(s) and %d track(s) failed: %s\n", result.failed_windows,
+                         result.failed_tracks, result.error.c_str());
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Error: %s\n", e.what());
+        return 1;
+    }
     return 0;
 }

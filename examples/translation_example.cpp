@@ -21,6 +21,8 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
