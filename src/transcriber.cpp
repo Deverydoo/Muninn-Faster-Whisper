@@ -1,5 +1,6 @@
 #include "muninn/transcriber.h"
 #include "log_stream.h"
+#include "text_decode.h"
 #include "muninn/logging.h"
 #include "muninn/mel_spectrogram.h"
 #include "muninn/audio_extractor.h"
@@ -76,11 +77,51 @@ float remap_timestamp_to_original(float filtered_time, const std::vector<muninn:
     return filtered_time;
 }
 
+// faster-whisper's SpeechTimestampsMap: VAD joined the speech regions into
+// one stream; this maps a time in that stream back to the recording. A time
+// exactly on a join is the end of the earlier region when it is an end, and
+// the start of the next one otherwise (Muninn treated both alike, so a
+// segment starting on a join began in the silence before it).
+class SpeechTimestampsMap {
+public:
+    explicit SpeechTimestampsMap(const std::vector<muninn::SpeechSegment>& regions) {
+        double silence = 0.0, previous_end = 0.0, filtered = 0.0;
+        for (const auto& r : regions) {
+            silence += r.start - previous_end;
+            previous_end = r.end;
+            filtered += r.end - r.start;
+            chunk_end_.push_back(filtered);
+            silence_before_.push_back(silence);
+        }
+    }
+    bool empty() const { return chunk_end_.empty(); }
+    size_t chunk_index(double t, bool is_end = false) const {
+        for (size_t i = 0; i < chunk_end_.size(); ++i) {
+            if (is_end && std::fabs(chunk_end_[i] - t) < 1e-4) return i;
+        }
+        const size_t i = static_cast<size_t>(
+            std::upper_bound(chunk_end_.begin(), chunk_end_.end(), t) - chunk_end_.begin());
+        return std::min(i, chunk_end_.size() - 1);
+    }
+    float original(double t, size_t chunk) const { return static_cast<float>(silence_before_[chunk] + t); }
+    float original(double t, bool is_end = false) const { return original(t, chunk_index(t, is_end)); }
+
+private:
+    std::vector<double> chunk_end_;       // end of each region on the joined timeline
+    std::vector<double> silence_before_;  // silence cut before each region
+};
+
 } // anonymous namespace
 #include <regex>
 #include <map>
 
 namespace muninn {
+
+using text::GPT2ByteDecoder;
+using text::get_gpt2_decoder;
+using text::clean_token;
+using text::clean_token_raw;
+using text::compression_ratio_of;
 
 // =======================
 // Transcriber::Impl
@@ -127,6 +168,7 @@ public:
     // (inference thread only), and the last error.
     int failed_windows = 0;
     std::string last_error;
+    float last_speech_timestamp = 0.0f;   // faster-whisper's, across windows
     void note_failure(const std::string& what) {
         ++failed_windows;
         last_error = what;
@@ -413,190 +455,35 @@ bool is_punctuation_only(const std::string& token) {
     // Empty after stripping = just a space marker
     if (text.empty()) return true;
 
-    // Check if any alphanumeric character exists
-    for (char c : text) {
-        if (std::isalnum(static_cast<unsigned char>(c))) {
-            return false;  // Has alphanumeric content = real word
+    // Decode the byte-level token to real UTF-8 first: a word starting with
+    // a non-ASCII letter ("école", "Привет") used to have no ASCII letter and
+    // counted as punctuation, so it was glued onto the previous word.
+    const std::string decoded = get_gpt2_decoder().decode(text);
+    for (size_t i = 0; i < decoded.size();) {
+        const unsigned char c = static_cast<unsigned char>(decoded[i]);
+        if (c < 0x80) {
+            if (std::isalnum(c)) return false;
+            ++i;
+            continue;
         }
+        // A non-ASCII character: a letter unless it's in a punctuation block
+        // (general punctuation, CJK symbols and punctuation, full-width forms).
+        int len = (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+        uint32_t cp = len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : len == 4 ? (c & 0x07) : c;
+        for (int k = 1; k < len && i + k < decoded.size(); ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(decoded[i + k]) & 0x3F);
+        i += len;
+        const bool punct = (cp >= 0x80 && cp <= 0xBF) || (cp >= 0x2000 && cp <= 0x206F) ||
+                           (cp >= 0x3000 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F) ||
+                           (cp >= 0xFF1A && cp <= 0xFF20) || (cp >= 0xFF5B && cp <= 0xFF65) ||
+                           (cp >= 0xFE30 && cp <= 0xFE4F);
+        if (!punct) return false;
     }
     return true;  // Only punctuation/symbols
 }
 
-/**
- * @brief GPT-2/Whisper byte-level BPE decoder
- *
- * GPT-2 and Whisper use byte-level BPE where raw bytes (0x00-0xFF) are mapped
- * to Unicode characters. This is necessary for handling non-ASCII text like
- * Japanese, Chinese, Korean, Arabic, etc.
- *
- * The encoding maps:
- * - Printable ASCII (0x21-0x7E) and Latin-1 Extended (0xA1-0xAC, 0xAE-0xFF) -> themselves
- * - Other bytes (0x00-0x20, 0x7F-0xA0, 0xAD) -> U+0100 to U+0143
- *
- * When decoding, we reverse this: convert each Unicode char back to its original byte,
- * then interpret the resulting byte sequence as UTF-8.
- */
-class GPT2ByteDecoder {
-public:
-    GPT2ByteDecoder() {
-        // Build the byte-to-unicode encoder mapping (same as Python's bytes_to_unicode())
-        std::vector<int> bs;
-        std::vector<int> cs;
-
-        // Printable ASCII and Latin-1 Extended characters stay as-is
-        for (int b = '!'; b <= '~'; b++) bs.push_back(b);
-        for (int b = 0xA1; b <= 0xAC; b++) bs.push_back(b);
-        for (int b = 0xAE; b <= 0xFF; b++) bs.push_back(b);
-
-        cs = bs;  // These map to themselves
-
-        // Other bytes get mapped to U+0100 onwards
-        int n = 0;
-        for (int b = 0; b < 256; b++) {
-            if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
-                bs.push_back(b);
-                cs.push_back(256 + n);
-                n++;
-            }
-        }
-
-        // Build the decoder map (Unicode codepoint -> original byte)
-        for (size_t i = 0; i < bs.size(); i++) {
-            decoder_[cs[i]] = static_cast<uint8_t>(bs[i]);
-        }
-    }
-
-    /**
-     * @brief Decode a GPT-2/Whisper token string to raw UTF-8 bytes
-     *
-     * The token string contains Unicode characters that represent raw bytes.
-     * We convert each char to its original byte value, giving us the UTF-8 bytes.
-     */
-    std::string decode(const std::string& token) const {
-        std::vector<uint8_t> bytes;
-        bytes.reserve(token.size());
-
-        // Parse UTF-8 to get Unicode codepoints
-        size_t i = 0;
-        while (i < token.size()) {
-            uint32_t codepoint = 0;
-            uint8_t c = static_cast<uint8_t>(token[i]);
-
-            // Decode UTF-8 to get the Unicode codepoint
-            if ((c & 0x80) == 0) {
-                // Single byte (ASCII)
-                codepoint = c;
-                i += 1;
-            } else if ((c & 0xE0) == 0xC0) {
-                // Two bytes
-                codepoint = (c & 0x1F) << 6;
-                if (i + 1 < token.size()) {
-                    codepoint |= (static_cast<uint8_t>(token[i + 1]) & 0x3F);
-                }
-                i += 2;
-            } else if ((c & 0xF0) == 0xE0) {
-                // Three bytes
-                codepoint = (c & 0x0F) << 12;
-                if (i + 1 < token.size()) {
-                    codepoint |= (static_cast<uint8_t>(token[i + 1]) & 0x3F) << 6;
-                }
-                if (i + 2 < token.size()) {
-                    codepoint |= (static_cast<uint8_t>(token[i + 2]) & 0x3F);
-                }
-                i += 3;
-            } else if ((c & 0xF8) == 0xF0) {
-                // Four bytes
-                codepoint = (c & 0x07) << 18;
-                if (i + 1 < token.size()) {
-                    codepoint |= (static_cast<uint8_t>(token[i + 1]) & 0x3F) << 12;
-                }
-                if (i + 2 < token.size()) {
-                    codepoint |= (static_cast<uint8_t>(token[i + 2]) & 0x3F) << 6;
-                }
-                if (i + 3 < token.size()) {
-                    codepoint |= (static_cast<uint8_t>(token[i + 3]) & 0x3F);
-                }
-                i += 4;
-            } else {
-                // Invalid UTF-8, skip
-                i += 1;
-                continue;
-            }
-
-            // Look up the original byte for this codepoint
-            auto it = decoder_.find(codepoint);
-            if (it != decoder_.end()) {
-                bytes.push_back(it->second);
-            } else {
-                // Not a BPE byte token - this shouldn't happen for valid Whisper output
-                // but encode the codepoint back to UTF-8 as fallback
-                if (codepoint < 0x80) {
-                    bytes.push_back(static_cast<uint8_t>(codepoint));
-                } else if (codepoint < 0x800) {
-                    bytes.push_back(static_cast<uint8_t>(0xC0 | (codepoint >> 6)));
-                    bytes.push_back(static_cast<uint8_t>(0x80 | (codepoint & 0x3F)));
-                } else if (codepoint < 0x10000) {
-                    bytes.push_back(static_cast<uint8_t>(0xE0 | (codepoint >> 12)));
-                    bytes.push_back(static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3F)));
-                    bytes.push_back(static_cast<uint8_t>(0x80 | (codepoint & 0x3F)));
-                } else {
-                    bytes.push_back(static_cast<uint8_t>(0xF0 | (codepoint >> 18)));
-                    bytes.push_back(static_cast<uint8_t>(0x80 | ((codepoint >> 12) & 0x3F)));
-                    bytes.push_back(static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3F)));
-                    bytes.push_back(static_cast<uint8_t>(0x80 | (codepoint & 0x3F)));
-                }
-            }
-        }
-
-        // The resulting bytes are the actual UTF-8 text
-        return std::string(bytes.begin(), bytes.end());
-    }
-
-private:
-    std::unordered_map<uint32_t, uint8_t> decoder_;
-};
-
-// Global instance (thread-safe initialization in C++11+)
-static const GPT2ByteDecoder& get_gpt2_decoder() {
-    static GPT2ByteDecoder decoder;
-    return decoder;
-}
-
-/**
- * @brief Clean a text token by removing GPT-2 BPE markers entirely (no space replacement)
- */
-std::string clean_token_raw(const std::string& token) {
-    // First decode the GPT-2 byte-level BPE encoding
-    std::string decoded = get_gpt2_decoder().decode(token);
-
-    // Then remove the space marker (now it's a regular space since we decoded it)
-    std::string processed;
-    processed.reserve(decoded.size());
-    for (size_t i = 0; i < decoded.size(); i++) {
-        // The space marker (U+0120 = Ġ) decodes to a space (0x20)
-        // But we want to remove it, not keep it
-        if (i == 0 && decoded[i] == ' ') {
-            continue;  // Skip leading space from Ġ marker
-        }
-        processed.push_back(decoded[i]);
-    }
-    return processed;
-}
-
-/**
- * @brief Clean a text token by decoding GPT-2 BPE and handling space markers
- *
- * This function:
- * 1. Decodes GPT-2 byte-level BPE encoding (converts Unicode chars to raw bytes)
- * 2. Handles the Ġ (U+0120) space marker by converting it to an actual space
- *
- * The result is proper UTF-8 text that can be displayed correctly.
- */
-std::string clean_token(const std::string& token) {
-    // Decode GPT-2 byte-level BPE to get raw UTF-8 bytes
-    std::string decoded = get_gpt2_decoder().decode(token);
-    return decoded;
-}
+// The GPT-2 byte decoder and token clean-up live in text_decode.{h,cpp},
+// shared with streaming (it had its own copy without the byte decoding).
 
 /**
  * @brief Check if token is a special non-timestamp token (language, task, etc.)
@@ -657,6 +544,66 @@ std::string Transcriber::Impl::extract_text(const std::vector<std::string>& toke
  * @param seg_start Segment start time
  * @param seg_end Segment end time
  */
+// faster-whisper splits these languages into words by character, not space.
+bool unicode_word_language(const std::string& lang) {
+    return lang == "zh" || lang == "ja" || lang == "th" || lang == "lo" || lang == "my" || lang == "yue";
+}
+
+// faster-whisper's word timing rules for one window's segments: a median word
+// length (at most 0.7 s); words longer than twice that at a sentence end are
+// cut; after a pause the first words are kept short; and a segment keeps its
+// own start or end when its edge word is too long, else follows its words.
+void apply_word_timing_rules(std::vector<Segment>& segments, float& last_speech_timestamp) {
+    std::vector<float> durations;
+    for (const auto& s : segments)
+        for (const auto& w : s.words)
+            if (w.end - w.start > 0.0f) durations.push_back(w.end - w.start);
+    if (durations.empty()) return;
+    std::nth_element(durations.begin(), durations.begin() + durations.size() / 2, durations.end());
+    float median = durations[durations.size() / 2];
+    if (durations.size() % 2 == 0) {
+        const float lower = *std::max_element(durations.begin(), durations.begin() + durations.size() / 2);
+        median = (median + lower) / 2.0f;
+    }
+    median = std::min(0.7f, median);
+    const float max_duration = median * 2.0f;
+    auto sentence_end = [](const std::string& w) {
+        static const char* marks[] = {".", "\xE3\x80\x82", "!", "\xEF\xBC\x81", "?", "\xEF\xBC\x9F"};
+        for (const char* m : marks) if (w == m) return true;
+        return false;
+    };
+    for (auto& seg : segments) {
+        auto& words = seg.words;
+        if (words.empty()) continue;
+        for (size_t i = 1; i < words.size(); ++i) {
+            if (words[i].end - words[i].start > max_duration) {
+                if (sentence_end(words[i].word)) words[i].end = words[i].start + max_duration;
+                else if (sentence_end(words[i - 1].word)) words[i].start = words[i].end - max_duration;
+            }
+        }
+        if (words[0].end - last_speech_timestamp > median * 4 &&
+            (words[0].end - words[0].start > max_duration ||
+             (words.size() > 1 && words[1].end - words[0].start > max_duration * 2))) {
+            if (words.size() > 1 && words[1].end - words[1].start > max_duration) {
+                const float boundary = std::max(words[1].end / 2, words[1].end - max_duration);
+                words[0].end = words[1].start = boundary;
+            }
+            words[0].start = std::max(0.0f, words[0].end - max_duration);
+        }
+        if (seg.start < words[0].end && seg.start - 0.5f > words[0].start) {
+            words[0].start = std::max(0.0f, std::min(words[0].end - median, seg.start));
+        } else {
+            seg.start = words[0].start;
+        }
+        if (seg.end > words.back().start && seg.end + 0.5f < words.back().end) {
+            words.back().end = std::max(words.back().start + median, seg.end);
+        } else {
+            seg.end = words.back().end;
+        }
+        last_speech_timestamp = seg.end;
+    }
+}
+
 void extract_words_from_alignment(
     Segment& seg,
     const std::vector<std::vector<float>>& alignment,
@@ -736,8 +683,7 @@ void extract_words_from_alignment(
 
         // Ensure word timing is valid and sequential
         word_start_time = std::max(word_start_time, prev_word_end);
-        word_end_time = std::max(word_end_time, word_start_time + 0.05f);  // Min 50ms per word
-        word_end_time = std::min(word_end_time, seg_end);
+        word_end_time = std::max(word_end_time, word_start_time);
 
         Word w;
         w.word = word_text;
@@ -749,39 +695,8 @@ void extract_words_from_alignment(
         prev_word_end = word_end_time;
     }
 
-    // Post-processing: Fix first word if it has excessive duration
-    // DTW often stretches the first token to fill silence at segment start
-    // Use stable-ts approach: for first word, trust the END time and estimate START
-    if (seg.words.size() >= 1 && use_new_format) {
-        Word& first = seg.words[0];
+    (void)seg_end;
 
-        // Calculate expected max duration based on word length
-        // Short words (1-3 chars): max 400ms
-        // Medium words (4-6 chars): max 600ms
-        // Long words (7+ chars): max 800ms
-        float max_expected_duration;
-        size_t word_len = first.word.length();
-        if (word_len <= 3) {
-            max_expected_duration = 0.4f;
-        } else if (word_len <= 6) {
-            max_expected_duration = 0.6f;
-        } else {
-            max_expected_duration = 0.8f;
-        }
-
-        float first_duration = first.end - first.start;
-
-        // If first word is longer than its expected max duration,
-        // the start time is likely wrong (DTW stretching into silence)
-        if (first_duration > max_expected_duration) {
-            // Estimate reasonable duration: ~100ms per character, min 200ms
-            float estimated_duration = std::max(0.2f, std::min(max_expected_duration, word_len * 0.1f));
-            float new_start = first.end - estimated_duration;
-            // Don't go before segment start
-            new_start = std::max(new_start, seg_start);
-            first.start = new_start;
-        }
-    }
 }
 
 /**
@@ -808,7 +723,8 @@ std::vector<Segment> extract_timestamped_segments(
     const std::vector<std::vector<float>>& alignment,
     float chunk_start_time,
     float chunk_duration,
-    bool word_timestamps
+    bool word_timestamps,
+    bool unicode_words
 ) {
     std::vector<Segment> segments;
 
@@ -973,13 +889,40 @@ std::vector<Segment> extract_timestamped_segments(
 
                 bool starts_new_word = is_word_start(token);
                 bool is_punct = is_punctuation_only(token);
+                // Languages written without spaces (faster-whisper's list):
+                // every complete character is a word. A token that ends in the
+                // middle of a multi-byte character waits for the rest.
+                if (unicode_words && !word_buffer.empty()) {
+                    const std::string& prev = word_buffer.back().first;
+                    size_t k = prev.size(), cont = 0;
+                    while (k > 0 && (static_cast<unsigned char>(prev[k - 1]) & 0xC0) == 0x80 && cont < 3) { --k; ++cont; }
+                    bool complete = true;
+                    if (k > 0) {
+                        const unsigned char lead = static_cast<unsigned char>(prev[k - 1]);
+                        const size_t need = (lead >> 5) == 0x6 ? 1 : (lead >> 4) == 0xE ? 2 : (lead >> 3) == 0x1E ? 3 : 0;
+                        complete = cont >= need;
+                    }
+                    starts_new_word = complete;
+                }
+                // Opening punctuation goes with the next word, as faster-whisper's
+                // merge_punctuations prepends it ("(this" not "( this").
+                static const std::string prepend = "\"'\xE2\x80\x9C\xC2\xBF([{-";
+                const bool opening = is_punct && !token_text.empty() &&
+                    token_text.find_first_not_of(prepend) == std::string::npos;
 
                 if (word_buffer.empty()) {
                     // First word token - always start a new word
                     // Store text_token_idx (filtered index) for alignment lookup, not i (original index)
                     word_buffer.push_back({token_text, {text_token_idx}});
+                } else if (opening && starts_new_word) {
+                    word_buffer.push_back({token_text, {text_token_idx}});
                 } else if (is_punct) {
                     // Punctuation: attach to previous word (e.g., "them" + "," = "them,")
+                    word_buffer.back().first += token_text;
+                    word_buffer.back().second.push_back(text_token_idx);
+                } else if (!word_buffer.empty() && is_punctuation_only(word_buffer.back().first) &&
+                           word_buffer.back().first.find_first_not_of(prepend) == std::string::npos) {
+                    // The word after an opening quote or bracket joins it.
                     word_buffer.back().first += token_text;
                     word_buffer.back().second.push_back(text_token_idx);
                 } else if (!starts_new_word) {
@@ -1028,27 +971,6 @@ std::vector<Segment> extract_timestamped_segments(
     return segments;
 }
 
-// faster-whisper's compression ratio: UTF-8 bytes over zlib-compressed bytes.
-// Repetitive text compresses well, so a loop scores high (threshold 2.4).
-// Muninn used tokens/characters (~0.25 for English), which never got near 2.4.
-static float compression_ratio_of(const std::string& text) {
-    if (text.empty()) return 0.0f;
-#if MUNINN_HAVE_ZLIB
-    uLongf size = compressBound(static_cast<uLong>(text.size()));
-    std::vector<Bytef> packed(size);
-    if (compress2(packed.data(), &size, reinterpret_cast<const Bytef*>(text.data()),
-                  static_cast<uLong>(text.size()), Z_DEFAULT_COMPRESSION) != Z_OK || size == 0) {
-        return 0.0f;
-    }
-    return static_cast<float>(text.size()) / static_cast<float>(size);
-#else
-    // No zlib in this build: approximate with distinct 4-grams (a loop repeats them).
-    if (text.size() < 8) return 1.0f;
-    std::set<std::string> grams;
-    for (size_t i = 0; i + 4 <= text.size(); ++i) grams.insert(text.substr(i, 4));
-    return static_cast<float>(text.size() - 3) / static_cast<float>(std::max<size_t>(1, grams.size()));
-#endif
-}
 
 
 bool Transcriber::Impl::is_hallucination(
@@ -1861,8 +1783,14 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                         }
 
                         if (!text_tokens.empty()) {
-                            // Build start sequence: just [sot_id] for alignment
-                            std::vector<size_t> start_sequence = {sot_id};
+                            // The start sequence as decoded (sot, language, task),
+                            // as faster-whisper aligns; it used to be sot alone.
+                            std::vector<size_t> start_sequence;
+                            for (const auto& t : sot_sequence(options)) {
+                                auto it = token_to_id.find(t);
+                                if (it != token_to_id.end()) start_sequence.push_back(it->second);
+                            }
+                            if (start_sequence.empty()) start_sequence = {sot_id};
 
                             // Number of mel frames in this chunk
                             std::vector<size_t> num_frames_vec = {static_cast<size_t>(n_frames)};
@@ -1928,7 +1856,9 @@ std::vector<Segment> Transcriber::Impl::transcribe_chunk(
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
                     result.sequences[0], token_ids, alignment_data,
-                    chunk_start_time, chunk_duration, options.word_timestamps);
+                    chunk_start_time, chunk_duration, options.word_timestamps,
+                    unicode_word_language(options.language));
+                if (options.word_timestamps) apply_word_timing_rules(timestamped_segs, last_speech_timestamp);
 
                 if (!timestamped_segs.empty()) {
                     // Use Whisper's native timestamp tokens for accurate timing
@@ -2140,7 +2070,12 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
         std::vector<std::vector<std::vector<float>>> alignment_data_per_b(batch_size);
         if (any_alignable) {
             try {
-                std::vector<size_t> start_sequence = {sot_id};
+                std::vector<size_t> start_sequence;
+                for (const auto& t : sot_sequence(options)) {
+                    auto it = token_to_id.find(t);
+                    if (it != token_to_id.end()) start_sequence.push_back(it->second);
+                }
+                if (start_sequence.empty()) start_sequence = {sot_id};
                 ctranslate2::dim_t median_filter_width = 7;
                 auto align_futures = model->align(features, start_sequence,
                                                    all_text_tokens, all_num_frames,
@@ -2240,7 +2175,9 @@ std::vector<std::vector<Segment>> Transcriber::Impl::transcribe_batch(
                 // Try to extract timestamped segments from Whisper's output
                 auto timestamped_segs = extract_timestamped_segments(
                     result.sequences[0], token_ids, alignment_data,
-                    chunk_start_time, chunk_duration, options.word_timestamps);
+                    chunk_start_time, chunk_duration, options.word_timestamps,
+                    unicode_word_language(options.language));
+                if (options.word_timestamps) apply_word_timing_rules(timestamped_segs, last_speech_timestamp);
 
                 size_t num_tokens = result.sequences_ids[0].size();
 
@@ -3061,6 +2998,7 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
     TranscribeResult result;
     failed_windows = 0;
     last_error.clear();
+    last_speech_timestamp = 0.0f;
 
     auto check_cancelled = [this, &result]() -> bool {
         if (cancelled.load(std::memory_order_acquire)) {
@@ -3088,14 +3026,23 @@ TranscribeResult Transcriber::Impl::transcribe_from_prepared(
     // runs. A cancelled run used to return them on the VAD-joined timeline.
     auto finish = [&]() -> TranscribeResult {
         if (!speech_segments.empty()) {
+            // As faster-whisper restores them: each word by the region its
+            // middle falls in (a word on a join no longer spans the silence
+            // between), and a segment with words is the span of its words.
+            const SpeechTimestampsMap ts_map(speech_segments);
             for (auto& seg : result.segments) {
-                seg.start = remap_timestamp_to_original(seg.start, speech_segments);
-                seg.end = remap_timestamp_to_original(seg.end, speech_segments);
-                for (auto& word : seg.words) {
-                    word.start = remap_timestamp_to_original(word.start, speech_segments);
-                    word.end = remap_timestamp_to_original(word.end, speech_segments);
+                if (!seg.words.empty()) {
+                    for (auto& word : seg.words) {
+                        const size_t chunk = ts_map.chunk_index((word.start + word.end) / 2.0);
+                        word.start = ts_map.original(word.start, chunk);
+                        word.end = ts_map.original(word.end, chunk);
+                    }
+                    seg.start = seg.words.front().start;
+                    seg.end = seg.words.back().end;
+                } else {
+                    seg.start = ts_map.original(seg.start);
+                    seg.end = ts_map.original(seg.end, /*is_end=*/true);
                 }
-                tighten_to_words(seg);
             }
             filter_silence_hallucinations(result.segments, speech_segments,
                                           options.hallucination_silence_threshold);

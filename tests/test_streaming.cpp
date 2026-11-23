@@ -274,8 +274,18 @@ void test_audio_buffer_concurrent() {
     const auto end = buffer.peek();
     CHECK(end.front + end.available == kTotal);  // everything pushed is accounted for
     CHECK(end.available == 0);
-    CHECK(buffer.dropped() > 0);                  // the small buffer did overflow
     CHECK(buffer.dropped() <= kTotal);
+
+    // Overflow itself, without depending on which thread the scheduler ran
+    // faster (the concurrent part above only overflows when the consumer
+    // happens to fall behind): push past the capacity with nobody reading.
+    {
+        AudioBuffer small(1000);
+        std::vector<float> lots(2500, 1.0f);
+        small.push(lots.data(), lots.size());
+        CHECK(small.dropped() == 1500);
+        CHECK(small.peek().available == 1000);
+    }
 }
 
 void test_audio_buffer_generation() {
