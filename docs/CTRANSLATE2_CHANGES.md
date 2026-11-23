@@ -6,8 +6,12 @@ Muninn builds against CTranslate2 **4.9.1** with a local patch,
 which follows them). The tree lives in `third_party/CTranslate2-4.9.1`, which is
 not tracked in git.
 
-The 4.9.1 patch is the 4.8.3 patch rebased; only `replica_pool.h` needed changes.
-The patches for 4.8.3 and 4.7.1 are kept beside it for reference.
+The 4.9.1 patch is the 4.8.3 patch rebased (only `replica_pool.h` needed changes),
+minus one hunk: the older patches also sent float32 GEMM through `cublasGemmEx`
+with `CUBLAS_GEMM_DEFAULT_TENSOR_OP` in `src/cuda/primitives.cu`, which lets
+cuBLAS round float32 inputs down. The accuracy clips came out byte-identical
+without it (audit item C2), so CTranslate2's own float32 GEMM is used. The
+patches for 4.8.3 and 4.7.1 are kept beside it for reference.
 
 ## What the patch changes
 
@@ -17,7 +21,6 @@ The patches for 4.8.3 and 4.7.1 are kept beside it for reference.
 | `include/ctranslate2/replica_pool.h` | `ReplicaPool::release_gpu_memory()`. `detach_models()` also calls `prepare_shutdown()` on each worker. `ReplicaWorker` gets an atomic `_shutting_down` flag: `idle()` returns early once it is set, and `prepare_shutdown()` and `finalize()` set it. Upstream's `synchronize_stream_nothrow` in `idle()` and `destroy_context()` in `finalize()` are kept. |
 | `include/ctranslate2/thread_pool.h`, `src/thread_pool.cc` | `Worker::join(int timeout_ms = 5000)`: if the worker thread doesn't finish in time it is detached, with a warning on stderr. A virtual `Worker::prepare_shutdown()`, called on every worker by `~ThreadPool()` before the queue is closed. `JobQueue::get()` doesn't call `before_wait()` (the idle stream sync) once the queue is closing, and releases the lock while it runs. |
 | `src/dtw.cc` | Bounds checks in the DTW backtrace used for word alignment: an out-of-range index throws instead of reading past the trace, and no negative pairs are emitted. |
-| `src/cuda/primitives.cu` | float32 GEMM (plain and strided-batched) goes through `cublasGemmEx` / `cublasGemmStridedBatchedEx` with `CUBLAS_GEMM_DEFAULT_TENSOR_OP` instead of `cublasSgemm`. Older notes called this "CUDA 13 changes"; it is a precision setting that lets cuBLAS use tensor cores (TF32 on Ampere and newer), which can round float32 inputs down. Whether it costs accuracy has not been measured yet (audit item C2 in [CODE_AUDIT_2026-11.md](CODE_AUDIT_2026-11.md)). |
 
 ## Why
 
