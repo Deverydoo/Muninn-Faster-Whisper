@@ -4,7 +4,7 @@ Real-time transcription API for live captions, subtitles, and voice commands.
 
 ## Overview
 
-`StreamingTranscriber` processes audio incrementally with low latency (~500ms-2s), suitable for:
+`StreamingTranscriber` processes audio as it arrives, with a delay of about one window (2 s by default) plus the decode time. It suits:
 
 - **Live captions** in OBS/streaming software
 - **Real-time subtitles** for videos
@@ -53,7 +53,9 @@ public:
 
     void start(const StreamingOptions& options = {},
                StreamingCallback callback = nullptr);
-    std::vector<Segment> stop();          // decodes what's buffered; returns every segment
+    // Decodes the audio still buffered (unless the callback returned false),
+    // then returns every segment since start() or the last reset().
+    std::vector<Segment> stop();
     bool is_active() const;
 
     // Never waits for a decode. Any channel count (averaged to mono), any
@@ -82,7 +84,7 @@ struct StreamingOptions {
     int beam_size = 5;
     float temperature = 0.0f;
 
-    float chunk_length_s = 2.0f;       // window length (at most 30 s)
+    float chunk_length_s = 2.0f;       // window length (0.5 to 30 s)
     float overlap_s = 0.5f;            // windows overlap by this (at most half a window)
     bool enable_vad = true;
     VADType vad_type = VADType::Energy;
@@ -244,8 +246,9 @@ muninn::StreamingOptions opts;
 opts.enable_vad = true;
 opts.vad_type = muninn::VADType::Energy;  // Fast, no dependencies
 
-// Or use Silero for better accuracy
+// Or Silero, which needs its model file
 // opts.vad_type = muninn::VADType::Silero;
+// opts.vad_model_path = "models/silero_vad.onnx";
 
 stream.start(opts);
 ```
@@ -271,13 +274,7 @@ std::cout << "Latency: " << stats.average_latency_ms << "ms\n";
 std::cout << "Buffer: " << (stats.buffer_fill_ratio * 100) << "%\n";
 ```
 
-## Performance
-
-- **Latency**: 500ms-2s depending on `chunk_length_s`
-- **Memory**: ~500MB model + buffers
-- **CPU Usage**: Minimal (most work on GPU)
-
-### Tuning Latency
+## Tuning Latency
 
 Every window is padded to 30 s before decoding, as Whisper expects, so a short
 window costs a full encoder pass: halving `chunk_length_s` roughly doubles the
@@ -286,7 +283,7 @@ GPU work.
 ```cpp
 muninn::StreamingOptions opts;
 
-// Lower latency (more CPU, less context)
+// Lower latency (more decoding work, less context)
 opts.chunk_length_s = 0.5f;   // Process every 500ms
 opts.overlap_s = 0.1f;         // Minimal overlap
 
@@ -308,7 +305,7 @@ opts.overlap_s = 1.0f;          // 1s overlap for context
 
 | Feature | StreamingTranscriber | Transcriber (Batch) |
 |---------|---------------------|-------------------|
-| Latency | 500ms-2s | Processes full file |
+| Latency | About one window plus decode time | Processes the whole file |
 | Use Case | Live captions, real-time | Post-production, archival |
 | Memory | Low (buffers chunks) | High (full audio) |
 | Word timestamps | Yes | Yes |
@@ -324,7 +321,7 @@ opts.overlap_s = 1.0f;          // 1s overlap for context
 
 stream.start(opts);
 // ... push audio ...
-auto segments = stream.stop();   // every segment of the session
+auto segments = stream.stop();   // every segment since start()
 
 muninn::SubtitleExporter exporter;
 exporter.export_srt(segments, "recording.mp4");   // writes recording.srt beside it
@@ -347,6 +344,4 @@ exporter.export_srt(segments, "recording.mp4");   // writes recording.srt beside
 
 ## License
 
-Business Source License 1.1 - Free for personal/academic use
-
-Commercial licensing: craig@nordiqai.io
+Business Source License 1.1, free for non-commercial use. Commercial licensing: craig@nordiqai.io

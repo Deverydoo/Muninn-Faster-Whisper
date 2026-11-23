@@ -1,16 +1,42 @@
-# Thread Safety Audit Report
+# Thread Safety Audit Report (December 2024)
 
-**Audit Date:** December 2024
-**Auditor:** Claude Code
-**Project:** Muninn Faster-Whisper
+> **Historical report.** This is the thread-safety review of December 2024.
+> It is superseded by [CODE_AUDIT_2026-11.md](CODE_AUDIT_2026-11.md). The
+> sections below are kept as written except where a claim is no longer true;
+> those are corrected and listed here.
+>
+> What changed since:
+> - **Transcriber cancel flag:** cleared when `transcribe()` returns, not at
+>   its start, so a `cancel()` sent just before a run counts. Partial results
+>   of a cancelled run get the same timestamp restore as a full run.
+> - **Transcriber unload:** `transcribe()` holds a shared lock on the model
+>   for the whole run and `unload_model()` takes it exclusively, so unloading
+>   waits for a running transcription instead of freeing the model under it
+>   (its `timeout_ms` is currently not used). `clear_cache()` checks for a
+>   null implementation before locking.
+> - **Translator:** `translate_batch()` holds a shared lock for the whole
+>   decode; `unload_model()` and `shutdown()` take it exclusively.
+>   `unload_model(timeout_ms)` asks a running batch to stop at its next chunk
+>   and returns `false` if it can't get the lock in time. The cancel flag
+>   stays set until `reset_cancel()`.
+> - **Logger:** thread-safe. The callback is swapped under a mutex and called
+>   outside the lock (so it may log itself); without a callback every level
+>   goes to stderr, one whole line at a time.
+> - **StreamingTranscriber:** rewritten in November 2026. Audio goes into a
+>   buffer with its own short lock; `push_audio()` never waits for a decode;
+>   callbacks run with no lock held; `start()`/`stop()` throw
+>   `std::logic_error` when called from a callback.
+> - **Language tables** (translator) are function-local statics, initialised
+>   once by the compiler; the `std::call_once` code quoted below is gone.
 
 ## Executive Summary
 
-Muninn provides a mixed thread-safety model:
-- **Cancellation API**: Thread-safe via `std::atomic<bool>` with proper memory ordering
-- **StreamingTranscriber**: Thread-safe for producer/consumer pattern
-- **Transcriber/Translator instances**: NOT thread-safe for concurrent operations on the same instance
-- **Static methods**: Thread-safe
+- **Cancellation API:** thread-safe (`std::atomic<bool>`, release/acquire).
+- **StreamingTranscriber:** thread-safe for one producer pushing audio and
+  other threads polling or reading results.
+- **Transcriber / Translator:** one operation at a time per instance. Calling
+  `unload_model()` from another thread during a run is safe (see above).
+- **Static methods:** thread-safe.
 
 ---
 
@@ -18,327 +44,138 @@ Muninn provides a mixed thread-safety model:
 
 ### 1. Transcriber (`src/transcriber.cpp`)
 
-#### Thread-Safe Components
+#### Thread-safe
 
 | Component | Mechanism | Notes |
 |-----------|-----------|-------|
-| `cancel()` | `std::atomic<bool>` with `memory_order_release` | Safe to call from any thread |
-| `reset_cancel()` | `std::atomic<bool>` with `memory_order_release` | Safe to call from any thread |
-| `is_cancelled()` | `std::atomic<bool>` with `memory_order_acquire` | Safe to call from any thread |
-| `get_audio_info()` | Static method | Thread-safe (no shared state) |
+| `cancel()`, `reset_cancel()`, `is_cancelled()` | `std::atomic<bool>` | Any thread |
+| `unload_model()` | exclusive lock on the inference mutex | Waits for a running `transcribe()` |
+| `get_audio_info()` | static, no shared state | |
 
-#### NOT Thread-Safe
+#### Not thread-safe
 
 | Component | Issue | Recommendation |
 |-----------|-------|----------------|
-| `transcribe()` | No mutex protection on `pimpl_->model`, mel converter, or VAD instances | Do NOT call concurrently on same instance |
-| `pimpl_->model` | CTranslate2 Whisper model is not thread-safe | One transcription at a time per instance |
-| `pimpl_->mel_converter` | MelSpectrogram instance has no internal synchronization | One transcription at a time per instance |
+| `transcribe()` | Concurrent calls on one instance share the mel converter and per-run state (the inference lock is shared, so it doesn't serialise them) | One transcription at a time per instance |
 
-#### Cancellation Implementation (CORRECT)
-
-```cpp
-// In Impl class:
-std::atomic<bool> cancelled{false};
-
-// In transcribe():
-pimpl_->cancelled.store(false, std::memory_order_release);  // Auto-reset at start
-
-// Check before each batch:
-if (pimpl_->cancelled.load(std::memory_order_acquire)) {
-    result.was_cancelled = true;
-    return result;
-}
-
-// Public cancel():
-void Transcriber::cancel() {
-    pimpl_->cancelled.store(true, std::memory_order_release);
-}
-```
-
-**Verdict:** The cancellation implementation is correct and safe. The `release/acquire` memory ordering ensures visibility across threads.
+The cancellation implementation uses `memory_order_release` in `cancel()` and
+`memory_order_acquire` at each check, which is correct.
 
 ---
 
 ### 2. Translator (`src/translator.cpp`)
 
-#### Thread-Safe Components
+#### Thread-safe
 
 | Component | Mechanism | Notes |
 |-----------|-----------|-------|
-| `cancel()` | `std::atomic<bool>` with `memory_order_release` | Safe to call from any thread |
-| `reset_cancel()` | `std::atomic<bool>` with `memory_order_release` | Safe to call from any thread |
-| `is_cancelled()` | `std::atomic<bool>` with `memory_order_acquire` | Safe to call from any thread |
-| `shutdown()` | `std::atomic<bool>` exchange for one-time execution | Safe shutdown pattern |
-| Static methods | `to_nllb_code()`, `from_nllb_code()`, `supported_languages()` | Thread-safe |
+| `cancel()`, `reset_cancel()`, `is_cancelled()` | `std::atomic<bool>` | Any thread |
+| `unload_model()`, `shutdown()` | exclusive lock on the model | Stop and wait for a running batch |
+| `to_nllb_code()`, `from_nllb_code()`, `supported_languages()` | static, read-only tables | |
 
-#### NOT Thread-Safe
+#### Not thread-safe
 
-| Component | Issue | Recommendation |
-|-----------|-------|----------------|
-| `translate()` / `translate_batch()` | No mutex on CTranslate2 model | One translation at a time per instance |
-| `pimpl_->model` | CTranslate2 Translator is not thread-safe | Create separate instances for parallel translation |
-
-#### Static Variable Safety
-
-```cpp
-// Thread-safe initialization of reverse mapping
-static std::unordered_map<std::string, std::string> NLLB_TO_CODE;
-static std::once_flag reverse_mapping_once;
-
-static void init_reverse_mapping() {
-    std::call_once(reverse_mapping_once, []() {
-        for (const auto& pair : CODE_TO_NLLB) {
-            NLLB_TO_CODE[pair.second] = pair.first;
-        }
-    });
-}
-```
-
-**Verdict:** Static variable initialization is correctly protected by `std::call_once`.
+| Component | Recommendation |
+|-----------|----------------|
+| `translate()` / `translate_batch()` from several threads on one instance | Not tested; use one at a time, or separate instances |
+| Destroying the Translator while another thread is inside one of its methods | Not allowed |
 
 ---
 
 ### 3. StreamingTranscriber (`src/streaming_transcriber.cpp`)
 
-#### Thread-Safe Components
+| Component | Notes |
+|-----------|-------|
+| `push_audio()` | Any thread; calls from several threads are serialised; never waits for a decode |
+| `poll_segment()`, `get_all_segments()`, `get_current_text()`, `get_stats()`, `last_error()` | Any thread, also from the callbacks |
+| `reset()` | Any thread, also from a callback |
+| `start()`, `stop()` | Not from a callback (they throw `std::logic_error`) |
+| Segment and error callbacks | Run on the worker thread with no lock held |
 
-| Component | Mechanism | Notes |
-|-----------|-----------|-------|
-| `push_audio()` | `std::mutex` on all buffer access | **Thread-safe** - can call from audio thread |
-| `poll_segment()` | `std::mutex` on segment queue | **Thread-safe** - can call from main thread |
-| `get_all_segments()` | `std::mutex` on completed segments | Thread-safe |
-| `get_current_text()` | `std::mutex` on completed segments | Thread-safe |
-| `get_stats()` | `std::mutex` on stats access | Thread-safe |
-| `reset()` | `std::mutex` on all state | Thread-safe |
-| `is_active()` | `std::atomic<bool>` | Thread-safe |
-| Stop signaling | `std::atomic<bool> stop_requested_` | Thread-safe |
-
-#### Implementation Pattern (Producer/Consumer)
-
-```cpp
-class StreamingTranscriber::Impl {
-    mutable std::mutex mutex_;
-    std::atomic<bool> active_;
-    std::atomic<bool> stop_requested_;
-    std::thread worker_;
-
-    // Protected by mutex_:
-    std::vector<float> audio_buffer_;
-    std::vector<Segment> completed_segments_;
-    std::deque<Segment> pending_segments_;
-};
-```
-
-#### Thread Communication Flow
-
-```
-Audio Thread                    Worker Thread                 UI Thread
-     │                               │                            │
-     │ push_audio()                  │                            │
-     │───[mutex]──►audio_buffer_     │                            │
-     │                               │                            │
-     │                 ┌─[mutex]─────┤                            │
-     │                 │ process_buffered_audio()                 │
-     │                 │     │                                    │
-     │                 │     ▼                                    │
-     │                 │ pending_segments_                        │
-     │                 └─────────────┤                            │
-     │                               │                            │
-     │                               │              poll_segment()│
-     │                               │◄──────[mutex]──────────────┤
-     │                               │                            │
-     │                               │      stop_requested_ = true│
-     │                               │◄──────[atomic]─────────────┤
-```
-
-**Verdict:** StreamingTranscriber is properly thread-safe for the producer/consumer pattern.
+Details are in [STREAMING_API.md](STREAMING_API.md).
 
 ---
 
 ### 4. VAD Components
 
-#### Energy VAD (`src/vad.cpp`)
-
-**Thread Safety:** NOT thread-safe
-
-- No mutex protection
-- Instance variable `silence_removed_` is modified during processing
-- Safe if: One VAD instance per thread, or external synchronization
-
-#### Silero VAD (`src/silero_vad.cpp`)
-
-**Thread Safety:** NOT thread-safe
-
-- ONNX Runtime session is not thread-safe
-- Internal state vectors (`state_`, `context_`) are modified during inference
-- Safe if: One SileroVAD instance per thread
-
-#### Recommendation
-
-VAD instances are created locally within `Transcriber::transcribe()`, so they are thread-safe by virtue of being stack-local to each transcription call.
+`VAD` (energy) and `SileroVAD` keep state between calls (Silero's recurrent
+state, `silence_removed_`), so one instance must not be used from two threads
+at once. The transcriber creates them per track, so this only matters when you
+use them directly.
 
 ---
 
 ### 5. MelSpectrogram (`src/mel_spectrogram.cpp`)
 
-**Thread Safety:** Conditionally safe
-
-- Constructor creates immutable lookup tables (`hann_window_`, `mel_filters_`)
-- `compute()` only reads from these tables
-- **Thread-safe for concurrent reads** after construction
-
-However, the `Transcriber::Impl::mel_converter` member is shared, so concurrent `transcribe()` calls on the same Transcriber instance would have undefined behavior if MelSpectrogram were modified (currently safe since `compute()` is read-only).
+The window and filterbank are built in the constructor and only read by
+`compute()`. The transcriber's converter is a member shared by every run of
+that instance, which is one more reason not to run two transcriptions on one
+instance at once.
 
 ---
 
-## Shared/Static State Analysis
+## Shared/Static State
 
-### Safe Static Variables
+| State | Protection |
+|-------|------------|
+| Translator language tables | `const` / function-local statics |
+| `Logger` callback and file | mutex (since November 2026) |
+| `CaptionRouter` engine list | `std::shared_mutex` (since November 2026) |
 
-| Variable | Location | Protection |
-|----------|----------|------------|
-| `CODE_TO_NLLB` | translator.cpp | `const` (immutable) |
-| `SUPPORTED_LANGUAGES` | translator.cpp | `const` (immutable) |
-| `NLLB_TO_CODE` | translator.cpp | `std::call_once` |
-
-### Potential Issues
-
-1. **Global Logger**: If `Logger::info()` / `Logger::error()` write to shared state (file/stream), they need internal synchronization.
-
-2. **CUDA Context**: CTranslate2 manages CUDA context internally. Creating multiple Transcriber/Translator instances on different threads for the same GPU may require CTranslate2's built-in synchronization.
+CTranslate2 manages the CUDA context itself. Several instances on one GPU
+work, but each loads its own copy of the model.
 
 ---
 
 ## Usage Patterns
 
-### SAFE: UI Cancel Pattern
+### Safe: cancel from the UI
 
 ```cpp
-// Worker thread
-std::thread worker([&transcriber, &audio_path, &options]() {
+std::thread worker([&] {
     auto result = transcriber.transcribe(audio_path, options);
-    if (result.was_cancelled) {
-        // Handle partial results
-    }
+    if (result.was_cancelled) { /* partial results */ }
 });
 
-// UI thread (e.g., button click)
-void onCancelClicked() {
-    transcriber.cancel();  // Thread-safe!
-}
+void onCancelClicked() { transcriber.cancel(); }
 ```
 
-### SAFE: Streaming Pattern
+### Safe: streaming
 
 ```cpp
-// Audio callback thread (from OS/driver)
 void onAudioData(const float* samples, size_t count) {
-    streamer.push_audio(samples, count, 48000, 2);  // Thread-safe!
+    streamer.push_audio(samples, count, 48000, 2);   // count = frames x channels
 }
 
-// Main/UI thread
 void pollForCaptions() {
-    Segment seg;
-    while (streamer.poll_segment(seg)) {  // Thread-safe!
-        displayCaption(seg.text);
-    }
+    muninn::Segment seg;
+    while (streamer.poll_segment(seg)) displayCaption(seg.text);
 }
 ```
 
-### UNSAFE: Concurrent Transcription
+### Unsafe: two transcriptions on one instance
 
 ```cpp
-// DON'T DO THIS - Same instance, multiple threads
-std::thread t1([&]() { transcriber.transcribe("file1.mp3", opts); });
-std::thread t2([&]() { transcriber.transcribe("file2.mp3", opts); });  // RACE CONDITION!
+std::thread t1([&] { transcriber.transcribe("file1.mp3", opts); });
+std::thread t2([&] { transcriber.transcribe("file2.mp3", opts); });  // don't
 ```
 
-### SAFE: Parallel Transcription (Separate Instances)
+### Safe: separate instances
 
 ```cpp
-// DO THIS - Separate instances
-Transcriber t1("models/whisper");
-Transcriber t2("models/whisper");
-
-std::thread thread1([&]() { t1.transcribe("file1.mp3", opts); });
-std::thread thread2([&]() { t2.transcribe("file2.mp3", opts); });  // SAFE
+muninn::Transcriber a("models/whisper"), b("models/whisper");
+std::thread t1([&] { a.transcribe("file1.mp3", opts); });
+std::thread t2([&] { b.transcribe("file2.mp3", opts); });
 ```
-
----
-
-## Recommendations
-
-### 1. Document Thread Safety in Headers
-
-Add thread-safety annotations to public headers:
-
-```cpp
-/**
- * @brief Request cancellation of ongoing transcription
- *
- * Thread Safety: SAFE - Can be called from any thread.
- */
-void cancel();
-
-/**
- * @brief Transcribe audio from file
- *
- * Thread Safety: NOT safe for concurrent calls on the same instance.
- * Create separate Transcriber instances for parallel transcription.
- */
-TranscribeResult transcribe(...);
-```
-
-### 2. Consider Adding Instance-Level Mutex (Optional)
-
-If users need concurrent `transcribe()` calls on the same instance (unlikely but possible), add:
-
-```cpp
-class Transcriber::Impl {
-    std::mutex transcribe_mutex_;  // Serialize transcribe() calls
-};
-
-TranscribeResult Transcriber::transcribe(...) {
-    std::lock_guard<std::mutex> lock(pimpl_->transcribe_mutex_);
-    // ... existing implementation
-}
-```
-
-**Trade-off:** This would queue concurrent calls rather than reject them. Consider if this is the desired behavior.
-
-### 3. Validate Logger Thread Safety
-
-Ensure `Logger::info()` and `Logger::error()` either:
-- Use `std::mutex` internally, OR
-- Use `std::osyncstream` (C++20), OR
-- Write to thread-local buffers
 
 ---
 
 ## Summary Table
 
-| Class | Concurrent Instances | Same Instance | Cancel API |
-|-------|---------------------|---------------|------------|
-| Transcriber | SAFE | NOT SAFE | SAFE |
-| Translator | SAFE | NOT SAFE | SAFE |
-| StreamingTranscriber | SAFE | SAFE (designed for it) | N/A (uses callback) |
-| VAD | SAFE | NOT SAFE | N/A |
-| SileroVAD | SAFE | NOT SAFE | N/A |
-| MelSpectrogram | SAFE | SAFE (read-only) | N/A |
-
----
-
-## Conclusion
-
-Muninn's thread-safety model is appropriate for its use case:
-
-1. **The cancellation API is correctly implemented** with proper atomic operations and memory ordering.
-
-2. **StreamingTranscriber is fully thread-safe** for the producer/consumer pattern it's designed for.
-
-3. **Transcriber and Translator are single-threaded per instance**, which is a reasonable design choice given that GPU resources are typically the bottleneck.
-
-4. **For parallel transcription**, users should create separate instances, which is well-documented and works correctly.
-
-The implementation follows best practices for cooperative cancellation and doesn't introduce any thread-safety bugs in its current form.
+| Class | Separate instances | Same instance | Cancel |
+|-------|--------------------|---------------|--------|
+| Transcriber | Safe | One run at a time; `unload_model()` during a run is safe | Safe |
+| Translator | Safe | One batch at a time; `unload_model()`/`cancel()` during a batch are safe | Safe |
+| StreamingTranscriber | Safe | Safe (designed for it) | n/a |
+| VAD, SileroVAD | Safe | Not safe | n/a |
+| MelSpectrogram | Safe | Safe (`compute()` is read-only) | n/a |

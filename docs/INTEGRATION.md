@@ -1,128 +1,104 @@
 # Muninn Integration Guide
 
-This guide shows how to integrate Muninn Faster-Whisper into your C++ application.
+How to use muninn.dll from a C++ program on Windows.
 
-## What's New: Self-Contained Architecture
+## 1. Files
 
-Muninn now includes **built-in audio extraction** powered by FFmpeg:
-
-✅ **No external audio DLLs** - Everything you need is in muninn.dll
-✅ **Multi-format support** - MP3, WAV, M4A, FLAC, MP4, MOV, MKV, etc.
-✅ **Multi-track support** - Process videos with multiple audio tracks
-✅ **Fast extraction** - Multi-threaded FFmpeg decoder
-✅ **Smart VAD auto-detection** - Automatically selects best algorithm per track (NEW!)
-✅ **Zero configuration** - Works perfectly out-of-box with sensible defaults
-
-**Deployment is simple**: Just 2 DLLs (muninn.dll + ctranslate2.dll) + model files.
-
-## Quick Start
-
-### 1. Add to Your Project
-
-**Minimum Required Files:**
+From a release zip (or your own build):
 
 ```
-lib/
-  muninn.dll          # Main library (includes built-in audio extraction)
-  muninn.lib          # Import library (for linking)
-  ctranslate2.dll     # CTranslate2 inference engine
-
-include/muninn/
-  transcriber.h       # Main API
-  types.h             # Options and result types
-  export.h            # DLL export macros
-  audio_extractor.h   # Audio extraction API (optional)
-  mel_spectrogram.h   # MEL conversion (optional)
-  vad.h               # VAD interfaces (optional)
+bin/      muninn.dll, ctranslate2.dll, onnxruntime.dll,
+          avformat-63.dll, avcodec-63.dll, avutil-61.dll, swresample-7.dll  (FFmpeg 9.0.2, LGPL)
+lib/      muninn.lib  (import library)
+include/  muninn/*.h
+models/   silero_vad.onnx (for Silero VAD)
 ```
 
-**Optional Files (for Silero VAD):**
+muninn.dll loads all of the DLLs in `bin/` at start-up, so ship them all,
+next to your executable (not only on PATH: Windows has an older
+onnxruntime.dll in System32 that would be found first). For the GPU you also
+need the CUDA 13 runtime and cuDNN 9 DLLs, which are not included;
+[packaging/README_BINARIES.txt](../packaging/README_BINARIES.txt) lists them,
+with the driver and GPU requirements. Without a GPU, `device = "cpu"` works,
+much more slowly.
 
-```
-lib/
-  onnxruntime.dll     # ONNX Runtime (only if using Silero VAD)
-```
+Your program must be built the way muninn.dll is, because the API passes
+`std::string`, `std::vector`, `std::function` and exceptions across the DLL:
+C++17, MSVC 2022 17.10 or newer, x64, Release with `/MD`. Call
+`muninn::check_version()` once at start-up; it throws if the DLL and the
+headers come from different releases.
 
-**Note:** Muninn now has **built-in audio extraction** - no separate Heimdall DLL needed!
+## 2. CMake
 
-### 2. Link in CMake
+There is no CMake package to `find_package()`. Point at the files:
 
 ```cmake
-target_link_libraries(your_app PRIVATE
-    ${CMAKE_SOURCE_DIR}/lib/muninn.lib
-)
-
-target_include_directories(your_app PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-)
+target_include_directories(your_app PRIVATE ${MUNINN_DIR}/include)
+target_link_libraries(your_app PRIVATE ${MUNINN_DIR}/lib/muninn.lib)
 ```
 
-### 3. Basic Usage
+## 3. Basic use
 
 ```cpp
 #include <muninn/transcriber.h>
+#include <muninn/version.h>
 #include <iostream>
 
 int main() {
-    // Initialize transcriber
+    muninn::check_version();
+
     muninn::Transcriber transcriber(
-        "path/to/faster-whisper-large-v3-turbo",  // Model path
-        "cuda",                                    // Device: "cuda", "cpu", "auto"
-        "float16"                                  // Precision: "float16", "int8", "float32"
-    );
+        "models/faster-whisper-large-v3-turbo",  // CTranslate2 model folder
+        "cuda",                                  // "cuda", "cpu" or "auto"
+        "float16");                              // float16 becomes float32 on the CPU
 
-    // Transcribe a file
-    auto result = transcriber.transcribe("audio.mp3");
+    auto result = transcriber.transcribe("video.mp4");
 
-    // Print results
     std::cout << "Language: " << result.language << "\n";
-    std::cout << "Duration: " << result.duration << "s\n\n";
-
-    for (const auto& segment : result.segments) {
-        std::cout << "[" << segment.start << "s] " << segment.text << "\n";
+    for (const auto& seg : result.segments) {
+        std::cout << "[" << seg.track_id << "] " << seg.start << "s " << seg.text << "\n";
     }
-
-    return 0;
 }
 ```
 
-## API Reference
+## API reference
 
-### Transcriber Class
+### Transcriber
 
 ```cpp
 namespace muninn {
 
 class Transcriber {
 public:
-    // Constructor with ModelOptions (recommended)
     explicit Transcriber(const ModelOptions& options);
-
-    // Convenience constructor
     Transcriber(const std::string& model_path,
                 const std::string& device = "cuda",
                 const std::string& compute_type = "float16");
 
-    // Transcribe from file (supports MP3, WAV, MP4, MOV, etc.)
-    TranscribeResult transcribe(
-        const std::string& audio_path,
-        const TranscribeOptions& options = {},
-        ProgressCallback progress_callback = nullptr
-    );
+    // Every audio track of a file (MP3, WAV, M4A, FLAC, MP4, MOV, MKV, ...)
+    TranscribeResult transcribe(const std::string& audio_path,
+                                const TranscribeOptions& options = {},
+                                ProgressCallback progress_callback = nullptr);
 
-    // Transcribe from memory
-    TranscribeResult transcribe(
-        const std::vector<float>& audio_samples,
-        int sample_rate = 16000,
-        const TranscribeOptions& options = {},
-        int track_id = 0
-    );
+    // One track already in memory (mono float at 16 kHz; other rates throw)
+    TranscribeResult transcribe(const std::vector<float>& audio_samples,
+                                int sample_rate = 16000,
+                                const TranscribeOptions& options = {},
+                                int track_id = 0,
+                                int total_tracks = 1,
+                                ProgressCallback progress_callback = nullptr);
 
-    // Get audio file info without transcribing
-    static AudioInfo get_audio_info(const std::string& audio_path);
-
-    // Get model metadata
+    static AudioInfo get_audio_info(const std::string& audio_path);  // always throws in this build; use AudioExtractor
     ModelInfo get_model_info() const;
+    DeviceInfo get_device_info() const;
+
+    void cancel();            // see CANCELLATION_API.md
+    void reset_cancel();
+    bool is_cancelled() const;
+
+    void unload_model(int timeout_ms = 3000);  // waits for a running transcribe()
+    void clear_cache();
+    std::vector<size_t> encode(const std::string& text) const;
 };
 
 }
@@ -130,64 +106,70 @@ public:
 
 ### TranscribeOptions
 
+The full list with defaults is in `include/muninn/types.h`. The ones most
+programs set:
+
 ```cpp
 muninn::TranscribeOptions options;
 
-// Language
-options.language = "auto";           // Auto-detect, or "en", "es", "ja", etc.
-options.task = "transcribe";         // "transcribe" or "translate" (to English)
+options.language = "auto";            // or "en", "es", "ja", ...; an unknown code throws
+options.task = "transcribe";          // or "translate" (into English)
 
-// Decoding
-options.beam_size = 5;               // Beam search width (1-10)
-options.temperature = 0.0f;          // 0 = greedy, >0 = sampling
+options.beam_size = 5;
+options.temperature_fallback = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
+options.best_of = 5;                  // samples per window above temperature 0
 
-// Voice Activity Detection (Auto-detection is DEFAULT)
-options.vad_type = muninn::VADType::Auto;    // Smart auto-selection (DEFAULT)
-// options.vad_type = muninn::VADType::Energy;  // Force Energy VAD (music + speech)
-// options.vad_type = muninn::VADType::Silero;  // Force Silero VAD (clean speech only)
-// options.vad_type = muninn::VADType::None;    // Disable VAD
-options.silero_model_path = "models/silero_vad.onnx";  // Needed if Auto chooses Silero
+options.vad_type = muninn::VADType::Auto;              // see VAD_API.md
+options.silero_model_path = "models/silero_vad.onnx";  // lets Auto use Silero
 
-// Quality filtering
-options.compression_ratio_threshold = 2.4f;  // Filter hallucinations
-options.no_speech_threshold = 0.4f;          // Skip silent segments
-
-// Timestamps
-options.word_timestamps = false;     // Enable word-level timing
-
-// Performance
-options.batch_size = 4;              // GPU batch size
+options.word_timestamps = true;       // Segment::words
+options.initial_prompt = "Names: Icarus, Tusker";
+options.clip_start = 60.0f;           // seconds; clip_end = -1 for the rest
+options.skip_tracks = {2};
+options.track_hints[1] = muninn::TrackType::Microphone;
 ```
+
+`sequential = true` (the default) decodes 30-second windows one after another
+with context, as faster-whisper does. `batch_size` only applies to the older
+batched path (`sequential = false`). `hotwords` is not used yet.
 
 ### TranscribeResult
 
 ```cpp
 struct TranscribeResult {
-    std::vector<Segment> segments;   // Transcription segments
-    std::string language;            // Detected language code
-    float language_probability;      // Detection confidence
-    float duration;                  // Audio duration in seconds
+    std::vector<Segment> segments;
+    std::string language;          // detected or given
+    float language_probability;
+    float duration;                // seconds
+    bool was_cancelled;
+    int failed_windows;            // windows whose decode threw (e.g. CUDA out of memory)
+    int failed_tracks;             // tracks that couldn't be extracted or decoded
+    std::string error;             // the last failure, "" when none
 };
 
 struct Segment {
-    int id;                   // Segment index
-    int track_id;             // Audio track (for multi-track files)
-    float start;              // Start time (seconds)
-    float end;                // End time (seconds)
-    std::string text;         // Transcribed text
-    std::vector<Word> words;  // Word timestamps (if enabled)
-
-    // Quality metrics
-    float temperature;
-    float avg_logprob;
-    float compression_ratio;
-    float no_speech_prob;
+    int id;
+    int track_id;
+    float start, end;              // seconds on the original timeline
+    std::string text;
+    std::vector<Word> words;       // with word_timestamps
+    std::string language;
+    float language_probability;
+    int speaker_id;                // -1 unless diarization assigned one
+    std::string speaker_label;
+    float speaker_confidence;
+    float temperature, avg_logprob, compression_ratio, no_speech_prob;
+    std::string translated_text, translation_target;   // filled by the caller
 };
 ```
 
+`transcribe()` throws when nothing could be transcribed. When only some
+windows or tracks fail, it returns what worked and reports the rest in
+`failed_windows`, `failed_tracks` and `error`.
+
 ## Streaming API
 
-Muninn provides a real-time streaming API for live transcription with word-level timestamps - perfect for live captions, OBS plugins, and karaoke-style word highlighting.
+`StreamingTranscriber` transcribes audio as it arrives, with word timestamps, for live captions. [STREAMING_API.md](STREAMING_API.md) has the details (windows, latency, thread rules).
 
 ### StreamingTranscriber Class
 
@@ -299,13 +281,13 @@ auto final_segments = stream.stop();
 
 ### Karaoke-Style Word Highlighting
 
-The killer feature for live captions - words light up as they're spoken:
+Highlight each word while it is spoken:
 
 ```cpp
 void render_karaoke(const muninn::Segment& seg, float current_time) {
     for (const auto& word : seg.words) {
         if (current_time >= word.start && current_time < word.end) {
-            // CURRENT WORD - HIGHLIGHT!
+            // current word: bold yellow
             std::cout << "\033[1;33m" << word.word << "\033[0m ";
         } else if (current_time > word.end) {
             // Past word - dimmed
@@ -439,40 +421,44 @@ options.overlap_s = 0.5f;
 options.beam_size = 10;          // Higher beam = better accuracy
 ```
 
-**Balanced (Default)**:
+**Defaults**:
 ```cpp
-options.chunk_length_s = 1.5f;   // 1.5s latency
-options.overlap_s = 0.3f;
+options.chunk_length_s = 2.0f;
+options.overlap_s = 0.5f;        // at most half a chunk
 options.beam_size = 5;
 ```
 
+Every window is padded to 30 seconds before decoding, so short chunks cost
+nearly as much GPU time each as long ones.
+
 ### Word Timestamp Accuracy
 
-Muninn uses CTranslate2's attention alignment data for accurate word timestamps:
-
-- **With alignment**: 95%+ accuracy using cross-attention peaks
-- **Fallback**: Even distribution if alignment unavailable (still 80%+ accurate)
-- **Automatic**: Enabled via `options.word_timestamps = true`
+Words are timed from CTranslate2's cross-attention alignment, with
+faster-whisper's word splitting and punctuation merging, as in the offline
+path. They are always aligned internally (that is how windows are joined);
+`options.word_timestamps` (default `true`) says whether they are returned.
 
 ### Thread Safety
 
-- ✅ `push_audio()` - Thread-safe, call from audio thread
-- ✅ `poll_segment()` - Thread-safe, call from any thread
-- ✅ `get_current_text()` - Thread-safe
-- ⚠️ Callback runs on worker thread - use mutex for UI updates
+- `push_audio()`: any thread, including an audio callback; never waits for a decode.
+- `poll_segment()`, `get_all_segments()`, `get_current_text()`, `get_stats()`: any thread.
+- The segment and error callbacks run on the worker thread with no lock held.
+  They may call `reset()` and the getters, but not `start()` or `stop()`
+  (those throw `std::logic_error` there). Use your own lock for UI updates.
 
 ### Statistics
 
 ```cpp
 auto stats = stream.get_stats();
-std::cout << "Latency: " << stats.avg_latency_ms << "ms\n";
-std::cout << "Buffer fill: " << stats.buffer_fill_ratio << "\n";
-std::cout << "Throughput: " << stats.throughput_ratio << "x real-time\n";
+std::cout << "Decode time per window: " << stats.average_latency_ms << " ms\n";
+std::cout << "Audio waiting: " << stats.buffer_fill_ratio << " chunks\n";
+std::cout << "Failed windows: " << stats.chunks_failed
+          << ", audio dropped: " << stats.samples_dropped << " samples\n";
 ```
 
 ### Complete Example
 
-See [examples/karaoke_captions.cpp](../examples/karaoke_captions.cpp) for a complete standalone example with ANSI color terminal output.
+[examples/karaoke_captions.cpp](../examples/karaoke_captions.cpp) plays an audio file into the transcriber in real time and draws the captions with the current word highlighted.
 
 For OBS plugin implementation, see [docs/OBS_KARAOKE_CAPTIONS.md](OBS_KARAOKE_CAPTIONS.md).
 
@@ -480,424 +466,117 @@ For OBS plugin implementation, see [docs/OBS_KARAOKE_CAPTIONS.md](OBS_KARAOKE_CA
 
 ## Voice Activity Detection (VAD)
 
-### Overview
-
-Muninn includes intelligent Voice Activity Detection that automatically selects the best algorithm for your audio. This is **critical for performance and quality** - VAD can reduce processing time by 2-3x while improving transcription accuracy by filtering silence.
-
-### Quick Start: Auto-Detection (Recommended)
+By default (`VADType::Auto`) the transcriber picks a detector per track: no
+VAD for game, system and music tracks and for track 0 of a multi-track file,
+Silero for microphone tracks and clean speech, Energy otherwise.
 
 ```cpp
 muninn::TranscribeOptions options;
-options.vad_type = muninn::VADType::Auto;  // DEFAULT - smart auto-selection
-options.silero_model_path = "models/silero_vad.onnx";  // Needed if Auto chooses Silero
+options.silero_model_path = "models/silero_vad.onnx";  // without it Silero falls back to Energy
+options.track_hints = {
+    {0, muninn::TrackType::GameAudio},
+    {1, muninn::TrackType::Microphone},
+};
 
-auto result = transcriber.transcribe("audio.mp3", options);
-```
-
-**That's it!** Muninn will automatically:
-- Analyze audio characteristics (noise floor, dynamic range)
-- Select the best VAD algorithm per track
-- Filter silence intelligently
-
-### VAD Options
-
-| VAD Type | Best For | Dependencies | Speed |
-|----------|----------|--------------|-------|
-| **Auto** (default) | Multi-track recordings, gaming streams, mixed content | None (Silero optional) | Smart |
-| **None** | Pre-cleaned audio, or when VAD causes issues | None | N/A |
-| **Energy** | Game audio with music, noisy environments, mixed content | None | ~1ms/chunk |
-| **Silero** | Clean speech, podcasts, studio recordings, noise-gated mics | ONNX Runtime | ~0.5ms/chunk |
-
-### Auto-Detection Heuristics
-
-When `VADType::Auto` is selected (default), Muninn analyzes each track:
-
-#### 1. Multi-track Track 0 → Energy VAD
-**Reasoning:** Desktop/game audio typically contains music + speech. Silero over-filters music.
-
-```cpp
-// Example: OBS recording with 3 tracks
-// Track 0: Desktop/game audio → Auto-detects Energy VAD
-// Track 1: Microphone → Auto-detects Silero or Energy based on noise
-// Track 2: Silent → Auto-detects Energy VAD (fast skip)
-```
-
-#### 2. Very Clean Speech → Silero VAD
-**Condition:** Noise floor < 0.0001, Dynamic range > 0.01
-**Reasoning:** Noise gates and studio mics produce extremely low noise floors. Silero excels here.
-
-```cpp
-// Example: Gaming commentary with noise gate
-[Auto-VAD] Track 1: Noise=3.48e-05, Speech=0.0193, Range=0.0192
-[Auto-VAD] Track 1: Very clean speech (noise gate) → Silero VAD
-```
-
-#### 3. Clean Speech → Silero VAD
-**Condition:** Noise floor < 0.01, Dynamic range > 0.15
-**Reasoning:** High signal-to-noise ratio benefits from neural precision.
-
-#### 4. Mixed/Noisy Content → Energy VAD
-**Default:** All other cases
-**Reasoning:** Energy VAD is robust to background noise and music.
-
-### Real-World Test Results
-
-Tested on 243-second gaming video (OBS multi-track):
-
-#### Track 0: Game Audio (Desktop)
-```
-[Auto-VAD] Track 0: Multi-track desktop/game audio → Energy VAD
-[VAD] Detected 21 speech segments
-[VAD] Removed 69.3s of silence (28% filtered)
-```
-
-**Quality:** ✅ Captured all game dialogue including quiet NPCs
-- "Accelerator, boa" (opening line)
-- "You go now" (quiet NPC during music)
-- "Scan found nothing. You go now."
-
-**Comparison with Silero (forced):**
-- Silero: 5 segments, 5.5s captured (97% filtered) ❌ Missed most dialogue
-- Energy: 21 segments, 173.7s captured (28% filtered) ✅ Perfect capture
-
-#### Track 1: Microphone (Noise Gate + Filters)
-```
-[Auto-VAD] Track 1: Noise=3.48e-05, Speech=0.0193, Range=0.0192
-[Auto-VAD] Track 1: Very clean speech (noise gate) → Silero VAD
-[SileroVAD] Detected 53 speech segments
-[SileroVAD] Removed 171.8s silence (70% filtered)
-```
-
-**Quality:** ✅ Perfect transcription including:
-- Small details: "Shift M" (keyboard callout)
-- License plate reading: "ZHW 327"
-- Natural sentence segmentation
-
-### Manual VAD Selection
-
-Force specific VAD if auto-detection doesn't fit your use case:
-
-```cpp
-muninn::TranscribeOptions options;
-
-// Force Energy VAD (music + speech, noisy environments)
-options.vad_type = muninn::VADType::Energy;
-options.vad_threshold = 0.02f;  // RMS energy threshold (0.0-1.0)
-
-// Force Silero VAD (clean speech only)
-options.vad_type = muninn::VADType::Silero;
-options.silero_model_path = "models/silero_vad.onnx";
-options.vad_threshold = 0.5f;  // Speech probability threshold (0.0-1.0)
-
-// Disable VAD (process all audio)
+// Or force one detector:
+options.vad_type = muninn::VADType::Energy;   // vad_threshold <= 0.1 is an RMS level
+options.vad_type = muninn::VADType::Silero;   // vad_threshold > 0.1 is a speech probability
 options.vad_type = muninn::VADType::None;
 ```
 
-### VAD Fine-Tuning
+`VADType::TEN` currently runs Silero. Options, defaults and fallbacks:
+[VAD_API.md](VAD_API.md). The auto rules: [VAD_AUTO_DETECTION.md](VAD_AUTO_DETECTION.md).
 
-```cpp
-muninn::TranscribeOptions options;
-options.vad_type = muninn::VADType::Auto;  // or Energy/Silero
+## Advanced usage
 
-// Energy VAD settings
-options.vad_threshold = 0.02f;              // Lower = more sensitive (0.01-0.05)
-options.vad_min_speech_duration_ms = 250;   // Minimum speech to keep
-options.vad_min_silence_duration_ms = 500;  // Minimum silence to split
-
-// Silero VAD settings (if using Silero)
-options.silero_model_path = "models/silero_vad.onnx";
-options.vad_threshold = 0.5f;               // Lower = more sensitive (0.3-0.7)
-options.silero_min_speech_duration_ms = 250;
-options.silero_min_silence_duration_ms = 100;  // Silero is more precise
-options.silero_speech_pad_ms = 100;            // Padding around speech
-```
-
-### When to Use Each VAD Type
-
-#### Use Auto (Default)
-✅ Multi-track recordings (OBS, video editing)
-✅ Mixed content (music + speech)
-✅ Unknown audio characteristics
-✅ "Just make it work" scenarios
-
-#### Use Energy VAD
-✅ Game audio with background music
-✅ Noisy environments
-✅ Field recordings
-✅ When you don't want ONNX Runtime dependency
-
-#### Use Silero VAD
-✅ Podcasts and interviews
-✅ Studio recordings
-✅ Clean microphone with noise gate
-✅ When you need maximum precision
-
-#### Use None (Disable VAD)
-✅ Pre-cleaned audio (already silence-removed)
-✅ When VAD incorrectly filters speech
-✅ Short audio clips (< 30s)
-✅ Debugging transcription issues
-
-### Performance Impact
-
-**Energy VAD:**
-- Overhead: ~1ms per chunk (negligible)
-- Speedup: 2-3x on typical content (30-50% silence)
-- Dependencies: None
-
-**Silero VAD:**
-- Overhead: ~0.5ms per chunk (faster than Energy!)
-- Speedup: 3-5x on clean speech (50-70% silence)
-- Dependencies: ONNX Runtime (~14 MB DLL)
-- Best for: Clean speech only
-
-**Auto VAD:**
-- Overhead: ~0.1ms audio analysis (one-time per track)
-- Speedup: Best of both worlds
-- Dependencies: ONNX Runtime optional (graceful fallback to Energy)
-
-### Multi-Track Intelligence
-
-Auto-detection analyzes each track independently:
-
-```cpp
-// OBS recording with 3 tracks
-auto result = transcriber.transcribe("gameplay.mp4", options);
-
-// Muninn automatically:
-// Track 0 (Desktop/Game): Energy VAD → Captures dialogue through music
-// Track 1 (Microphone):   Silero VAD → Clean speech with noise gate
-// Track 2 (Silent):       Energy VAD → Fast skip (0 processing)
-```
-
-### Troubleshooting
-
-#### Issue: VAD filters too aggressively (missing speech)
-
-**Solution 1:** Disable VAD
-```cpp
-options.vad_type = muninn::VADType::None;
-```
-
-**Solution 2:** Lower threshold
-```cpp
-options.vad_threshold = 0.01f;  // More sensitive (default: 0.02)
-```
-
-**Solution 3:** Force Energy VAD
-```cpp
-options.vad_type = muninn::VADType::Energy;  // Better for noisy content
-```
-
-#### Issue: Silero VAD missing speech in game audio
-
-**Expected behavior!** Silero is designed for clean speech only. It will over-filter music + speech.
-
-**Solution:** Use Energy VAD or Auto (will auto-select Energy)
-```cpp
-options.vad_type = muninn::VADType::Auto;  // Will choose Energy for mixed content
-```
-
-#### Issue: Energy VAD not filtering enough silence
-
-**Solution 1:** Increase threshold
-```cpp
-options.vad_threshold = 0.05f;  // Less sensitive (default: 0.02)
-```
-
-**Solution 2:** Use Silero VAD for clean speech
-```cpp
-options.vad_type = muninn::VADType::Silero;
-options.silero_model_path = "models/silero_vad.onnx";
-```
-
-#### Issue: "Silero model not found" error with Auto VAD
-
-**Explanation:** Auto-detection tried to use Silero but model path not set.
-
-**Solution:** Set Silero model path even when using Auto
-```cpp
-options.vad_type = muninn::VADType::Auto;
-options.silero_model_path = "models/silero_vad.onnx";  // Needed for Auto
-```
-
-Or force Energy if you don't have Silero:
-```cpp
-options.vad_type = muninn::VADType::Energy;  // No external dependencies
-```
-
-### Streaming API VAD
-
-Same options apply to streaming transcription:
-
-```cpp
-muninn::StreamingOptions options;
-options.vad_type = muninn::VADType::Auto;   // Smart selection
-options.enable_vad = true;                  // Enable VAD
-options.vad_threshold = 0.02f;              // Threshold
-
-muninn::StreamingTranscriber stream("models/faster-whisper-large-v3-turbo");
-stream.start(options, callback);
-```
-
-### Advanced: Manual Audio Analysis
-
-Analyze audio characteristics before transcription:
-
-```cpp
-#include <muninn/vad.h>
-
-// Analyze audio
-auto characteristics = muninn::analyze_audio_characteristics(audio_samples);
-
-std::cout << "Noise floor: " << characteristics.noise_floor << "\n";
-std::cout << "Speech level: " << characteristics.speech_level << "\n";
-std::cout << "Dynamic range: " << characteristics.dynamic_range << "\n";
-std::cout << "Is silent: " << characteristics.is_silent << "\n";
-
-// Get VAD recommendation
-auto vad_type = muninn::auto_detect_vad_type(audio_samples, track_id, total_tracks);
-
-if (vad_type == muninn::VADType::Silero) {
-    std::cout << "Recommended: Silero VAD (clean speech detected)\n";
-} else {
-    std::cout << "Recommended: Energy VAD (mixed/noisy content)\n";
-}
-```
-
-### See Also
-
-- **[VAD API Reference](VAD_API.md)** - Complete API documentation
-- **[VAD Auto-Detection](VAD_AUTO_DETECTION.md)** - Feature details and test results
-- **[Streaming API](STREAMING_API.md)** - Real-time VAD usage
-
----
-
-## Advanced Usage
-
-### Progress Callback (GUI Integration)
+### Progress and cancellation
 
 ```cpp
 auto result = transcriber.transcribe("video.mp4", options,
-    [](int track, int total_tracks, float progress, const std::string& message) -> bool {
-        std::cout << "Track " << (track + 1) << "/" << total_tracks
-                  << " - " << (progress * 100) << "% - " << message << "\n";
-
-        // Return false to cancel transcription
-        return !user_cancelled;
-    }
-);
+    [&](int track, int total_tracks, float progress, const std::string& message) {
+        std::cout << "Track " << (track + 1) << "/" << total_tracks << " "
+                  << int(progress * 100) << "% " << message << "\n";
+        return !user_cancelled;   // false cancels
+    });
 ```
 
-### Multi-Track Video Files
+`transcriber.cancel()` from another thread does the same. See
+[CANCELLATION_API.md](CANCELLATION_API.md).
 
-Muninn automatically detects and processes multiple audio tracks:
+### Multi-track files
+
+Each audio track is extracted and transcribed separately; segments carry
+`track_id`.
 
 ```cpp
-// Get track info first
 auto info = muninn::Transcriber::get_audio_info("video.mp4");
-std::cout << "Found " << info.num_tracks << " audio track(s)\n";
+std::cout << info.num_tracks << " track(s), " << info.duration << " s\n";
 
-// Skip specific tracks
-options.skip_tracks = {2};  // Skip track index 2
-options.skip_silent_tracks = true;  // Auto-skip silent tracks
-
+options.skip_tracks = {2};          // don't transcribe track 2
+options.skip_silent_tracks = true;  // default: skip tracks with no signal
 auto result = transcriber.transcribe("video.mp4", options);
-
-// Results include track_id for each segment
-for (const auto& segment : result.segments) {
-    std::cout << "[Track " << segment.track_id << "] "
-              << segment.text << "\n";
-}
 ```
 
-### Using ModelOptions
+### ModelOptions
 
 ```cpp
-muninn::ModelOptions model_opts;
-model_opts.model_path = "models/faster-whisper-large-v3-turbo";
-model_opts.device = muninn::DeviceType::CUDA;
-model_opts.compute_type = muninn::ComputeType::Float16;
-model_opts.device_index = 0;      // GPU index
-model_opts.intra_threads = 4;     // CPU threads
+muninn::ModelOptions m;
+m.model_path = "models/faster-whisper-large-v3-turbo";
+m.device = muninn::DeviceType::Auto;          // CUDA when a compatible GPU is there, else CPU
+m.compute_type = muninn::ComputeType::Float16; // float32 on the CPU
+m.device_index = 0;                            // GPU index
+m.intra_threads = 0;                           // CPU threads; 0 = half the hardware threads
+muninn::Transcriber transcriber(m);
 
-muninn::Transcriber transcriber(model_opts);
+auto dev = transcriber.get_device_info();      // what was actually used
 ```
 
-### Temperature Fallback
+### Temperature fallback
 
-Muninn automatically retries with higher temperatures if quality thresholds fail:
-
-```cpp
-options.temperature = 0.0f;  // Start with greedy decoding
-options.temperature_fallback = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
-options.compression_ratio_threshold = 2.4f;  // Retry if exceeded
-options.log_prob_threshold = -1.0f;          // Retry if below
-```
+A window is decoded again at the next temperature when its compression ratio
+is above `compression_ratio_threshold` (2.4) or its average log probability is
+below `log_prob_threshold` (-1.0). Above temperature 0 it takes `best_of`
+samples with beam 1 and keeps the best, as faster-whisper does.
 
 ## Models
 
-Download CTranslate2-converted Whisper models:
+Muninn reads CTranslate2-format Whisper models, for example
+`Systran/faster-whisper-large-v3` or `deepdml/faster-whisper-large-v3-turbo-ct2`
+on Hugging Face. large-v3-turbo is the usual choice: close to large-v3 in
+accuracy and much faster. It can't translate (task "translate"); use
+large-v3 or a smaller multilingual model for that.
 
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| tiny | 75 MB | Fastest | Basic |
-| base | 150 MB | Fast | Good |
-| small | 500 MB | Medium | Better |
-| medium | 1.5 GB | Slower | Great |
-| large-v3 | 3 GB | Slow | Best |
-| **large-v3-turbo** | 1.6 GB | Fast | Excellent |
+## Logging
 
-Recommended: `faster-whisper-large-v3-turbo` for best speed/quality balance.
+Muninn logs through `muninn::Logger` (`muninn/logging.h`). Without a callback
+every line goes to stderr, never stdout. Set a callback to send it to your own
+log:
 
-Models available at: https://huggingface.co/Systran
+```cpp
+muninn::Logger::set_callback([](muninn::LogLevel level, const std::string& msg) {
+    my_log(level, msg);
+});
+```
 
-## Required Runtime Files
-
-Distribute these DLLs with your application:
-
-| File | Size | Required | Purpose |
-|------|------|----------|---------|
-| **muninn.dll** | 17 MB | Always | Main library with built-in audio extraction |
-| **ctranslate2.dll** | 20 MB | Always | Whisper inference engine |
-| **onnxruntime.dll** | 14 MB | Optional | Only needed for Silero VAD |
-
-**No separate audio extraction DLL needed** - FFmpeg is statically linked into muninn.dll.
-
-Plus CUDA runtime DLLs if using GPU acceleration (cudart64_*.dll, cublas64_*.dll, etc.).
-
-## Error Handling
+## Errors
 
 ```cpp
 try {
     muninn::Transcriber transcriber("models/whisper");
     auto result = transcriber.transcribe("audio.mp3");
-} catch (const std::runtime_error& e) {
+    if (result.failed_windows || result.failed_tracks)
+        std::cerr << "Part of the audio failed: " << result.error << "\n";
+} catch (const std::exception& e) {
     std::cerr << "Transcription failed: " << e.what() << "\n";
 }
 ```
 
-Common errors:
-- Model not found
-- Invalid audio file
-- CUDA out of memory (reduce batch_size)
-- VAD model not found (check silero_model_path)
-
-## Performance Tips
-
-1. **Use GPU**: CUDA is 10-20x faster than CPU
-2. **Use large-v3-turbo**: Best speed/quality ratio
-3. **Use Auto VAD (default)**: Automatically selects best algorithm per track - 2-3x speedup with zero configuration
-4. **Batch processing**: Set `batch_size = 4-8` for long audio
-5. **Use float16**: Good balance of speed and quality on GPU
-6. **Built-in audio extraction**: Multi-threaded FFmpeg decoder uses all CPU cores for fast extraction
-7. **Multi-track optimization**: Auto-VAD analyzes each track independently for optimal filtering
+The constructor throws when the model can't be loaded. `transcribe()` throws
+for a file that can't be opened, a language the model doesn't know, or a run
+in which nothing succeeded.
 
 ## License
 
-Business Source License 1.1
-
-- Free for personal and academic use
-- Commercial use requires a license
-
-Contact: craig@nordiqai.io
+Business Source License 1.1 with an additional grant for any non-commercial
+use. Each release becomes MIT-licensed four years after it is published. For
+commercial use, see [LICENSE](../LICENSE).

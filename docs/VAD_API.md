@@ -1,154 +1,109 @@
-# Voice Activity Detection (VAD) API
+# Voice Activity Detection (VAD)
 
-## Overview
+VAD finds the parts of a track that contain speech. Muninn decodes only those
+parts, joined together, and maps the timestamps back to the original timeline
+afterwards (words by the region their midpoint falls in, as faster-whisper
+does). This applies to `Transcriber`; streaming has its own, simpler VAD
+handling (see [STREAMING_API.md](STREAMING_API.md)).
 
-Muninn provides intelligent Voice Activity Detection to filter silence and improve transcription quality. The VAD system automatically selects the best algorithm based on audio characteristics.
+## `VADType`
 
-## API Options
+| Value | What happens |
+|---|---|
+| `Auto` (default) | Chosen per track; see [VAD_AUTO_DETECTION.md](VAD_AUTO_DETECTION.md). |
+| `None` | No VAD: the whole track is decoded. Same as `vad_filter = false`. |
+| `Energy` | RMS energy detector with an adaptive noise floor. No model needed. |
+| `Silero` | Silero VAD (ONNX Runtime, CPU). Needs `silero_model_path`. |
+| `TEN` | Not implemented yet: the transcriber logs a warning and uses Silero. |
+| `WebRTC` | Not implemented: falls back to Energy. |
 
-### `VADType` Enum
+Silero falls back to Energy, with a warning in the log, when Muninn was built
+without ONNX Runtime, when `silero_model_path` is empty, or when the model
+fails to load or run. The fallback uses the energy detector's own threshold.
 
-| Value    | Description | Best For |
-|----------|-------------|----------|
-| **Auto** (default) | Smart auto-detection per track | Multi-track recordings, gaming streams, mixed content |
-| **None** | No VAD - process all audio | Pre-cleaned audio, or when VAD causes issues |
-| **Energy** | RMS energy-based detection | Game audio with music, mixed content, noisy environments |
-| **Silero** | Neural VAD (ONNX Runtime) | Clean speech, podcasts, studio recordings, noise-gated mics |
+## Options (`TranscribeOptions`)
 
-## Auto-Detection Heuristics
+| Option | Default | Used by |
+|---|---|---|
+| `vad_type` | `Auto` | |
+| `vad_filter` | `true` | `false` turns VAD off whatever `vad_type` says |
+| `vad_threshold` | `0.02` | Energy uses it when it is 0.1 or less (an RMS level). Silero uses it when it is above 0.1 (a speech probability); otherwise Silero uses 0.25. |
+| `vad_min_speech_duration_ms` | `250` | Energy, Silero |
+| `vad_min_silence_duration_ms` | `500` | Energy, Silero: the silence needed to end a speech region |
+| `vad_speech_pad_ms` | `300` | Energy, Silero: padding on each side of a region |
+| `vad_max_speech_duration_s` | `30` | Silero: a longer region is split at its last pause of about 100 ms |
+| `vad_audio_preamble_ms` | `2000` | Only read by the TEN path, so currently unused (see below) |
+| `silero_model_path` | empty | Silero (also needed when `Auto` picks Silero) |
+| `ten_vad_model_path` | empty | Unused while TEN is replaced by Silero |
+| `skip_silent_tracks` | `true` | A track whose peak stays below 0.0001 is skipped before VAD |
+| `track_hints` | empty | `Auto` only: track index to `TrackType` |
+| `hallucination_silence_threshold` | `0` | 0 = off. Otherwise the fraction (0 to 1, clamped) of a segment that must fall inside detected speech, counted word by word when there are word timestamps; segments below it are dropped. Only applies when VAD found speech regions. |
 
-When `VADType::Auto` is selected (default), Muninn analyzes each audio track and selects the optimal VAD:
+Both detectors have a fixed 2-second preamble: speech that starts within the
+first 2 s is pulled back to 0. The preamble never becomes a segment on its
+own, so a track with no detected speech gives no speech regions.
 
-### 1. Multi-track Track 0 → Energy VAD
-- **Reason:** Desktop/game audio typically contains music + speech
-- **Example:** OBS recordings with separate game audio and microphone tracks
+When a detector finds no speech in a track that does have signal (peak of
+0.001 or more), the whole track is decoded as if VAD were off. A track below
+that level is skipped.
 
-### 2. Very Clean Speech → Silero VAD
-- **Condition:** Noise floor < 0.0001, Dynamic range > 0.01
-- **Reason:** Noise gates and studio mics produce extremely low noise floors
-- **Example:** Gaming commentary with noise gate filters
-
-### 3. Clean Speech → Silero VAD
-- **Condition:** Noise floor < 0.01, Dynamic range > 0.15
-- **Reason:** High signal-to-noise ratio benefits from neural precision
-- **Example:** Podcasts, interviews, clean recordings
-
-### 4. Mixed/Noisy Content → Energy VAD
-- **Default:** All other cases
-- **Reason:** Energy VAD is robust to background noise and music
-- **Example:** Field recordings, noisy environments
-
-## Usage Examples
-
-### C++ API
+## Examples
 
 ```cpp
 #include <muninn/transcriber.h>
 
-// Auto-detection (recommended)
-muninn::TranscribeOptions options;
-options.vad_type = muninn::VADType::Auto;  // Default
-transcriber.transcribe(audio_samples, 16000, options);
+muninn::TranscribeOptions options;          // Auto by default
+options.silero_model_path = "models/silero_vad.onnx";  // lets Auto use Silero
 
-// Force Energy VAD
-options.vad_type = muninn::VADType::Energy;
+// Tell Auto what each track is (Loki Studio does this from track titles)
+options.track_hints[0] = muninn::TrackType::GameAudio;   // no VAD
+options.track_hints[1] = muninn::TrackType::Microphone;  // Silero
 
-// Force Silero VAD (requires ONNX Runtime)
+// Or pick one detector for every track
 options.vad_type = muninn::VADType::Silero;
-options.silero_model_path = "path/to/silero_vad.onnx";
+options.vad_threshold = 0.35f;              // Silero speech probability
 
-// Disable VAD
-options.vad_type = muninn::VADType::None;
+options.vad_type = muninn::VADType::Energy;
+options.vad_threshold = 0.01f;              // lower RMS level = keeps quieter speech
+
+options.vad_type = muninn::VADType::None;   // decode everything
 ```
 
-### Qt GUI Integration
+## Using the detectors directly
 
-```cpp
-// Dropdown options
-QComboBox* vadCombo = new QComboBox();
-vadCombo->addItem("Auto (Recommended)", static_cast<int>(muninn::VADType::Auto));
-vadCombo->addItem("Off", static_cast<int>(muninn::VADType::None));
-vadCombo->addItem("Energy VAD", static_cast<int>(muninn::VADType::Energy));
-vadCombo->addItem("Silero VAD", static_cast<int>(muninn::VADType::Silero));
-vadCombo->setCurrentIndex(0);  // Auto by default
-
-// Set option
-muninn::TranscribeOptions options;
-options.vad_type = static_cast<muninn::VADType>(vadCombo->currentData().toInt());
-```
-
-## Performance Characteristics
-
-| VAD Type | Speed | Accuracy | Dependencies | Best Use Case |
-|----------|-------|----------|--------------|---------------|
-| Auto | Mixed | Best overall | Silero ONNX (optional) | Multi-track, gaming streams |
-| None | Fastest | N/A | None | Pre-cleaned audio |
-| Energy | ~1ms/chunk | Good | None | Mixed audio, music + speech |
-| Silero | ~0.5ms/chunk | Excellent | ONNX Runtime (~2MB) | Clean speech only |
-
-## Test Results
-
-Tested on 243-second gaming video with OBS multi-track audio:
-
-### Track 0: Game Audio (Desktop)
-- **Auto-detected:** Energy VAD
-- **Result:** 21 segments, 173.7s captured (28% filtered)
-- **Quality:** Captured all game dialogue including quiet NPCs
-
-### Track 1: Microphone (Noise Gate)
-- **Auto-detected:** Silero VAD (noise floor: 0.000035)
-- **Result:** 53 segments, 71.3s captured (70% silence filtered)
-- **Quality:** Accurate transcription including "Shift M", license plate "ZHW 327"
-
-### Track 2: Silent
-- **Auto-detected:** Energy VAD
-- **Result:** 0 segments (empty track)
-
-## Troubleshooting
-
-### Issue: VAD filters too aggressively
-**Solution:** Use `VADType::None` or adjust `vad_threshold` (lower = less aggressive)
-
-```cpp
-options.vad_type = muninn::VADType::None;  // Disable VAD
-// Or
-options.vad_threshold = 0.01f;  // Lower threshold (default: 0.02)
-```
-
-### Issue: Silero VAD missing speech in noisy audio
-**Solution:** Use `VADType::Energy` or `VADType::Auto` (will auto-select Energy)
-
-```cpp
-options.vad_type = muninn::VADType::Energy;  // Force Energy for noisy content
-```
-
-### Issue: Energy VAD not filtering enough silence
-**Solution:** Increase `vad_threshold` or use `VADType::Silero` for clean speech
-
-```cpp
-options.vad_threshold = 0.05f;  // Higher threshold = more aggressive
-```
-
-## Advanced: Manual Analysis
-
-You can manually analyze audio characteristics before transcription:
+`muninn/vad.h` and `muninn/silero_vad.h` expose the detectors on their own:
 
 ```cpp
 #include <muninn/vad.h>
+#include <muninn/silero_vad.h>
 
-// Analyze audio
-auto characteristics = muninn::analyze_audio_characteristics(audio_samples);
+muninn::VAD energy;                         // VADOptions defaults
+auto regions = energy.detect_speech(samples, 16000);
 
-std::cout << "Noise floor: " << characteristics.noise_floor << "\n";
-std::cout << "Speech level: " << characteristics.speech_level << "\n";
-std::cout << "Dynamic range: " << characteristics.dynamic_range << "\n";
+muninn::SileroVADOptions so;
+so.model_path = "models/silero_vad.onnx";
+muninn::SileroVAD silero(so);               // throws if the model can't load
+std::vector<muninn::SpeechSegment> speech;
+auto speech_only = silero.filter_silence(samples, 16000, speech);
 
-// Get recommendation
-auto vad_type = muninn::auto_detect_vad_type(audio_samples, track_id, total_tracks);
+auto c = muninn::analyze_audio_characteristics(samples);
+auto pick = muninn::auto_detect_vad_type(samples, track_id, total_tracks,
+                                         muninn::TrackType::Unknown);
 ```
 
-## See Also
+Note that `VADOptions` and `SileroVADOptions` have their own defaults
+(`speech_pad_ms` 100 and 300, `min_silence_duration_ms` 500 and 100, Silero
+`threshold` 0.5); the transcriber overrides them from `TranscribeOptions` as
+listed above.
 
-- [Streaming API](STREAMING_API.md) - Real-time transcription with VAD
-- [Multi-track Audio](INTEGRATION.md#multi-track-audio) - Working with OBS recordings
-- [Performance Tuning](../README.md#performance) - Optimization guide
+A `VAD` or `SileroVAD` object must not be used from two threads at once. The
+transcriber creates its own for each track.
+
+## Troubleshooting
+
+- **Speech is cut:** lower `vad_threshold` for Energy, set a Silero
+  probability such as 0.2, raise `vad_speech_pad_ms`, or use `None`.
+- **Too much silence is decoded:** raise the Energy threshold, or use Silero
+  on clean microphone tracks.
+- **Silero isn't used:** check the log for the fallback warning. Usually
+  `silero_model_path` is empty or wrong.

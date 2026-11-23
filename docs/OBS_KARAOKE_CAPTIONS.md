@@ -1,14 +1,14 @@
 # OBS Karaoke Captions Plugin Guide
 
-Build an OBS plugin with word-by-word highlighting using Muninn's streaming API.
+A sketch of an OBS filter plugin that shows live captions with the current word highlighted, using Muninn's streaming API. It is not a finished plugin: the OBS calls are outlined, not tested. `examples/karaoke_captions.cpp` is the same idea as a complete program that runs in a terminal.
 
-## Features
+What it gives you:
+- Captions about one window (2 s by default) plus the decode time after the speech
+- The current word highlighted, from streaming's word timestamps
+- The language detected on the first speech (`language = "auto"`)
+- SRT or VTT export of the session through `SubtitleExporter`
 
-✅ **Real-time captions** - 500ms-2s latency
-✅ **Word highlighting** - Karaoke-style word-by-word emphasis
-✅ **Customizable styles** - Colors, fonts, sizes, positions
-✅ **Auto language detection** - 99+ languages supported
-✅ **Export SRT** - Save captions with word timing
+The plugin must be built the way README_BINARIES.txt says (MSVC 2022 17.10 or newer, Release, /MD) and should call `muninn::check_version()` once when it loads.
 
 ## Architecture
 
@@ -36,12 +36,12 @@ project(obs-muninn-captions)
 # Find OBS
 find_package(libobs REQUIRED)
 
-# Add Muninn
+# Muninn: headers from include/, import library lib/muninn.lib
+target_include_directories(obs-muninn-captions PRIVATE ${MUNINN_DIR}/include)
 target_link_libraries(obs-muninn-captions
     PRIVATE
         OBS::libobs
-        muninn.lib
-        ctranslate2.lib
+        ${MUNINN_DIR}/lib/muninn.lib
 )
 ```
 
@@ -88,7 +88,8 @@ struct muninn_caption_data {
     // Caption state
     std::mutex caption_mutex;
     std::deque<caption_segment> segments;
-    float stream_time;
+    std::atomic<float> stream_time;  // written by the audio thread, read by the worker
+    int sample_rate;                 // audio_output_get_sample_rate(obs_get_audio())
 
     // Worker thread
     std::thread worker;
@@ -106,6 +107,7 @@ static void* caption_filter_create(obs_data_t* settings, obs_source_t* source) {
     data->word_highlighting = true;
     data->latency_s = 1.5f;
     data->stream_time = 0.0f;
+    data->sample_rate = static_cast<int>(audio_output_get_sample_rate(obs_get_audio()));
     data->stop_worker = false;
 
     // Get settings
@@ -217,11 +219,12 @@ static struct obs_audio_data* caption_filter_audio(
     const float* samples = reinterpret_cast<const float*>(chan0);
     size_t frames = audio->frames;
 
-    // Push to Muninn (thread-safe)
-    data->transcriber->push_audio(samples, frames, 48000, 1);
+    // OBS audio is planar float; this pushes the first channel. Use OBS's
+    // real rate: audio_output_get_sample_rate(obs_get_audio()).
+    data->transcriber->push_audio(samples, frames, data->sample_rate, 1);
 
-    // Update stream time
-    data->stream_time += static_cast<float>(frames) / 48000.0f;
+    // Seconds pushed: the same clock as the segment timestamps
+    data->stream_time = data->stream_time + static_cast<float>(frames) / data->sample_rate;
 
     return audio;  // Pass through
 }
@@ -253,8 +256,11 @@ void update_text_source(muninn_caption_data* data) {
         return;
     }
 
-    // Karaoke mode - build HTML/Rich Text with word highlighting
-    std::string formatted_text = build_karaoke_text(seg, data->stream_time);
+    // Karaoke mode. A segment arrives about one window after its words were
+    // spoken, so the display clock runs that far behind the audio clock;
+    // otherwise every word is already past when it appears.
+    const float display_time = data->stream_time - (data->latency_s + 1.0f);
+    std::string formatted_text = build_karaoke_text(seg, display_time);
 
     obs_data_t* settings = obs_data_create();
     obs_data_set_string(settings, "text", formatted_text.c_str());
@@ -275,7 +281,8 @@ std::string build_karaoke_text(const caption_segment& seg, float current_time) {
         }
     }
 
-    // Build HTML with color coding
+    // Build HTML with color coding (escape the text with
+    // muninn::HTMLFormatter::escape if it can hold &, < or >)
     for (size_t i = 0; i < seg.words.size(); ++i) {
         if (static_cast<int>(i) < current_word_idx) {
             // Past words - gray
@@ -355,54 +362,36 @@ static obs_properties_t* caption_filter_properties(void* vdata) {
     );
     // Add languages: "auto", "en", "es", "ja", etc.
 
-    // Export button
+    // Export button: its callback asks for a path and calls
+    // export_subtitles() from step 7
     obs_properties_add_button(
         props,
-        "export_srt",
-        "Export SRT Subtitles",
-        export_srt_callback
+        "export_subtitles",
+        "Export Subtitles",
+        export_button_clicked
     );
 
     return props;
 }
 ```
 
-### 7. Export SRT with Word Timestamps
+### 7. Export Subtitles
+
+`SubtitleExporter` writes the session's segments as SRT or VTT. SRT has no word timing; VTT can carry it as per-word tags (`vtt_include_word_timestamps`). How you ask the user for a path depends on your UI; `path` below is that choice.
 
 ```cpp
-static bool export_srt_callback(obs_properties_t* props, obs_property_t* property, void* vdata) {
-    auto* data = static_cast<muninn_caption_data*>(vdata);
+#include <muninn/subtitle_export.h>
 
-    // Get save path from user
-    const char* path = obs_frontend_get_save_path("srt", "SRT Files (*.srt)");
-    if (!path) {
-        return false;
-    }
+static void export_subtitles(muninn_caption_data* data, const std::string& path) {
+    const auto segments = data->transcriber->get_all_segments();
 
-    // Get all segments
-    auto all_segments = data->transcriber->get_all_segments();
+    muninn::SubtitleExportOptions opts;
+    opts.output_path = path;                    // ends in .vtt here
+    opts.format = muninn::SubtitleFormat::VTT;  // the format comes from this, not the extension
+    opts.vtt_include_word_timestamps = true;
 
-    // Export to SRT
-    std::ofstream srt(path);
-    int index = 1;
-
-    for (const auto& seg : all_segments) {
-        srt << index++ << "\n";
-        srt << format_srt_time(seg.start) << " --> " << format_srt_time(seg.end) << "\n";
-        srt << seg.text << "\n\n";
-
-        // Optionally: export word-level SRT (one word per subtitle)
-        if (!seg.words.empty()) {
-            for (const auto& word : seg.words) {
-                srt << index++ << "\n";
-                srt << format_srt_time(word.start) << " --> " << format_srt_time(word.end) << "\n";
-                srt << word.word << "\n\n";
-            }
-        }
-    }
-
-    blog(LOG_INFO, "[Muninn] Exported SRT to: %s", path);
-    return true;
+    muninn::SubtitleExporter exporter;
+    exporter.export_subtitles(segments, "", opts);  // video path unused when output_path is set
 }
 ```
 
@@ -483,11 +472,10 @@ for (const auto& word : seg.words) {
 
 ## Performance Tips
 
-1. **Use GPU** - CUDA gives 10-20x speedup
-2. **Adjust chunk_length_s** - Lower = lower latency, higher CPU
-3. **Use Energy VAD** - Fast, no ONNX dependency
-4. **Limit visible segments** - Keep only last 3-5 for display
-5. **30 FPS rendering** - Smooth word transitions without overhead
+1. **Use a GPU** if you have one; the CPU works but is much slower.
+2. **chunk_length_s** - Shorter windows mean lower latency but more decoding: every window is padded to 30 s before the encoder runs, so halving the window roughly doubles the work.
+3. **Energy VAD** (the default) needs no model file; Silero needs `vad_model_path`.
+4. **Keep only the last few segments** for display.
 
 ## Configuration Presets
 
@@ -511,30 +499,16 @@ opts.beam_size = 10;           // Higher beam = better quality
 opts.word_timestamps = true;
 ```
 
-### Balanced (Default)
+### Defaults
 
 ```cpp
-muninn::StreamingOptions opts;
-opts.chunk_length_s = 1.5f;   // 1.5s latency
-opts.overlap_s = 0.3f;
-opts.enable_vad = true;
-opts.word_timestamps = true;
+muninn::StreamingOptions opts;   // chunk_length_s 2.0, overlap_s 0.5,
+                                 // Energy VAD on, word timestamps on
 ```
 
-## Testing
+## Installing
 
-```bash
-# Build plugin
-mkdir build && cd build
-cmake .. -DCMAKE_PREFIX_PATH=/path/to/obs-studio
-make
-
-# Install to OBS
-cp obs-muninn-captions.dll ~/.config/obs-studio/plugins/
-
-# Run OBS and test
-obs --verbose --log-level debug
-```
+Muninn is Windows-only. Copy the plugin DLL to OBS's `obs-plugins4bit` folder, and make Muninn's `bin\` DLLs (muninn, ctranslate2, onnxruntime, FFmpeg) plus the CUDA 13 and cuDNN 9 DLLs loadable from there. Windows has an older `onnxruntime.dll` of its own in System32, so don't rely on PATH for that one (see README_BINARIES.txt).
 
 ## Troubleshooting
 
@@ -543,8 +517,8 @@ obs --verbose --log-level debug
 | No captions appearing | Check model path, ensure text source exists |
 | High latency | Reduce `chunk_length_s`, use faster model (turbo) |
 | Words not highlighting | Ensure `word_timestamps = true` |
-| Audio choppy | Push smaller chunks (1024 samples) |
-| CUDA errors | Fallback to CPU (`device = "cpu"`) |
+| Errors during a stream | Set an error callback (`set_error_callback`): failed windows are reported there and skipped |
+| No GPU | Use device `"auto"`: it falls back to the CPU when CUDA isn't there or fails |
 
 ## Full Example
 
@@ -552,5 +526,4 @@ See `examples/karaoke_captions.cpp` for a complete standalone example.
 
 ## License
 
-Business Source License 1.1
-Commercial use: craig@nordiqai.io
+Business Source License 1.1, free for non-commercial use. Commercial use: craig@nordiqai.io

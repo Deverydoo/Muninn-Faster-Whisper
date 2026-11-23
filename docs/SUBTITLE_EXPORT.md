@@ -1,6 +1,6 @@
 # Subtitle Export (SRT/VTT/ASS)
 
-Muninn provides automatic subtitle generation from transcription results, with support for SRT, VTT, ASS and metadata JSON formats.
+`SubtitleExporter` writes transcription results as SRT, VTT or ASS subtitles, and `SubtitleMetadata` as a metadata JSON file.
 
 ## Overview
 
@@ -99,7 +99,7 @@ exporter.export_srt(result.segments, "gameplay.mp4", options);
 **Output:**
 ```srt
 1
-00:00:15,020 --> 00:01:35,870
+00:00:15,020 --> 00:00:18,400
 [Game Audio] Jump Gate, Unknown Sector.
 
 2
@@ -112,17 +112,16 @@ exporter.export_srt(result.segments, "gameplay.mp4", options);
 Multi-speaker subtitles with speaker labels:
 
 ```cpp
-// Transcribe + diarize
+// Transcribe + diarize (audio: the file's 16 kHz mono samples, from AudioExtractor)
 auto result = transcriber.transcribe("podcast.mp3");
 
-muninn::Diarizer diarizer("models/pyannote-embedding.onnx");
-auto diarization = diarizer.diarize(audio_data, num_samples, 16000);
+muninn::Diarizer diarizer("models/pyannote_embedding.onnx");
+auto diarization = diarizer.diarize(audio.data(), audio.size(), 16000);
 
-muninn::Diarizer::assign_speakers_to_segments(result.segments, diarization);
-
-// Custom speaker names
+// Names first: assign_speakers_to_segments copies the labels it finds
 std::map<int, std::string> names = {{0, "Host"}, {1, "Guest"}};
 muninn::Diarizer::set_speaker_labels(diarization, names);
+muninn::Diarizer::assign_speakers_to_segments(result.segments, diarization);
 
 // Export with speaker labels
 muninn::SubtitleExportOptions options;
@@ -145,7 +144,7 @@ exporter.export_srt(result.segments, "podcast.mp3", options);
 
 ### 4. YouTube/Streaming (VTT with Colors)
 
-Export VTT with speaker-specific colors:
+Export VTT with speaker-specific colors. Cues with a speaker get a `<v SpeakerN>` voice tag, and the STYLE block colours each voice:
 
 ```cpp
 muninn::SubtitleExportOptions options;
@@ -167,11 +166,20 @@ exporter.export_vtt(result.segments, "video.mp4", options);
 WEBVTT
 
 STYLE
+::cue {
+  background-color: rgba(0, 0, 0, 0.8);
+}
+
 ::cue(v[voice="Speaker0"]) {
   color: #00D9FF;
 }
+
 ::cue(v[voice="Speaker1"]) {
   color: #FF6B9D;
+}
+
+::cue(v[voice="Speaker2"]) {
+  color: #C9F04D;
 }
 
 1
@@ -241,7 +249,7 @@ struct SubtitleExportOptions {
     // Text formatting
     int max_chars_per_line = 42;           // Max characters (code points) per line
     int max_lines = 2;                     // Max lines per subtitle; more text = next cue
-    bool auto_split_long_text = true;      // Auto-split at spaces/punctuation
+    bool auto_split_long_text = true;      // Break lines at max_chars_per_line (false = one line per cue)
 
     // Speaker labels
     bool include_speakers = false;         // Include speaker labels
@@ -422,32 +430,25 @@ options.gap_threshold = 0.5f;          // Merge segments < 0.5s apart (same trac
 
 **Before splitting:**
 ```
-This is a very long sentence that exceeds the maximum character limit.
+This is a long sentence that runs past the line limit.
 ```
 
-**After splitting:**
+**After splitting (35 characters per line):**
 ```
-This is a very long sentence
-that exceeds the maximum character limit.
+This is a long sentence that runs
+past the line limit.
 ```
 
 ## Subtitle Format Comparison
 
-| Feature | SRT | VTT |
-|---------|-----|-----|
-| **Compatibility** | Universal (all players) | Web/modern players |
-| **Styling** | ❌ | ✅ (CSS-like) |
-| **Speaker colors** | ❌ | ✅ |
-| **Word-level timing** | ❌ | ✅ |
-| **File size** | Smaller | Slightly larger |
-| **YouTube** | ✅ | ✅ |
-| **Video editors** | ✅ | Limited |
-| **Streaming** | ✅ | ✅ (preferred) |
+| | SRT | VTT | ASS |
+|---|---|---|---|
+| Players and editors | Nearly all | Web players, most modern players | Players and editors with ASS support |
+| Styling from Muninn | None | Speaker colours, confidence class | One plain style |
+| Word timing | No | Per-word tags (`vtt_include_word_timestamps`) | No |
+| Speaker | In the text (`include_speakers`) | Voice tag and/or in the text | Name field |
 
-**Recommendation:**
-- **SRT**: Video editing, YouTube upload, universal compatibility
-- **VTT**: Live streaming, web players, speaker differentiation
-- **Both**: Export both for maximum flexibility
+SRT for editors and uploads, VTT for web players and speaker colours.
 
 ## Loki Studio Integration
 
@@ -476,7 +477,7 @@ void process_video(const std::string& video_path) {
     );
     // Creates: video_metadata.json
 
-    // 3. Export SRT (new!)
+    // 3. Export SRT
     muninn::SubtitleExporter exporter;
     exporter.export_srt(result.segments, video_path);
     // Creates: video.srt
@@ -523,7 +524,3 @@ exporter.export_srt(segments, "video.mp4");
 - [Speaker Diarization](SPEAKER_DIARIZATION.md)
 - [OBS Integration](OBS_KARAOKE_CAPTIONS.md)
 - [Integration Guide](INTEGRATION.md)
-
----
-
-**Professional subtitle export made easy!** Generate publication-ready SRT/VTT files directly from transcription results.

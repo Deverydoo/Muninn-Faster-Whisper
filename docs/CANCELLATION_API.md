@@ -1,8 +1,10 @@
-# Cancellation API
+# Cancellation
 
-Muninn provides a thread-safe cancellation API for both `Transcriber` and `Translator` classes, allowing GUI applications to cancel long-running operations without blocking or hanging.
+`Transcriber` and `Translator` can be cancelled from another thread (a UI
+thread, for example). Cancellation is cooperative: the running call stops at
+its next check and returns what it has.
 
-## Quick Start
+## Transcriber
 
 ```cpp
 #include <muninn/transcriber.h>
@@ -10,246 +12,90 @@ Muninn provides a thread-safe cancellation API for both `Transcriber` and `Trans
 
 muninn::Transcriber transcriber("models/faster-whisper-large-v3-turbo");
 
-// Start transcription in worker thread
-std::thread worker([&]() {
-    auto result = transcriber.transcribe("long_audio.mp4", options);
-
+std::thread worker([&] {
+    auto result = transcriber.transcribe("long_video.mp4", options);
     if (result.was_cancelled) {
-        std::cout << "Transcription was cancelled\n";
-        // Handle partial results in result.segments
+        // result.segments holds what was finished, with normal timestamps
     }
 });
 
-// Cancel from UI thread (e.g., button click)
-transcriber.cancel();
-
+transcriber.cancel();   // from any thread
 worker.join();
 ```
 
-## API Reference
+| Method | |
+|---|---|
+| `cancel()` | Sets the flag. Safe from any thread. |
+| `reset_cancel()` | Clears the flag. Only needed to undo a `cancel()` sent while nothing was running. |
+| `is_cancelled()` | Whether the flag is set. |
 
-### Transcriber
+How the flag behaves:
+- It is cleared when `transcribe()` returns, not when it starts. A
+  `cancel()` sent just before `transcribe()` is called cancels that run.
+- If nothing is running, the flag stays set until the next `transcribe()`
+  (which it then cancels) or `reset_cancel()`.
 
-```cpp
-class Transcriber {
-public:
-    // Request cancellation (thread-safe, can be called from any thread)
-    void cancel();
+Where it is checked:
+- before each track of a file;
+- after VAD, before the mel spectrogram is computed;
+- before each 30-second window (sequential decoding, the default), or before
+  each batch (`sequential = false`).
 
-    // Reset cancellation flag (auto-called at start of transcribe())
-    void reset_cancel();
+Audio extraction, VAD itself, the mel spectrogram and the window being
+decoded are not interrupted, so a cancel can take as long as the current step.
 
-    // Check if cancellation was requested
-    bool is_cancelled() const;
-};
-```
-
-### Translator
-
-```cpp
-class Translator {
-public:
-    // Request cancellation (thread-safe)
-    void cancel();
-
-    // Reset cancellation flag
-    void reset_cancel();
-
-    // Check if cancellation was requested
-    bool is_cancelled() const;
-};
-```
-
-### TranscribeResult
+A progress callback that returns `false` cancels the same way:
 
 ```cpp
-struct TranscribeResult {
-    std::vector<Segment> segments;  // Partial results if cancelled
-    bool was_cancelled;             // True if transcription was cancelled
-    // ... other fields
-};
-```
-
-## How It Works
-
-### Thread Safety
-
-The cancellation flag uses `std::atomic<bool>` with proper memory ordering:
-- `cancel()` uses `memory_order_release` to ensure visibility
-- Checks use `memory_order_acquire` to see the latest value
-
-This guarantees that when you call `cancel()` from the UI thread, the worker thread will see it at the next checkpoint.
-
-### Cooperative Cancellation
-
-Cancellation is **cooperative**, meaning it checks at safe points rather than forcibly terminating:
-
-1. **Before each batch** - Checked before starting GPU inference
-2. **After each batch** - Checked after processing results
-3. **Between tracks** - Checked when processing multi-track files
-4. **Between translation chunks** - Checked every 8 segments
-
-This ensures:
-- No GPU resources are left in an inconsistent state
-- Partial results are valid and usable
-- No memory leaks or crashes
-
-### Checkpoint Locations
-
-```
-Transcription Flow:
-┌─────────────────┐
-│  Load Audio     │
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│  VAD Processing │
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│  Split Chunks   │
-└────────┬────────┘
-         │
-    ┌────▼────┐
-    │  Batch  │◄─── ✓ Cancellation check
-    │   1     │
-    └────┬────┘
-         │
-    ┌────▼────┐
-    │  Batch  │◄─── ✓ Cancellation check
-    │   2     │
-    └────┬────┘
-         │
-        ...
-```
-
-## Usage Patterns
-
-### Pattern 1: Simple Cancel Button
-
-```cpp
-// Member variables
-muninn::Transcriber* m_transcriber;
-std::thread m_worker;
-
-void onStartClicked() {
-    m_worker = std::thread([this]() {
-        auto result = m_transcriber->transcribe(m_audioPath, m_options);
-        emit transcriptionComplete(result);
-    });
-}
-
-void onCancelClicked() {
-    m_transcriber->cancel();  // Safe to call from UI thread
-}
-```
-
-### Pattern 2: Progress Callback with Cancel
-
-The progress callback can also trigger cancellation by returning `false`:
-
-```cpp
-auto result = transcriber.transcribe(audio_path, options,
-    [this](int track, int total, float progress, const std::string& msg) {
-        updateProgressBar(progress);
-        return !m_cancelRequested;  // Return false to cancel
+auto result = transcriber.transcribe(path, options,
+    [&](int track, int total, float progress, const std::string& msg) {
+        update_progress(track, total, progress, msg);
+        return !cancel_requested;
     });
 ```
 
-### Pattern 3: Cancelling Both Transcription and Translation
+### Partial results
+
+`result.segments` keeps every segment finished before the cancel, from all
+tracks done so far. Their timestamps go through the same steps as a complete
+run (mapped back from the VAD-joined audio, plus the clip offset), so they are
+on the original timeline. `failed_windows`, `failed_tracks` and `error` are
+filled in as usual. A cancelled run doesn't throw, and speaker diarization
+(if enabled) still runs on what was kept.
+
+One gap: when the cancel lands between VAD and the mel spectrogram of the
+only (or last) track, the track comes back with no segments and
+`was_cancelled` can be `false`.
+
+## Translator
 
 ```cpp
-void onCancelClicked() {
-    m_transcriber->cancel();
-    m_translator->cancel();
-}
+translator.cancel();          // from any thread
+translator.reset_cancel();    // before the next batch
 ```
 
-### Pattern 4: Checking Partial Results
+- A running `translate_batch()` stops before its next chunk of 128
+  sentences. Items it didn't finish come back `""`.
+- The flag stays set until `reset_cancel()`: every batch started meanwhile
+  returns at once with all items `""`.
+- `translate_batch()` can't tell a cancelled item from a failed one; use
+  `translate_batch_result()`, which sets `cancelled` and counts
+  `failed_count`.
+- `unload_model()` also stops a running batch at its next chunk (and
+  reports it as cancelled), then waits for it up to `timeout_ms`.
 
-```cpp
-auto result = transcriber.transcribe(audio_path, options);
+## Errors
 
-if (result.was_cancelled) {
-    // Still have valid partial results!
-    std::cout << "Got " << result.segments.size() << " segments before cancel\n";
-
-    for (const auto& seg : result.segments) {
-        std::cout << seg.text << "\n";  // Valid transcribed text
-    }
-}
-```
-
-## Best Practices
-
-### DO:
-- Call `cancel()` from your UI thread - it's thread-safe
-- Check `result.was_cancelled` to know if cancellation occurred
-- Use partial results if needed - they're valid
-
-### DON'T:
-- Don't call `reset_cancel()` before `transcribe()` - it's automatic
-- Don't try to force-terminate threads - use cooperative cancellation
-- Don't assume immediate cancellation - it happens at checkpoints
-
-## Latency
-
-Cancellation latency depends on where the operation is in its processing:
-
-| Operation | Typical Latency |
-|-----------|-----------------|
-| Between batches | < 100ms |
-| During batch inference | Up to batch duration (1-5s) |
-| During VAD | < 500ms |
-| During audio extraction | < 1s |
-
-For very long audio files with large batches, worst-case cancellation latency is the time to complete one batch (typically 1-5 seconds on GPU).
-
-## Error Handling
-
-Cancellation is not an error - it's a normal control flow:
+Cancelling is not an error. `transcribe()` throws for real failures: a model
+that isn't loaded, a file that can't be opened, an unknown language, or a run
+in which no track succeeded.
 
 ```cpp
 try {
     auto result = transcriber.transcribe(path, options);
-
-    if (result.was_cancelled) {
-        // Normal cancellation - not an exception
-        handlePartialResults(result);
-    } else {
-        handleCompleteResults(result);
-    }
+    if (result.was_cancelled) { /* partial */ }
+    if (result.failed_windows || result.failed_tracks) { /* some audio was lost: result.error */ }
 } catch (const std::exception& e) {
-    // Actual errors (file not found, GPU error, etc.)
-    handleError(e.what());
+    // nothing could be transcribed
 }
 ```
-
-## Implementation Notes
-
-### Memory Ordering
-
-```cpp
-// In cancel():
-cancelled.store(true, std::memory_order_release);
-
-// In transcribe loop:
-if (cancelled.load(std::memory_order_acquire)) {
-    // Guaranteed to see the store from cancel()
-}
-```
-
-### Auto-Reset Behavior
-
-`Transcriber::transcribe()` automatically resets the cancellation flag at the start:
-
-```cpp
-TranscribeResult Transcriber::transcribe(...) {
-    pimpl_->cancelled.store(false, std::memory_order_release);
-    // ... rest of transcription
-}
-```
-
-This means you don't need to call `reset_cancel()` between transcriptions - each call starts fresh.
-
-For `Translator`, you should call `reset_cancel()` explicitly if reusing after a cancellation.
