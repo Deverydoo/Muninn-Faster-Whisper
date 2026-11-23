@@ -6,6 +6,7 @@
 // Usage: test_core            (exit code 0 = all checks passed)
 
 #include "muninn/audio_extractor.h"
+#include "muninn/version.h"
 #include "muninn/mel_spectrogram.h"
 #include "muninn/silero_vad.h"
 #include "muninn/subtitle_export.h"
@@ -258,7 +259,16 @@ void test_build_features() {
 
 }  // namespace
 
+void test_version() {
+    std::printf("[version]\n");
+    bool threw = false;
+    try { muninn::check_version(); } catch (const std::exception&) { threw = true; }
+    CHECK(!threw);   // the headers and the DLL are from the same build
+    CHECK(std::string(muninn::library_version()) == MUNINN_VERSION_STRING);
+}
+
 int main() {
+    test_version();
     test_subtitle_timestamps();
     test_mel_spectrogram();
     test_energy_vad();

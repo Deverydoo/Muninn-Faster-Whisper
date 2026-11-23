@@ -4,7 +4,14 @@ cmake_minimum_required(VERSION 3.20)
 set(CMAKE_TOOLCHAIN_FILE "C:/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "Vcpkg target triplet")
 
-project(MuninnFasterWhisper VERSION 0.5.0 LANGUAGES CXX)
+project(MuninnFasterWhisper VERSION 0.6.0 LANGUAGES CXX)
+
+# include/muninn/version.h carries the same number for users of the headers.
+file(READ "${CMAKE_SOURCE_DIR}/include/muninn/version.h" _muninn_version_h)
+string(REGEX MATCH "MUNINN_VERSION_STRING \"([0-9.]+)\"" _ "${_muninn_version_h}")
+if(NOT CMAKE_MATCH_1 STREQUAL PROJECT_VERSION)
+    message(FATAL_ERROR "include/muninn/version.h says ${CMAKE_MATCH_1}, project() says ${PROJECT_VERSION}")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -282,6 +289,7 @@ endif()
 # Muninn Library Sources
 # =======================
 set(MUNINN_SOURCES
+    src/version.cpp
     src/logging.cpp
     src/mel_spectrogram.cpp
     src/transcriber.cpp
@@ -319,9 +327,15 @@ if(BUILD_SHARED_LIBS)
     add_library(muninn SHARED ${MUNINN_SOURCES})
     # Use WINDOWS_EXPORT_ALL_SYMBOLS for automatic DLL export (Muninn pattern)
     set_target_properties(muninn PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    # std::mutex built with VS 2022 17.10+ needs msvcp140 14.40 or newer; a
+    # host that ships an older msvcp140 beside its exe (plugin hosts often do)
+    # crashed in mutex::lock. This keeps the older, compatible constructor.
+    target_compile_definitions(muninn PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 else()
     add_library(muninn STATIC ${MUNINN_SOURCES})
 endif()
+
+target_compile_definitions(muninn PRIVATE MUNINN_BUILD_VERSION="${PROJECT_VERSION}")
 
 # Set output name
 set_target_properties(muninn PROPERTIES

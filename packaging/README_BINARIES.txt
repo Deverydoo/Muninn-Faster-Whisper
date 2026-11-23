@@ -41,13 +41,26 @@ Requirements
     and cuDNN 9 for CUDA 13 provides them.
   - The Microsoft Visual C++ 2015-2022 Redistributable (x64)
 
-This CTranslate2 build has no CPU matrix-multiply backend, so it cannot run
-Whisper on the CPU: device "cpu" will fail. Use a GPU.
+Without a supported GPU, device "cpu" works (CTranslate2 is built with the Ruy
+CPU backend and OpenMP); it is much slower than a GPU. VCOMP140.DLL comes with
+the Visual C++ Redistributable.
 
 Using it
 --------
 Add include/ to your include path, link lib/muninn.lib, and put everything in
-bin/ next to your executable. C++17, MSVC 2022, /MD runtime.
+bin/ next to your executable.
+
+Muninn's API passes C++ standard-library types (std::string, std::vector,
+std::function) and exceptions across the DLL boundary, so your program must be
+built the same way:
+  - C++17 or newer, MSVC (Visual Studio 2022 17.10 or newer), x64
+  - Release configuration with the /MD runtime. A Debug build (/MDd) has a
+    different std::string layout and crashes on the first call; /MT frees
+    memory on the wrong heap.
+  - Visual C++ Redistributable 14.40 or newer at run time.
+Call muninn::check_version() (include <muninn/version.h>) once at startup: it
+throws if the muninn.dll that loaded isn't from the same release as the
+headers.
 
 Next to the executable, not on PATH: Windows 10 and 11 have an older
 onnxruntime.dll of their own in System32, and Windows looks there before it
