@@ -62,6 +62,8 @@ Copy-Required "$CT2Dir/third_party/cpu_features/LICENSE" "$lic/cpu_features-LICE
 Copy-Required "$CT2Dir/third_party/spdlog/LICENSE"       "$lic/spdlog-LICENSE.txt"
 Copy-Required "$CT2Dir/third_party/thrust/LICENSE"       "$lic/thrust-LICENSE.txt"
 Copy-Required "$CT2Dir/third_party/cutlass/LICENSE.txt"  "$lic/cutlass-LICENSE.txt"
+Copy-Required "$CT2Dir/third_party/ruy/LICENSE"          "$lic/ruy-LICENSE.txt"
+Copy-Required "$CT2Dir/third_party/ruy/third_party/cpuinfo/LICENSE" "$lic/cpuinfo-LICENSE.txt"
 Copy-Required "$OrtDir/LICENSE"                          "$lic/onnxruntime-LICENSE.txt"
 Copy-Required "$OrtDir/ThirdPartyNotices.txt"            "$lic/onnxruntime-ThirdPartyNotices.txt"
 Copy-Required "$FfmpegSourceDir/COPYING.LGPLv2.1"        "$lic/LGPL-2.1.txt"
