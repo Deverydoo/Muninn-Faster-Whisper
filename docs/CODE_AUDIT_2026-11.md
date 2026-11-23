@@ -1,5 +1,7 @@
 # Muninn Code Audit, November 2026
 
+> **Status: fixed, 2026-11-22** (commits e3a4211..5c09cc0 on master; Loki Studio ad2c68d, 518c379, f8663df, 0bceb77). Every finding below is fixed, measured where it changes transcripts (tests/accuracy/results/2026-11-22_*.json). Story clip WER 2.8% -> 1.3%, intro clip misses 4 words instead of 9, word timings closer, CPU and GPU now give the same words. Not done: the C interface (A1, long term; the version check and stated build requirements are in instead). Also found and fixed during the work: Loki Studio linked muninn.lib from a stale build; the shipped build had no zlib (estimated compression ratio); VAD returned whole tracks without speech; get_audio_info always threw; VTT styles were ignored.
+
 The first full audit since the thread-safety review of December 2024. Four reviewers worked in parallel, all read-only:
 
 1. The offline transcription core: transcriber, VAD, mel spectrogram, audio extraction.
