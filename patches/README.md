@@ -14,11 +14,14 @@ front). It adds:
   `synchronize_stream()` once shutdown starts (it could block on Windows during
   CUDA teardown). Upstream 4.8's `destroy_context()` in `finalize()` is kept.
 - Bounds checks in the DTW backtrace (word alignment).
-- `src/cuda/primitives.cu`: float32 GEMM goes through `cublasGemmEx` with
-  `CUBLAS_GEMM_DEFAULT_TENSOR_OP`. Older notes called this "CUDA 13 changes";
-  it is a precision setting (cuBLAS may round inputs down for tensor cores),
-  measured separately (see the audit, C2).
 - Thread-pool changes in `thread_pool.{h,cc}`.
+
+Dropped in 4.9.1 (November 2026): a `src/cuda/primitives.cu` change that sent
+float32 GEMM through `cublasGemmEx` with `CUBLAS_GEMM_DEFAULT_TENSOR_OP`
+(older notes called it "CUDA 13 changes"; it let cuBLAS round float32 inputs
+down for tensor cores). Measured with and without it: the accuracy clips'
+transcripts and word times were byte-identical (Whisper runs in float16), so
+CTranslate2's own exact float32 GEMM is kept.
 
 `ctranslate2-v4.8.3-local.patch` and `ctranslate2-v4.7.1-local.patch` are the
 same set against the older versions (4.7.1 also carried the BS::thread_pool 5.1
