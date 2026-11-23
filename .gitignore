@@ -130,3 +130,9 @@ D*Vibe_Projects*
 # Release archives
 Muninn-*.zip
 Muninn-*.zip.sha256
+
+# CTranslate2 source trees (built locally; see patches/README.md and
+# scripts/build_ctranslate2.ps1). third_party/CTranslate2 is the old 4.7.1
+# submodule, no longer used.
+third_party/CTranslate2/
+third_party/CTranslate2-*/
